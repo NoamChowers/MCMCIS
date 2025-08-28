@@ -13,14 +13,18 @@ class MCMCVarianceEstimation:
         self,
         batch_size_func: Callable[[int], int] = lambda n: int(np.floor(n**0.5)),
         method: str = "sv",  # "sv", "bm", "obm"
-        sv_window = "tukey-hanning"
+        sv_window = "tukey-hanning"  # "tukey-hanning" or "bartlett"
     ):
         self.batch_size_func = batch_size_func
         self.method = method.lower()
         if self.method not in ["sv", "bm", "obm"]:
             raise ValueError("method must be one of ['sv', 'bm', 'obm']")
+
+        if self.method == "sv":
+            self.sv_window = sv_window.lower()
+            if self.sv_window not in ["tukey-hanning", "bartlett"]:
+                raise ValueError("sv_window must be one of ['tukey-hanning', 'bartlett']")
     
-        self.sv_window = sv_window
         
     def _center_cols(self, Y):
         return Y - Y.mean(axis=0, keepdims=True)
@@ -63,8 +67,32 @@ class MCMCVarianceEstimation:
         return m * C
 
     def _Sigma_OBM(self, Y, m):
-        """Overlapping BM via Bartlett spectral equivalence."""
-        return self._Sigma_SV(Y, m, window="bartlett")
+        Y = np.asarray(Y, dtype=float)
+
+        n, d = Y.shape
+        m = int(m)
+        if not (2 <= m < n):
+            raise ValueError("OBM requires 2 <= m < n.")
+
+        # overall mean (1,d)
+        Ybar = Y.mean(axis=0, keepdims=True)
+
+        # overlapping window means via cumulative sums (O(n d), zero-copy math)
+        cs = np.vstack([np.zeros((1, d), dtype=Y.dtype), np.cumsum(Y, axis=0)])  # (n+1,d)
+        # window sums S_j = cs[j+m] - cs[j], j=0..n-m
+        S = cs[m:] - cs[:-m]                         # (n-m+1, d)
+        M = S / m                                    # window means (n-m+1, d)
+
+        D = M - Ybar                                 # deviations from global mean
+        # sum_j D_j^T D_j = D^T D
+        DD = D.T @ D                                 # (d,d)
+
+        factor =  (n * m) / ((n - m) * (n - m + 1))
+        Sigma_hat = factor * DD
+
+        # return scalar for univariate input to match usual API expectations
+        return Sigma_hat.item() if d == 1 else Sigma_hat
+    
     
     def variance_of_ratio(self, U, V):
         """
