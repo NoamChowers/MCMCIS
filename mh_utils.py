@@ -12,6 +12,7 @@ class PermutationStatistic(ABC):
     def __call__(self, s1, s2) -> float:
         raise NotImplementedError("Must be implemented!")
 
+
 class PermutationPropsal(ABC):
     def __init__(self):
         pass
@@ -21,9 +22,6 @@ class PermutationPropsal(ABC):
         raise NotImplementedError("Must be implemented!")
 
 
-class MCMCVarianceEstimation(ABC):
-    def __init__(self):
-        pass
 
 class AdaptiveImportanceSampling(ABC):
     def __init__(
@@ -77,6 +75,7 @@ class AdaptiveImportanceSampling(ABC):
     @abstractmethod
     def calc_estimator(self, x_array):
         pass
+
 
 class MCMCISPermutationTest(ABC):
     """
