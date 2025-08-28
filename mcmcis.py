@@ -1,5 +1,4 @@
 import numpy as np
-from tqdm.auto import tqdm
 from scipy.optimize import fsolve
 from scipy.stats import norm
 from mh_utils import (MCMCISPermutationTest, AdaptiveImportanceSampling, PermutationStatistic)
