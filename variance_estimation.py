@@ -1,52 +1,27 @@
 import numpy as np
 from scipy.optimize import fsolve
 from scipy.stats import norm
-from mh_utils import VarianceEstimation
 from typing import Callable, Union
 
 """
 https://arxiv.org/pdf/0811.1729
 """
 
-class OBM(VarianceEstimation):
-    def __init__(
-        self,
-        batch_size_func: Callable[[int], int] = lambda n: int(np.floor(n**0.5)),
-        step_size: Union[None, int] = 1  # If None, non-overlapping batches are used
-    ):
-        self.batch_size_func = batch_size_func
-        self.step_size = step_size
-    
-    def __call__(self, chain: np.array, calc_estimator_func: Callable) -> float:
-        n = len(chain)
-        estimator_array = []
-        batch_size = self.batch_size_func(n)
-        self.step_size = self.step_size if self.step_size is not None else batch_size
-        for start in range(n - batch_size + 1, self.step_size):
-            stop = start + batch_size
-            cur_batch = chain[start:stop]
-            estimator_array.append(
-                calc_estimator_func(cur_batch)
-            )
-        mean_estimator = np.mean(estimator_array)
-        return (
-            batch_size / (len(estimator_array) * (len(estimator_array)-1))
-        ) * np.sum((estimator_array-mean_estimator)**2)
-
-
-
 
 class MCMCVarianceEstimation:
     def __init__(
         self,
         batch_size_func: Callable[[int], int] = lambda n: int(np.floor(n**0.5)),
-        method: str = "sv"  # "sv", "bm", "obm"
+        method: str = "sv",  # "sv", "bm", "obm"
+        sv_window = "tukey-hanning"
     ):
         self.batch_size_func = batch_size_func
         self.method = method.lower()
         if self.method not in ["sv", "bm", "obm"]:
             raise ValueError("method must be one of ['sv', 'bm', 'obm']")
     
+        self.sv_window = sv_window
+        
     def _center_cols(self, Y):
         return Y - Y.mean(axis=0, keepdims=True)
 
@@ -59,14 +34,14 @@ class MCMCVarianceEstimation:
             Gam[s] = (A.T @ B) / n
         return Gam
 
-    def _Sigma_SV(self, Y, m, window="tukey-hanning"):
+    def _Sigma_SV(self, Y, m):
         """Spectral (matrix) LR-cov with Tukey–Hanning or Bartlett window."""
         Yc = self._center_cols(np.asarray(Y, float))
         Gam = self._autocov_mats(Yc, int(m) - 1)  # shape (m, d, d)
-        if window == "tukey-hanning":
+        if self.sv_window == "tukey-hanning":
             w = np.empty(m); w[0] = 1.0
             s = np.arange(1, m); w[1:] = 0.5 * (1.0 + np.cos(np.pi * s / m))
-        elif window == "bartlett":
+        elif self.sv_window == "bartlett":
             s = np.arange(m); w = 1.0 - s / m
         else:
             raise ValueError("Unsupported SV window")
@@ -91,7 +66,7 @@ class MCMCVarianceEstimation:
         """Overlapping BM via Bartlett spectral equivalence."""
         return self._Sigma_SV(Y, m, window="bartlett")
     
-    def variance_of_ratio(self, U, V, method, sv_window="tukey-hanning"):
+    def variance_of_ratio(self, U, V):
         """
         Var( (mean U)/(mean V) ) ≈ (1/n) * grad^T Σ grad,
         where Σ is the LR-cov matrix of (U,V).
@@ -112,13 +87,13 @@ class MCMCVarianceEstimation:
 
         # pick Σ
         if self.method == "sv":
-            Sigma = self._Sigma_SV(Y, m, window=sv_window)
+            Sigma = self._Sigma_SV(Y, m)
         elif self.method == "bm":
             Sigma = self._Sigma_BM(Y, m)
         elif self.method == "obm":
             Sigma = self._Sigma_OBM(Y, m)
         else:
-            raise ValueError(f"Unknown method: {method}")
+            raise ValueError(f"Unknown method: {self.method}")
 
         muU = float(U.mean())
         muV = float(V.mean())
@@ -130,6 +105,6 @@ class MCMCVarianceEstimation:
         return float(grad @ Sigma @ grad) / n
     
     
-    def __call__(self, chain: np.array, calc_estimator_func: Callable) -> float:
-        raise NotImplementedError("Must be implemented!")
+    def __call__(self, U, V) -> float:
+        return self.variance_of_ratio(U, V)
 

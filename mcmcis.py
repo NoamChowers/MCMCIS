@@ -16,9 +16,13 @@ class SmoothedMCMCIS(AdaptiveImportanceSampling):
         statistic_func: PermutationStatistic,  # Receives arguments s1, s2 and returns a scalar
         target_pdf: Callable = lambda x: 1,
         beta: float = 0.0,
-        init_iterations: int = 100_000
+        init_iterations: int = 100_000,
+        seed: int = 111
         
     ):
+        self.seed = seed
+        np.random.seed(self.seed)
+        
         self.target_prob = target_prob
         self.lambda_star = lambda_star
         self.beta = beta

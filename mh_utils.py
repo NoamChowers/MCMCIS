@@ -3,6 +3,8 @@ from typing import Callable, List, Union, Tuple
 import numpy as np
 import math
 
+from variance_estimation import MCMCVarianceEstimation
+
 
 class PermutationStatistic(ABC):
     def __init__(self):
@@ -99,6 +101,7 @@ class MCMCISPermutationTest(ABC):
         log_scale: bool = True,  # This helps avoid stack overflow
         seed: int = 42,
         verbose: bool = True,
+        calc_estimator_variance: bool = False,
         initial_perm: Union[Tuple[np.array, np.array], None] = None,
     ):
         self.s = np.concatenate((s1, s2))
@@ -108,6 +111,9 @@ class MCMCISPermutationTest(ABC):
         self.proposal_func = proposal_func
         self.variance_estimation_method = variance_estimation_method
         self.batch_size = batch_size
+        self.calc_estimator_variance = calc_estimator_variance
+        if self.calc_estimator_variance:
+            self.var_array = []
         
         # Initialize Importance Sampling instance
         self.ais = ais 
@@ -117,11 +123,12 @@ class MCMCISPermutationTest(ABC):
         if log_scale:
             self.accept_proposal = lambda cur, prop: np.log(np.random.uniform(0, 1)) < (prop - cur)
             self.importance_pdf = lambda x: self.ais.calc_log_importance_pdf(x)
-            self.weight = self.ais.calc_log_weight
+            # self.weight = self.ais.calc_log_weight
         else:
             self.accept_proposal = lambda cur, prop: np.random.uniform(0, 1) < prop / cur
             self.importance_pdf = lambda x: self.ais.calc_importance_pdf(x)
-            self.weight = self.ais.calc_weight
+        
+        self.weight = self.ais.calc_weight
 
         self.verbose = verbose
         self.J = J
@@ -149,19 +156,7 @@ class MCMCISPermutationTest(ABC):
                 self.weight(self.cur_importance_val)
             )
 
-    
-    def estimate_variance(self):
-        n = len(self.lambda_array)
-        m = int(self.batch_size(n))
-        if self.variance_estimation_method == "sv":  # Spectral Variance
-            pass
-        elif self.variance_estimation_method == "bm":
-            pass
-        elif self.variance_estimation_method == "obm":
-            pass
-        else:
-            raise ValueError("variance_estimation_method must be one of ['sv', 'bm', 'obm']")
-        
+
     def run_chain(self):
         np.random.seed(self.seed)
         
@@ -185,13 +180,22 @@ class MCMCISPermutationTest(ABC):
                 self.update_chain_state(burn_in = i < self.B)
                 if self.ais.update_after_each_sample and i >= self.B:  # For algorithms such as SAMC
                     self.ais.update(self.cur_lambda, i)
-    
+
+            if self.calc_estimator_variance:
+                variance = self.variance_estimation_method(
+                    U = self.weights_array * (self.lambda_array >= self.lambda_star).astype(int),
+                    V = self.weights_array
+                )
+                self.var_array.append(variance)
+
             self.estimator_array.append(
                 self.ais.calc_estimator(self.lambda_array)
             )
             
             if self.verbose:
                 print(f"p-value = {self.estimator_array[-1]}")
+                if self.calc_estimator_variance:
+                    print(f"SD estimate = {np.sqrt(self.var_array[-1])}")
                 print(f"Acceptance rate = {round(self.accepted / self.T, 4)}")
             
             if not self.ais.update_after_each_sample:
