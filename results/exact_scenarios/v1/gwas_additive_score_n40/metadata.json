@@ -1,0 +1,28 @@
+{
+  "key": "gwas_additive_score_n40",
+  "description": "GWAS-like additive score: Binomial(2, maf=0.15) dosages, n=40, right-tail treated dosage sum with a near-extreme but non-max case set.",
+  "statistic_name": "treated_sum",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 40,
+  "n_treated": 20,
+  "n_control": 20,
+  "t_obs": 19.0,
+  "exact_method": "LinearStatisticDPSolver",
+  "exact_p_value": 9.121811124035818e-07,
+  "tail_hits": 125741,
+  "n_permutations": 137846528820,
+  "notes": "Additive-dose score statistic T=sum_i G_i y_i with fixed case count. Observed labels are constructed by a one-swap downgrade from the maximal dosage sum.",
+  "extra": {
+    "n": 40,
+    "n_treated": 20,
+    "maf": 0.15,
+    "seed": 9,
+    "downgrade_swaps": 1,
+    "observed_score": 19.0,
+    "extreme_score": 20.0,
+    "n_heterozygous": 14,
+    "n_homozygous_alt": 3,
+    "total_dosage_sum": 20
+  }
+}

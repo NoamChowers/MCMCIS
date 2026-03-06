@@ -1,0 +1,17 @@
+{
+  "key": "rank_sum_dp_n40",
+  "description": "Rank-sum (Mann-Whitney U) with deterministic near-tail labels, n=40.",
+  "statistic_name": "mann_whitney_u",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 40,
+  "n_treated": 20,
+  "n_control": 20,
+  "t_obs": 374.0,
+  "exact_method": "RankSumDPSolver",
+  "exact_p_value": 8.445624347350904e-08,
+  "tail_hits": 11642,
+  "n_permutations": 137846528820,
+  "notes": "DP over rank-sum counts with no ties in X.",
+  "extra": {}
+}

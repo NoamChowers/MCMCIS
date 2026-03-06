@@ -1,0 +1,40 @@
+{
+  "FAST_MODE": false,
+  "SCENARIO_KEYS_TO_RUN": [
+    "binary_hypergeom_1e5",
+    "rank_linear_x",
+    "linear_nonlinear_x"
+  ],
+  "MIN_TAIL_STATES": 2,
+  "USE_TRUE_P0_FOR_Q_TARGET": true,
+  "P0_GUESS": 1e-08,
+  "D_ALPHA": 0.25,
+  "N_REPEATS": 3,
+  "IID_SAMPLES": 1000000,
+  "MCMC_CHAINS": 2,
+  "MCMC_STEPS_PER_CHAIN": 500000,
+  "MCMC_BURN_IN": 100000,
+  "MCMC_THIN": 1,
+  "MCMC_ESTIMATE_VARIANCE": true,
+  "MCMC_TILT_MODE": "smooth_hinge",
+  "MCMC_PILOT_SAMPLES": 20000,
+  "MCMC_SCALE_METHOD": "sd",
+  "MCMC_TUNE_STEPS": 12000,
+  "MCMC_TUNE_BURN_IN": 2400,
+  "MCMC_TUNE_THIN": 2,
+  "MCMC_TUNING_BUDGET_MODE": "per_run",
+  "SAMC_STEPS": 1000000,
+  "SAMC_BURN_IN": 200000,
+  "SAMC_N_BINS": 40,
+  "BETA_SWEEP_MULTIPLIERS": [
+    0.25,
+    0.6,
+    0.85,
+    1.0,
+    1.2,
+    1.5,
+    2.0
+  ],
+  "BETA_SWEEP_REPEATS": 2,
+  "BETA_SWEEP_TOTAL_STEPS": 1000000
+}

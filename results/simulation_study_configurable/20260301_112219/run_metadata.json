@@ -1,0 +1,46 @@
+{
+  "scenarios": [
+    {
+      "key": "bruteforce_welch_nonextreme_n22",
+      "display_name": "Brute-force benchmark (non-DP statistic): right-tail Welch t-statistic, n=22 with non-extreme observed labeling.",
+      "exact_p": 1.5593281847151816e-05,
+      "exact_tail_hits": 11,
+      "exact_n_perm": 705432,
+      "exact_method": "BruteForceExactSolver"
+    },
+    {
+      "key": "hypergeom_1e7",
+      "display_name": "Binary treated-successes with exact p around 1e-7.",
+      "exact_p": 3.8542863904376695e-07,
+      "exact_tail_hits": 53130,
+      "exact_n_perm": 137846528820,
+      "exact_method": "Fisher exact test (2x2; hypergeometric tail)"
+    },
+    {
+      "key": "rank_sum_dp_n40",
+      "display_name": "Rank-sum (Mann-Whitney U) with deterministic near-tail labels, n=40.",
+      "exact_p": 8.445624347350904e-08,
+      "exact_tail_hits": 11642,
+      "exact_n_perm": 137846528820,
+      "exact_method": "RankSumDPSolver"
+    },
+    {
+      "key": "linear_stat_dp_n40",
+      "display_name": "Difference in means on nonlinear numeric X=i^2, n=40.",
+      "exact_p": 8.124977898155825e-09,
+      "exact_tail_hits": 1120,
+      "exact_n_perm": 137846528820,
+      "exact_method": "LinearStatisticDPSolver"
+    },
+    {
+      "key": "poisson_diffmeans_righttail_tiny_n200",
+      "display_name": "Poisson benchmark: treated~Pois(3), control~Pois(2), right-tail difference in means, n1=n2=100.",
+      "exact_p": 1.1304419213592634e-07,
+      "exact_tail_hits": 10235983688407281097742818333791018059820045140647870,
+      "exact_n_perm": 90548514656103281165404177077484163874504589675413336841320,
+      "exact_method": "LinearStatisticDPSolver"
+    }
+  ],
+  "timestamp": "2026-03-01 13:58:49",
+  "run_dir": "/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/results/simulation_study_configurable/20260301_112219"
+}

@@ -39,6 +39,15 @@ def treated_successes(x: np.ndarray, y: np.ndarray) -> float:
     return float(int(np.dot(np.asarray(x, dtype=np.int8), np.asarray(y, dtype=np.int8))))
 
 
+def treated_sum(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Sum of numeric scores among treated labels.
+    """
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=np.int8)
+    return float(np.dot(x_arr, y_arr))
+
+
 def exact_hypergeom_right_tail(
     n: int,
     n_treated: int,
@@ -66,6 +75,53 @@ def near_tail_labels_tiny_p_case() -> tuple[np.ndarray, np.ndarray]:
     treated_values = set([1, 16] + list(range(23, 41)))
     y = np.array([1 if int(v) in treated_values else 0 for v in x], dtype=np.int8)
     return x, y
+
+
+def _near_extreme_linear_labels(x: np.ndarray, n_treated: int, *, downgrade_swaps: int = 1) -> np.ndarray:
+    """
+    Start from the top-score labeling and downgrade it by a small number of swaps.
+
+    This keeps the observed statistic near the right tail while avoiding the most
+    extreme allocation.
+    """
+    if downgrade_swaps <= 0:
+        raise ValueError("downgrade_swaps must be positive.")
+
+    x_arr = np.asarray(x, dtype=float)
+    if x_arr.ndim != 1:
+        raise ValueError("_near_extreme_linear_labels requires a 1D score array.")
+    if not (0 < n_treated < x_arr.size):
+        raise ValueError("n_treated must satisfy 0 < n_treated < len(x).")
+
+    order = np.argsort(x_arr, kind="mergesort")
+    y = np.zeros(x_arr.size, dtype=np.int8)
+    treated_idx = order[-n_treated:]
+    y[treated_idx] = 1
+
+    control_idx = order[:-n_treated]
+    treated_sorted = treated_idx[np.argsort(x_arr[treated_idx], kind="mergesort")]
+    control_sorted = control_idx[np.argsort(x_arr[control_idx], kind="mergesort")[::-1]]
+
+    used_controls: set[int] = set()
+    swaps_done = 0
+    for ti in treated_sorted.tolist():
+        for ci in control_sorted.tolist():
+            if ci in used_controls:
+                continue
+            if x_arr[ti] > x_arr[ci]:
+                y[ti] = 0
+                y[ci] = 1
+                used_controls.add(ci)
+                swaps_done += 1
+                break
+        if swaps_done >= downgrade_swaps:
+            break
+
+    if swaps_done < downgrade_swaps:
+        raise ValueError(
+            "Could not construct a non-extreme near-tail labeling with the requested swaps."
+        )
+    return y
 
 
 def _binary_hypergeom_problem(
@@ -200,6 +256,129 @@ def _make_linear_dp_scenario() -> ExactScenario:
     )
 
 
+def _make_gwas_additive_score_scenario(
+    *,
+    key: str = "gwas_additive_score_n40",
+    description: str = (
+        "GWAS-like additive score: Binomial(2, maf=0.15) dosages, n=40, "
+        "right-tail treated dosage sum with a near-extreme but non-max case set."
+    ),
+    n: int = 40,
+    n_treated: int = 20,
+    maf: float = 0.15,
+    seed: int = 9,
+    downgrade_swaps: int = 1,
+) -> ExactScenario:
+    rng = np.random.default_rng(seed)
+    x = rng.binomial(2, maf, size=n).astype(float)
+    y = _near_extreme_linear_labels(x, n_treated, downgrade_swaps=downgrade_swaps)
+    problem = PermutationTestProblem(X=x, y_obs=y, statistic=treated_sum, tail="right")
+    exact = LinearStatisticDPSolver(
+        problem,
+        scores=x,
+        score_scale=1,
+        scale=1.0,
+        offset=0.0,
+    ).compute()
+
+    extreme_score = float(np.sum(np.sort(x)[-n_treated:]))
+    observed_score = float(problem.t_obs)
+    if not observed_score < extreme_score:
+        raise ValueError(
+            f"Scenario '{key}' must be non-extreme, but observed score={observed_score} "
+            f"and extreme score={extreme_score}."
+        )
+
+    return ExactScenario(
+        key=key,
+        description=description,
+        problem=problem,
+        statistic_name="treated_sum",
+        exact_method="LinearStatisticDPSolver",
+        exact_p_value=float(exact.p_value),
+        tail_hits=int(exact.tail_hits),
+        n_permutations=int(exact.n_permutations),
+        notes=(
+            "Additive-dose score statistic T=sum_i G_i y_i with fixed case count. "
+            "Observed labels are constructed by a one-swap downgrade from the maximal dosage sum."
+        ),
+        extra={
+            "n": int(n),
+            "n_treated": int(n_treated),
+            "maf": float(maf),
+            "seed": int(seed),
+            "downgrade_swaps": int(downgrade_swaps),
+            "observed_score": observed_score,
+            "extreme_score": extreme_score,
+            "n_heterozygous": int(np.sum(x == 1.0)),
+            "n_homozygous_alt": int(np.sum(x == 2.0)),
+            "total_dosage_sum": int(np.sum(x)),
+        },
+    )
+
+
+def _make_zero_inflated_poisson_diffmeans_scenario(
+    *,
+    key: str = "zip_diffmeans_righttail_n40",
+    description: str = (
+        "Zero-inflated Poisson benchmark: 80% zeros, otherwise Pois(4), n=40, "
+        "right-tail difference in means with a near-extreme but non-max treated set."
+    ),
+    n: int = 40,
+    n_treated: int = 20,
+    zero_prob: float = 0.80,
+    lam_nonzero: float = 4.0,
+    seed: int = 4,
+    downgrade_swaps: int = 1,
+) -> ExactScenario:
+    rng = np.random.default_rng(seed)
+    is_zero = rng.random(n) < zero_prob
+    x = np.where(is_zero, 0, rng.poisson(lam_nonzero, size=n)).astype(float)
+    y = _near_extreme_linear_labels(x, n_treated, downgrade_swaps=downgrade_swaps)
+    problem = PermutationTestProblem(
+        X=x,
+        y_obs=y,
+        statistic=difference_in_means,
+        tail="right",
+    )
+    exact = LinearStatisticDPSolver.from_difference_in_means(problem, score_scale=1).compute()
+
+    extreme_treated_sum = float(np.sum(np.sort(x)[-n_treated:]))
+    observed_treated_sum = float(np.sum(x[y == 1]))
+    if not observed_treated_sum < extreme_treated_sum:
+        raise ValueError(
+            f"Scenario '{key}' must be non-extreme, but observed treated sum={observed_treated_sum} "
+            f"and extreme treated sum={extreme_treated_sum}."
+        )
+
+    return ExactScenario(
+        key=key,
+        description=description,
+        problem=problem,
+        statistic_name="difference_in_means",
+        exact_method="LinearStatisticDPSolver",
+        exact_p_value=float(exact.p_value),
+        tail_hits=int(exact.tail_hits),
+        n_permutations=int(exact.n_permutations),
+        notes=(
+            "Zero-inflated count data with exact linear-stat DP truth. "
+            "Observed labels are a one-swap downgrade from the maximal treated-count sum."
+        ),
+        extra={
+            "n": int(n),
+            "n_treated": int(n_treated),
+            "zero_prob": float(zero_prob),
+            "lambda_nonzero": float(lam_nonzero),
+            "seed": int(seed),
+            "downgrade_swaps": int(downgrade_swaps),
+            "n_zeros": int(np.sum(x == 0.0)),
+            "n_nonzero": int(np.sum(x > 0.0)),
+            "observed_treated_sum": observed_treated_sum,
+            "extreme_treated_sum": extreme_treated_sum,
+        },
+    )
+
+
 def _make_poisson_diffmeans_righttail_scenario(
     *,
     key: str = "poisson_diffmeans_righttail_tiny_n200",
@@ -327,8 +506,10 @@ def build_exact_scenarios() -> list[ExactScenario]:
             m_success=15,
             k_obs=15,
         ),
+        _make_gwas_additive_score_scenario(),
         _make_rank_sum_dp_scenario(),
         _make_linear_dp_scenario(),
+        _make_zero_inflated_poisson_diffmeans_scenario(),
         _make_poisson_diffmeans_righttail_scenario(),
         _make_bruteforce_welch_scenario(),
     ]
@@ -399,6 +580,7 @@ def save_exact_scenarios(
 
 STATISTIC_REGISTRY = {
     "treated_successes": treated_successes,
+    "treated_sum": treated_sum,
     "mann_whitney_u": mann_whitney_u,
     "difference_in_means": difference_in_means,
     "t_statistic_welch": t_statistic_welch,

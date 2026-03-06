@@ -1,0 +1,110 @@
+{
+  "scenario": {
+    "key": "rank_linear_x",
+    "display_name": "Rank-sum U",
+    "exact_p": 8.445624347350904e-08,
+    "exact_tail_hits": 11642,
+    "exact_n_perm": 137846528820,
+    "exact_method": "RankSumDPSolver"
+  },
+  "beta_workflow": {
+    "beta0_formula": 4.035719547418867,
+    "beta0_laplace": 4.25,
+    "beta_hat_tuned": 4.3828125,
+    "beta_used": 4.3828125,
+    "sigma_t": 36.96956145021457,
+    "p0_for_qtarget": 8.445624347350904e-08,
+    "q_target": 0.017047391701237962,
+    "q_hat_beta_hat": 0.0175,
+    "bracket_succeeded": true,
+    "n_short_chain_calls": 7,
+    "tuning_eval_total": 104007,
+    "tuning_wall_time_sec": 4.65421237499686,
+    "history_tail": [
+      {
+        "stage": "bisect",
+        "iter": 3,
+        "beta": 4.78125,
+        "q_hat": 0.026875,
+        "accept_rate": 0.3328333333333333
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 4,
+        "beta": 4.515625,
+        "q_hat": 0.023125,
+        "accept_rate": 0.35491666666666666
+      },
+      {
+        "stage": "bisect",
+        "iter": 4,
+        "beta": 4.515625,
+        "q_hat": 0.023125,
+        "accept_rate": 0.35491666666666666
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 5,
+        "beta": 4.3828125,
+        "q_hat": 0.0175,
+        "accept_rate": 0.35541666666666666
+      },
+      {
+        "stage": "bisect",
+        "iter": 5,
+        "beta": 4.3828125,
+        "q_hat": 0.0175,
+        "accept_rate": 0.35541666666666666
+      }
+    ]
+  },
+  "samc_setup": {
+    "lambda_min": 75.0,
+    "n_bins": 40,
+    "bin_edges": [
+      75.0,
+      82.66666666666667,
+      90.33333333333333,
+      98.0,
+      105.66666666666667,
+      113.33333333333334,
+      121.0,
+      128.66666666666669,
+      136.33333333333334,
+      144.0,
+      151.66666666666669,
+      159.33333333333334,
+      167.0,
+      174.66666666666669,
+      182.33333333333334,
+      190.0,
+      197.66666666666669,
+      205.33333333333334,
+      213.0,
+      220.66666666666669,
+      228.33333333333334,
+      236.0,
+      243.66666666666669,
+      251.33333333333334,
+      259.0,
+      266.6666666666667,
+      274.33333333333337,
+      282.0,
+      289.6666666666667,
+      297.33333333333337,
+      305.0,
+      312.6666666666667,
+      320.33333333333337,
+      328.0,
+      335.6666666666667,
+      343.33333333333337,
+      351.0,
+      358.6666666666667,
+      366.33333333333337,
+      374.0,
+      "inf"
+    ]
+  },
+  "cross_plot_path": "/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/results/simulation_study_configurable/rank_linear_x/plots/cross_method_comparison.png",
+  "elapsed_sec_cross": 414.44282770802965
+}

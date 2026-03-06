@@ -1,0 +1,30 @@
+{
+  "scenarios": [
+    {
+      "key": "binary_hypergeom_1e5",
+      "display_name": "Binary treated-successes (hypergeometric ~1e-5)",
+      "exact_p": 1.9656860591232116e-05,
+      "exact_tail_hits": 2709630,
+      "exact_n_perm": 137846528820,
+      "exact_method": "Hypergeometric"
+    },
+    {
+      "key": "rank_linear_x",
+      "display_name": "Rank-sum U",
+      "exact_p": 8.445624347350904e-08,
+      "exact_tail_hits": 11642,
+      "exact_n_perm": 137846528820,
+      "exact_method": "RankSumDPSolver"
+    },
+    {
+      "key": "linear_nonlinear_x",
+      "display_name": "Difference in means (LinearStatisticDP)",
+      "exact_p": 8.124977898155825e-09,
+      "exact_tail_hits": 1120,
+      "exact_n_perm": 137846528820,
+      "exact_method": "LinearStatisticDPSolver"
+    }
+  ],
+  "timestamp": "2026-02-28 15:17:29",
+  "run_dir": "/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/results/simulation_study_configurable/20260228_151729"
+}

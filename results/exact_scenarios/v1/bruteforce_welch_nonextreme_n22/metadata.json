@@ -1,0 +1,21 @@
+{
+  "key": "bruteforce_welch_nonextreme_n22",
+  "description": "Brute-force benchmark (non-DP statistic): right-tail Welch t-statistic, n=22 with non-extreme observed labeling.",
+  "statistic_name": "t_statistic_welch",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 22,
+  "n_treated": 11,
+  "n_control": 11,
+  "t_obs": 6.16832811644175,
+  "exact_method": "BruteForceExactSolver",
+  "exact_p_value": 1.5593281847151816e-05,
+  "tail_hits": 11,
+  "n_permutations": 705432,
+  "notes": "Welch t-statistic is nonlinear in group variances and not covered by current linear/rank DP solvers. Exact p-value computed via full brute-force permutation enumeration.",
+  "extra": {
+    "swap_from_extreme": 2,
+    "n": 22,
+    "n_treated": 11
+  }
+}

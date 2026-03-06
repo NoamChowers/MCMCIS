@@ -1,0 +1,23 @@
+{
+  "key": "hypergeom_1e5",
+  "description": "Binary treated-successes with exact p around 1e-5.",
+  "statistic_name": "treated_successes",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 40,
+  "n_treated": 20,
+  "n_control": 20,
+  "t_obs": 14.0,
+  "exact_method": "Fisher exact test (2x2; hypergeometric tail)",
+  "exact_p_value": 1.9656860591232116e-05,
+  "tail_hits": 2709630,
+  "n_permutations": 137846528820,
+  "notes": "Fisher exact one-sided tail for a 2x2 table. In this binary permutation setup, it matches full permutation enumeration.",
+  "extra": {
+    "n": 40,
+    "n_treated": 20,
+    "m_success": 15,
+    "k_obs": 14,
+    "dp_cross_check_p": 1.9656860591232116e-05
+  }
+}
