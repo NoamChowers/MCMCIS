@@ -75,6 +75,11 @@ class MCMCWorkflowConfig:
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
     local_scan_thin: int = 1
+    local_scan_min_ess: float = 10.0
+    local_scan_min_ess_fraction: float = 1e-3
+    local_scan_q_lower_factor: float = 0.25
+    local_scan_q_upper_factor: float = 4.0
+    local_scan_variance_near_min_ratio: float = 1.20
 
 
 @dataclass(frozen=True)
@@ -334,8 +339,11 @@ def local_beta_scan(
     *,
     beta_center: float,
     sigma_t: float,
+    q_target: float,
     seed: int,
 ) -> dict[str, Any]:
+    if cfg.local_scan_variance_near_min_ratio < 1.0:
+        raise ValueError("local_scan_variance_near_min_ratio must be >= 1.")
     if not cfg.local_scan_enabled:
         return {
             "enabled": False,
@@ -386,25 +394,74 @@ def local_beta_scan(
             if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm) and res.snis_variance_obm > 0.0
             else np.nan
         )
-        score = float(np.log(var_hat)) if np.isfinite(var_hat) and var_hat > 0.0 else float("inf")
+        q_hat = float(res.tail_share_raw_sample)
+        q_log_ratio_abs = (
+            float(abs(np.log(q_hat / q_target)))
+            if q_hat > 0.0 and np.isfinite(q_hat) and q_target > 0.0 and np.isfinite(q_target)
+            else float("inf")
+        )
+        ess = float(res.ess)
+        weight_cv = float(res.weight_summary.cv)
+        n_weighted_samples = int(res.n_weighted_samples)
+        ess_guardrail_min = float(max(cfg.local_scan_min_ess, cfg.local_scan_min_ess_fraction * n_weighted_samples))
+        guardrail_fail_reasons: list[str] = []
+        if not np.isfinite(var_hat) or var_hat <= 0.0:
+            guardrail_fail_reasons.append("variance_estimate_nonpositive")
+        if not np.isfinite(q_hat) or q_hat < float(cfg.local_scan_q_lower_factor * q_target):
+            guardrail_fail_reasons.append("q_hat_below_guardrail")
+        if not np.isfinite(q_hat) or q_hat > float(cfg.local_scan_q_upper_factor * q_target):
+            guardrail_fail_reasons.append("q_hat_above_guardrail")
+        if not np.isfinite(ess) or ess < ess_guardrail_min:
+            guardrail_fail_reasons.append("ess_below_guardrail")
         rows.append(
             {
                 "beta": float(beta),
                 "estimate": float(res.estimate),
                 "variance_estimate": var_hat,
-                "q_hat": float(res.tail_share_raw_sample),
-                "ess": float(res.ess),
+                "q_hat": q_hat,
+                "q_log_ratio_abs": q_log_ratio_abs,
+                "ess": ess,
+                "n_weighted_samples": n_weighted_samples,
+                "ess_guardrail_min": ess_guardrail_min,
                 "acceptance_rate": float(res.overall_acceptance_rate),
-                "weight_cv": float(res.weight_summary.cv),
-                "score": score,
+                "weight_cv": weight_cv,
+                "guardrail_passed": int(not guardrail_fail_reasons),
+                "guardrail_fail_reasons": guardrail_fail_reasons,
+                "variance_ratio_to_best": None,
+                "within_variance_tolerance": None,
             }
         )
 
-    finite_rows = [row for row in rows if np.isfinite(row["score"])]
-    if finite_rows:
-        best = min(finite_rows, key=lambda row: row["score"])
-        selected_beta = float(best["beta"])
-        selected_reason = "min_estimated_variance"
+    eligible_indices = [idx for idx, row in enumerate(rows) if bool(row["guardrail_passed"])]
+    candidate_indices = eligible_indices or [
+        idx for idx, row in enumerate(rows)
+        if np.isfinite(row["variance_estimate"]) and float(row["variance_estimate"]) > 0.0
+    ]
+    if candidate_indices:
+        best_var_hat = float(min(float(rows[idx]["variance_estimate"]) for idx in candidate_indices))
+        variance_limit = float(best_var_hat * cfg.local_scan_variance_near_min_ratio)
+        near_min_indices: list[int] = []
+        for idx in candidate_indices:
+            var_hat = float(rows[idx]["variance_estimate"])
+            ratio = float(var_hat / best_var_hat) if best_var_hat > 0.0 else float("inf")
+            within_tol = bool(var_hat <= variance_limit)
+            rows[idx]["variance_ratio_to_best"] = ratio
+            rows[idx]["within_variance_tolerance"] = int(within_tol)
+            if within_tol:
+                near_min_indices.append(idx)
+        best_idx = min(
+            near_min_indices,
+            key=lambda idx: (
+                float(rows[idx]["beta"]),
+                float(rows[idx]["variance_estimate"]),
+            ),
+        )
+        selected_beta = float(rows[best_idx]["beta"])
+        selected_reason = (
+            "smallest_beta_within_variance_tolerance"
+            if eligible_indices
+            else "smallest_beta_within_variance_tolerance_no_guardrail_survivors"
+        )
     else:
         selected_beta = float(beta_center)
         selected_reason = "fallback_beta_center"
@@ -417,6 +474,20 @@ def local_beta_scan(
         "burn_in": int(burn_in),
         "scan_eval_total": int(len(betas) * _mcmc_eval_count(steps_per_chain, cfg.local_scan_chains)),
         "scan_wall_time_sec": float(time.perf_counter() - t_start),
+        "selection_metrics": {
+            "selection_rule": {
+                "type": "smallest_beta_within_variance_tolerance",
+                "variance_near_min_ratio": float(cfg.local_scan_variance_near_min_ratio),
+                "preference_within_tolerance": "smaller_beta",
+            },
+            "guardrails": {
+                "variance_estimate_positive": True,
+                "q_hat_min_factor": float(cfg.local_scan_q_lower_factor),
+                "q_hat_max_factor": float(cfg.local_scan_q_upper_factor),
+                "min_ess": float(cfg.local_scan_min_ess),
+                "min_ess_fraction_of_weighted_samples": float(cfg.local_scan_min_ess_fraction),
+            },
+        },
         "rows": rows,
     }
 
@@ -483,7 +554,14 @@ def build_beta_workflow(
             "selected_reason": "beta_override",
         }
     else:
-        scan = local_beta_scan(problem, cfg, beta_center=beta_tuned, sigma_t=float(sigma_t), seed=seed + 7)
+        scan = local_beta_scan(
+            problem,
+            cfg,
+            beta_center=beta_tuned,
+            sigma_t=float(sigma_t),
+            q_target=q_target,
+            seed=seed + 7,
+        )
         beta_used = float(scan["selected_beta"])
 
     beta_selection_eval_total = int(tuning_eval_total + int(scan.get("scan_eval_total", 0)))
@@ -1360,23 +1438,19 @@ def plot_cross_method_max_budget(
     labels = ["IID", "MCMC-IS", "SAMC"]
 
     est_data = []
-    var_data = []
     rmse_data = []
     for method in methods:
         sub = [row for row in rows if row["method"] == method]
         est = np.asarray([row["estimate"] for row in sub], dtype=float)
-        var_hat = np.asarray([row["variance_estimate"] for row in sub], dtype=float)
         rse = np.asarray([row["root_squared_error"] for row in sub], dtype=float)
         if method == "iid":
             tail_hits = np.asarray([row.get("tail_hits", 0) for row in sub], dtype=int)
             est[tail_hits <= 0] = np.nan
-            var_hat[tail_hits <= 0] = np.nan
             rse[tail_hits <= 0] = np.nan
         est_data.append(_positive_for_plot(est))
-        var_data.append(_positive_for_plot(var_hat))
         rmse_data.append(_positive_for_plot(rse))
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2))
     axes[0].boxplot(est_data, tick_labels=labels, showfliers=False)
     if _has_positive_finite(est_data):
         axes[0].set_yscale("log")
@@ -1386,19 +1460,12 @@ def plot_cross_method_max_budget(
     axes[0].set_ylabel("p_hat")
     axes[0].legend()
 
-    axes[1].boxplot(var_data, tick_labels=labels, showfliers=False)
-    if _has_positive_finite(var_data):
-        axes[1].set_yscale("log")
-    _set_log_ylim(axes[1], var_data)
-    axes[1].set_title("Variance estimate distribution")
-    axes[1].set_ylabel("var_hat")
-
-    axes[2].boxplot(rmse_data, tick_labels=labels, showfliers=False)
+    axes[1].boxplot(rmse_data, tick_labels=labels, showfliers=False)
     if _has_positive_finite(rmse_data):
-        axes[2].set_yscale("log")
-    _set_log_ylim(axes[2], rmse_data)
-    axes[2].set_title("RMSE across repeats")
-    axes[2].set_ylabel("root squared error")
+        axes[1].set_yscale("log")
+    _set_log_ylim(axes[1], rmse_data)
+    axes[1].set_title("RMSE across repeats")
+    axes[1].set_ylabel("root squared error")
 
     title = f"Cross-method comparison: {scenario_name}\nmax iterations={max_budget:,}, true p={exact_p:.3e}"
     if beta_workflow is not None:
@@ -1427,17 +1494,15 @@ def plot_cross_method_convergence(
     labels = {"iid": "IID", "mcmc_is": "MCMC-IS", "samc": "SAMC"}
     colors = {"iid": "#4e79a7", "mcmc_is": "#f28e2b", "samc": "#59a14f"}
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2))
     for method in methods:
         sub = sorted([row for row in summary if row["method"] == method], key=lambda row: row["checkpoint"])
         x = np.asarray([row["checkpoint"] for row in sub], dtype=float)
         mean_est = np.asarray([row["mean_estimate"] for row in sub], dtype=float)
         rmse = np.asarray([row["rmse"] for row in sub], dtype=float)
-        mean_var = np.asarray([row["mean_variance_estimate"] for row in sub], dtype=float)
 
         axes[0].plot(x, mean_est, marker="o", label=labels[method], color=colors[method])
         axes[1].plot(x, rmse, marker="o", label=labels[method], color=colors[method])
-        axes[2].plot(x, mean_var, marker="o", label=labels[method], color=colors[method])
 
     axes[0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
     for ax in axes:
@@ -1447,14 +1512,10 @@ def plot_cross_method_convergence(
         axes[0].set_yscale("log")
     if _has_positive_finite([np.asarray([row["rmse"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
         axes[1].set_yscale("log")
-    if _has_positive_finite([np.asarray([row["mean_variance_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
-        axes[2].set_yscale("log")
     axes[0].set_title("Mean estimate vs iterations")
     axes[0].set_ylabel("p_hat")
     axes[1].set_title("RMSE vs iterations")
     axes[1].set_ylabel("RMSE")
-    axes[2].set_title("Mean variance estimate vs iterations")
-    axes[2].set_ylabel("var_hat")
     axes[0].legend()
     fig.suptitle(
         f"Cross-method convergence: {scenario_name} (true p={exact_p:.3e})\n"
