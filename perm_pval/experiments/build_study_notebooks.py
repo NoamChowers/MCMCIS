@@ -143,8 +143,8 @@ def build_cross_method_notebook() -> dict:
             )
             mcmc_cfg = MCMCWorkflowConfig(
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
-                tune_steps=12_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=80_000 if not FAST_MODE else 4_000,
+                tune_steps=2_000 if not FAST_MODE else 1_000,
+                local_scan_total_steps=40_000 if not FAST_MODE else 4_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
@@ -325,8 +325,8 @@ def build_beta_notebook() -> dict:
 
             mcmc_cfg = MCMCWorkflowConfig(
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
-                tune_steps=12_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=80_000 if not FAST_MODE else 4_000,
+                tune_steps=2_000 if not FAST_MODE else 1_000,
+                local_scan_total_steps=40_000 if not FAST_MODE else 4_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,

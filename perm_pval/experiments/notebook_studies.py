@@ -51,7 +51,7 @@ class MCMCWorkflowConfig:
     pilot_samples: int = 20_000
     scale_method: str = "sd"
     beta_max_init: float = 1e6
-    tune_steps: int = 12_000
+    tune_steps: int = 2_000
     tune_burn_in_fraction: float = 0.20
     tune_thin: int = 2
     tune_bracket_factor: float = 2.0
@@ -71,7 +71,7 @@ class MCMCWorkflowConfig:
     proposal_swaps: int | None = None
     local_scan_enabled: bool = True
     local_scan_multipliers: tuple[float, ...] = (0.50, 0.75, 1.00, 1.25, 1.5)
-    local_scan_total_steps: int = 80_000
+    local_scan_total_steps: int = 40_000
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
     local_scan_thin: int = 1
