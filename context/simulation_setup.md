@@ -4,6 +4,7 @@ This note proposes *implementation-oriented* simulation designs that (i) cover a
 
 Related note:
 - See `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/checkpoints.md` for how simulation checkpoints are interpreted in the current notebooks. In particular, cross-method checkpoints are total budgets, while beta-diagnostic checkpoints are production-only.
+- See `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/multiprocessing.md` for the current process-parallel execution strategy and the recommended `N_JOBS` defaults.
 
 ---
 

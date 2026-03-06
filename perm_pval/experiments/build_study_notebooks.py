@@ -47,6 +47,7 @@ def _common_setup_code() -> str:
     from __future__ import annotations
 
     import json
+    import os
     import sys
     from pathlib import Path
 
@@ -128,6 +129,7 @@ def build_cross_method_notebook() -> dict:
 
             ESTIMATION_POINTS = (10_000, 100_000, 1_000_000) if not FAST_MODE else (2_000, 10_000, 20_000)
             N_REPEATS = 5 if not FAST_MODE else 2
+            N_JOBS = min(N_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
             BASE_SEED = 12_345
 
@@ -137,6 +139,7 @@ def build_cross_method_notebook() -> dict:
                 base_seed=BASE_SEED,
                 iid_density_samples=120_000 if not FAST_MODE else 10_000,
                 min_tail_states=MIN_TAIL_STATES,
+                n_jobs=N_JOBS,
             )
             mcmc_cfg = MCMCWorkflowConfig(
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
@@ -160,6 +163,7 @@ def build_cross_method_notebook() -> dict:
                 "SCENARIO_KEYS_TO_RUN": SCENARIO_KEYS_TO_RUN,
                 "ESTIMATION_POINTS": ESTIMATION_POINTS,
                 "N_REPEATS": N_REPEATS,
+                "N_JOBS": N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
             }, indent=2))
             """
@@ -316,6 +320,7 @@ def build_beta_notebook() -> dict:
             ESTIMATION_POINTS = (10_000, 100_000, 1_000_000) if not FAST_MODE else (2_000, 10_000, 20_000)
             BETA_MULTIPLIERS = (0.70, 0.90, 1.00, 1.15, 1.35)
             BETA_REPEATS = 5 if not FAST_MODE else 2
+            N_JOBS = min(BETA_REPEATS, os.cpu_count() or 1)
             BASE_SEED = 54_321
 
             mcmc_cfg = MCMCWorkflowConfig(
@@ -336,6 +341,7 @@ def build_beta_notebook() -> dict:
                 estimate_variance=True,
                 proposal_fraction=0.075,
                 base_seed=BASE_SEED,
+                n_jobs=N_JOBS,
             )
 
             print(json.dumps({
@@ -344,6 +350,7 @@ def build_beta_notebook() -> dict:
                 "ESTIMATION_POINTS": ESTIMATION_POINTS,
                 "BETA_MULTIPLIERS": BETA_MULTIPLIERS,
                 "BETA_REPEATS": BETA_REPEATS,
+                "N_JOBS": N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
             }, indent=2))
             """

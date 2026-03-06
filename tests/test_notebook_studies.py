@@ -76,6 +76,24 @@ def _assert_same_png_pixels(path_a, path_b) -> None:
     assert np.array_equal(img_a, img_b)
 
 
+def _strip_runtime_fields(rows):
+    out = []
+    for row in rows:
+        clean = dict(row)
+        clean.pop("wall_time_sec", None)
+        out.append(clean)
+    return out
+
+
+def _strip_runtime_summary_fields(rows):
+    out = []
+    for row in rows:
+        clean = dict(row)
+        clean.pop("mean_wall_time_sec", None)
+        out.append(clean)
+    return out
+
+
 def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     scenario = _small_right_tail_scenario()
     cross_cfg = CrossMethodStudyConfig(
@@ -203,3 +221,76 @@ def test_saved_beta_outputs_can_be_reloaded_and_replotted(tmp_path):
     assert all(path.exists() for path in regen.values())
     _assert_same_png_pixels(out_dir / "beta_max_budget.png", regen["beta_max_budget"])
     _assert_same_png_pixels(out_dir / "beta_convergence.png", regen["beta_convergence"])
+
+
+def test_cross_method_parallel_matches_serial():
+    scenario = _small_right_tail_scenario()
+    serial_cfg = CrossMethodStudyConfig(
+        estimation_points=(500, 800),
+        repeats=2,
+        iid_density_samples=20,
+        base_seed=123,
+        n_jobs=1,
+    )
+    parallel_cfg = CrossMethodStudyConfig(
+        estimation_points=(500, 800),
+        repeats=2,
+        iid_density_samples=20,
+        base_seed=123,
+        n_jobs=2,
+    )
+    mcmc_cfg = _small_mcmc_cfg()
+    samc_cfg = _small_samc_cfg()
+
+    serial = run_cross_method_study(scenario, serial_cfg, mcmc_cfg, samc_cfg)
+    parallel = run_cross_method_study(scenario, parallel_cfg, mcmc_cfg, samc_cfg)
+
+    assert _strip_runtime_fields(serial["records"]) == _strip_runtime_fields(parallel["records"])
+    assert _strip_runtime_summary_fields(serial["summary"]) == _strip_runtime_summary_fields(parallel["summary"])
+
+
+def test_beta_study_parallel_matches_serial():
+    scenario = _small_right_tail_scenario()
+    mcmc_cfg = _small_mcmc_cfg()
+    beta_workflow = build_beta_workflow(
+        scenario.problem,
+        scenario.exact_p,
+        mcmc_cfg,
+        seed=321,
+    )
+    serial_cfg = BetaSweepStudyConfig(
+        estimation_points=(20, 40),
+        repeats=2,
+        beta_multipliers=(1.0, 1.2),
+        chains=1,
+        thin=1,
+        base_seed=999,
+        n_jobs=1,
+    )
+    parallel_cfg = BetaSweepStudyConfig(
+        estimation_points=(20, 40),
+        repeats=2,
+        beta_multipliers=(1.0, 1.2),
+        chains=1,
+        thin=1,
+        base_seed=999,
+        n_jobs=2,
+    )
+
+    serial = run_beta_checkpoint_study(
+        scenario.problem,
+        scenario.exact_p,
+        beta_center=float(beta_workflow["beta_used"]),
+        sigma_t=float(beta_workflow["sigma_t"]),
+        beta_cfg=serial_cfg,
+    )
+    parallel = run_beta_checkpoint_study(
+        scenario.problem,
+        scenario.exact_p,
+        beta_center=float(beta_workflow["beta_used"]),
+        sigma_t=float(beta_workflow["sigma_t"]),
+        beta_cfg=parallel_cfg,
+    )
+
+    assert _strip_runtime_fields(serial["records"]) == _strip_runtime_fields(parallel["records"])
+    assert _strip_runtime_summary_fields(serial["summary"]) == _strip_runtime_summary_fields(parallel["summary"])

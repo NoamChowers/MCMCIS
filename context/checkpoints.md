@@ -163,3 +163,4 @@ If future code changes checkpoint behavior, update this note together with:
 
 - `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/diagnostics.md`
 - `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/results_replot.md`
+- `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/multiprocessing.md`

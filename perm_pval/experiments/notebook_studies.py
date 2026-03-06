@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import math
+import multiprocessing as mp
 import time
+import warnings
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -67,7 +70,7 @@ class MCMCWorkflowConfig:
     proposal_fraction: float = 0.075
     proposal_swaps: int | None = None
     local_scan_enabled: bool = True
-    local_scan_multipliers: tuple[float, ...] = (0.70, 0.90, 1.00, 1.15, 1.35)
+    local_scan_multipliers: tuple[float, ...] = (0.50, 0.75, 1.00, 1.25, 1.5)
     local_scan_total_steps: int = 80_000
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
@@ -94,13 +97,14 @@ class CrossMethodStudyConfig:
     iid_density_samples: int = 120_000
     min_tail_states: int = 2
     confidence_level: float = 0.95
+    n_jobs: int = 1
 
 
 @dataclass(frozen=True)
 class BetaSweepStudyConfig:
     estimation_points: tuple[int, ...]
     repeats: int = 5
-    beta_multipliers: tuple[float, ...] = (0.70, 0.90, 1.00, 1.15, 1.35)
+    beta_multipliers: tuple[float, ...] = (0.50, 0.75, 1.00, 1.25, 1.5)
     chains: int = 2
     burn_in_fraction: float = 0.20
     thin: int = 1
@@ -110,6 +114,7 @@ class BetaSweepStudyConfig:
     proposal_fraction: float = 0.075
     proposal_swaps: int | None = None
     base_seed: int = 54_321
+    n_jobs: int = 1
 
 
 @dataclass(frozen=True)
@@ -220,6 +225,32 @@ def create_timestamped_run_dir(root: Path, prefix: str) -> Path:
     run_dir = Path(root) / f"{ts}_{prefix}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def _effective_n_jobs(n_jobs: int, n_tasks: int) -> int:
+    if n_tasks <= 0:
+        return 1
+    if n_jobs is None:
+        requested = 1
+    else:
+        requested = int(n_jobs)
+    if requested <= 1:
+        return 1
+    return max(1, min(requested, n_tasks))
+
+
+def _try_make_process_pool(n_jobs: int) -> cf.ProcessPoolExecutor | None:
+    if int(n_jobs) <= 1:
+        return None
+    mp_ctx = mp.get_context("spawn")
+    try:
+        return cf.ProcessPoolExecutor(max_workers=int(n_jobs), mp_context=mp_ctx)
+    except (PermissionError, NotImplementedError, OSError) as exc:
+        warnings.warn(
+            f"ProcessPoolExecutor unavailable in this runtime ({exc}). Falling back to serial execution.",
+            RuntimeWarning,
+        )
+        return None
 
 
 def samc_variance_proxy(p_hat: float, n_steps: int, burn_in: int) -> float:
@@ -954,6 +985,125 @@ def _run_samc_cumulative_checkpoints(
     return rows
 
 
+def _iid_replicate_worker(
+    *,
+    scenario_key: str,
+    scenario_display: str,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    rep: int,
+    rep_seed: int,
+    confidence_level: float,
+) -> list[dict[str, Any]]:
+    rows = _run_iid_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=checkpoints,
+        seed=rep_seed,
+        confidence_level=confidence_level,
+    )
+    for row in rows:
+        row["scenario"] = scenario_key
+        row["scenario_display"] = scenario_display
+        row["replicate"] = int(rep)
+        row["beta_selection_budget"] = 0
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+    return rows
+
+
+def _mcmc_cross_replicate_worker(
+    *,
+    scenario_key: str,
+    scenario_display: str,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    mcmc_chain_checkpoints: tuple[int, ...],
+    beta_workflow: dict[str, Any],
+    beta_selection_budget: int,
+    mcmc_cfg: MCMCWorkflowConfig,
+    rep: int,
+    rep_seed: int,
+) -> list[dict[str, Any]]:
+    rows = _run_mcmc_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=mcmc_chain_checkpoints,
+        reported_checkpoints=checkpoints,
+        beta=float(beta_workflow["beta_used"]),
+        sigma_t=float(beta_workflow["sigma_t"]),
+        cfg=mcmc_cfg,
+        seed=rep_seed + 1,
+    )
+    for row in rows:
+        row["scenario"] = scenario_key
+        row["scenario_display"] = scenario_display
+        row["replicate"] = int(rep)
+        row["beta_selection_budget"] = int(beta_selection_budget)
+        row["eval_incl_tuning"] = float(int(row["mcmc_chain_budget"]) + beta_selection_budget)
+    return rows
+
+
+def _samc_replicate_worker(
+    *,
+    scenario_key: str,
+    scenario_display: str,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    samc_setup: dict[str, Any],
+    samc_cfg: SAMCWorkflowConfig,
+    rep: int,
+    rep_seed: int,
+) -> list[dict[str, Any]]:
+    rows = _run_samc_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=checkpoints,
+        samc_setup=samc_setup,
+        cfg=samc_cfg,
+        seed=rep_seed + 2,
+    )
+    for row in rows:
+        row["scenario"] = scenario_key
+        row["scenario_display"] = scenario_display
+        row["replicate"] = int(rep)
+        row["beta_selection_budget"] = 0
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+    return rows
+
+
+def _beta_replicate_worker(
+    *,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    beta: float,
+    sigma_t: float,
+    beta_cfg: BetaSweepStudyConfig,
+    rep: int,
+    rep_seed: int,
+    multiplier: float,
+) -> list[dict[str, Any]]:
+    beta_rows = _run_mcmc_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=checkpoints,
+        beta=beta,
+        sigma_t=sigma_t,
+        cfg=beta_cfg,
+        seed=rep_seed,
+    )
+    for row in beta_rows:
+        row["beta_multiplier"] = float(multiplier)
+        row["beta"] = float(beta)
+        row["replicate"] = int(rep)
+        row["seed"] = int(rep_seed)
+        row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
+    return beta_rows
+
+
 def summarize_records(
     records: list[dict[str, Any]],
     *,
@@ -1063,52 +1213,113 @@ def run_cross_method_study(
         )
 
     records: list[dict[str, Any]] = []
-    for rep in range(cross_cfg.repeats):
-        rep_seed = int(cross_cfg.base_seed + 1_000 * rep)
-        rows = []
-        rows.extend(
-            _run_iid_cumulative_checkpoints(
-                scenario.problem,
-                scenario.exact_p,
-                checkpoints=checkpoints,
-                seed=rep_seed,
-                confidence_level=cross_cfg.confidence_level,
-            )
-        )
-        rows.extend(
-            _run_mcmc_cumulative_checkpoints(
-                scenario.problem,
-                scenario.exact_p,
-                checkpoints=mcmc_chain_checkpoints,
-                reported_checkpoints=checkpoints,
-                beta=float(beta_workflow["beta_used"]),
-                sigma_t=float(beta_workflow["sigma_t"]),
-                cfg=mcmc_cfg,
-                seed=rep_seed + 1,
-            )
-        )
-        rows.extend(
-            _run_samc_cumulative_checkpoints(
-                scenario.problem,
-                scenario.exact_p,
-                checkpoints=checkpoints,
-                samc_setup=samc_setup,
-                cfg=samc_cfg,
-                seed=rep_seed + 2,
-            )
-        )
-        for row in rows:
-            row["scenario"] = scenario.key
-            row["scenario_display"] = scenario.description
-            row["replicate"] = int(rep)
-            if row["method"] == "mcmc_is":
-                row["beta_selection_budget"] = int(beta_selection_budget)
-                row["eval_incl_tuning"] = float(int(row["mcmc_chain_budget"]) + beta_selection_budget)
-            else:
-                row["beta_selection_budget"] = 0
-                row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
-            records.append(row)
+    repeat_jobs = [(int(rep), int(cross_cfg.base_seed + 1_000 * rep)) for rep in range(cross_cfg.repeats)]
+    n_jobs = _effective_n_jobs(cross_cfg.n_jobs, len(repeat_jobs))
 
+    executor = _try_make_process_pool(n_jobs) if n_jobs > 1 else None
+
+    if executor is None:
+        for rep, rep_seed in repeat_jobs:
+            records.extend(
+                _iid_replicate_worker(
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                    confidence_level=cross_cfg.confidence_level,
+                )
+            )
+        for rep, rep_seed in repeat_jobs:
+            records.extend(
+                _mcmc_cross_replicate_worker(
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    mcmc_chain_checkpoints=mcmc_chain_checkpoints,
+                    beta_workflow=beta_workflow,
+                    beta_selection_budget=beta_selection_budget,
+                    mcmc_cfg=mcmc_cfg,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+            )
+        for rep, rep_seed in repeat_jobs:
+            records.extend(
+                _samc_replicate_worker(
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    samc_setup=samc_setup,
+                    samc_cfg=samc_cfg,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+            )
+    else:
+        with executor:
+            futures = [
+                executor.submit(
+                    _iid_replicate_worker,
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                    confidence_level=cross_cfg.confidence_level,
+                )
+                for rep, rep_seed in repeat_jobs
+            ]
+            for future in cf.as_completed(futures):
+                records.extend(future.result())
+
+            futures = [
+                executor.submit(
+                    _mcmc_cross_replicate_worker,
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    mcmc_chain_checkpoints=mcmc_chain_checkpoints,
+                    beta_workflow=beta_workflow,
+                    beta_selection_budget=beta_selection_budget,
+                    mcmc_cfg=mcmc_cfg,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+                for rep, rep_seed in repeat_jobs
+            ]
+            for future in cf.as_completed(futures):
+                records.extend(future.result())
+
+            futures = [
+                executor.submit(
+                    _samc_replicate_worker,
+                    scenario_key=scenario.key,
+                    scenario_display=scenario.description,
+                    problem=scenario.problem,
+                    exact_p=scenario.exact_p,
+                    checkpoints=checkpoints,
+                    samc_setup=samc_setup,
+                    samc_cfg=samc_cfg,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+                for rep, rep_seed in repeat_jobs
+            ]
+            for future in cf.as_completed(futures):
+                records.extend(future.result())
+
+    records = sorted(records, key=lambda row: (int(row["replicate"]), str(row["method"]), int(row["checkpoint"])))
     summary = summarize_records(records)
     density_summary = iid_stat_density_summary(
         scenario.problem,
@@ -1335,28 +1546,51 @@ def run_beta_checkpoint_study(
 ) -> dict[str, Any]:
     checkpoints = _sorted_unique_points(beta_cfg.estimation_points)
     rows: list[dict[str, Any]] = []
+    n_jobs = _effective_n_jobs(beta_cfg.n_jobs, beta_cfg.repeats)
 
-    for beta_idx, multiplier in enumerate(beta_cfg.beta_multipliers):
-        beta = float(beta_center * multiplier)
-        for rep in range(beta_cfg.repeats):
-            rep_seed = int(beta_cfg.base_seed + 10_000 * beta_idx + 100 * rep)
-            beta_rows = _run_mcmc_cumulative_checkpoints(
-                problem,
-                exact_p,
-                checkpoints=checkpoints,
-                beta=beta,
-                sigma_t=sigma_t,
-                cfg=beta_cfg,
-                seed=rep_seed,
-            )
-            for row in beta_rows:
-                row["beta_multiplier"] = float(multiplier)
-                row["beta"] = float(beta)
-                row["replicate"] = int(rep)
-                row["seed"] = int(rep_seed)
-                row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
-                rows.append(row)
+    executor = _try_make_process_pool(n_jobs) if n_jobs > 1 else None
 
+    if executor is None:
+        for beta_idx, multiplier in enumerate(beta_cfg.beta_multipliers):
+            beta = float(beta_center * multiplier)
+            for rep in range(beta_cfg.repeats):
+                rep_seed = int(beta_cfg.base_seed + 10_000 * beta_idx + 100 * rep)
+                rows.extend(
+                    _beta_replicate_worker(
+                        problem=problem,
+                        exact_p=exact_p,
+                        checkpoints=checkpoints,
+                        beta=beta,
+                        sigma_t=sigma_t,
+                        beta_cfg=beta_cfg,
+                        rep=rep,
+                        rep_seed=rep_seed,
+                        multiplier=multiplier,
+                    )
+                )
+    else:
+        with executor:
+            for beta_idx, multiplier in enumerate(beta_cfg.beta_multipliers):
+                beta = float(beta_center * multiplier)
+                futures = [
+                    executor.submit(
+                        _beta_replicate_worker,
+                        problem=problem,
+                        exact_p=exact_p,
+                        checkpoints=checkpoints,
+                        beta=beta,
+                        sigma_t=sigma_t,
+                        beta_cfg=beta_cfg,
+                        rep=rep,
+                        rep_seed=int(beta_cfg.base_seed + 10_000 * beta_idx + 100 * rep),
+                        multiplier=multiplier,
+                    )
+                    for rep in range(beta_cfg.repeats)
+                ]
+                for future in cf.as_completed(futures):
+                    rows.extend(future.result())
+
+    rows = sorted(rows, key=lambda row: (float(row["beta"]), int(row["replicate"]), int(row["checkpoint"])))
     summary = summarize_records(rows, group_fields=("checkpoint", "beta"))
     return {
         "records": rows,
