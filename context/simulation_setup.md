@@ -2,6 +2,9 @@
 
 This note proposes *implementation-oriented* simulation designs that (i) cover a range of null-statistic tail shapes, (ii) admit **ground-truth p-values** (exact or essentially exact), and (iii) resemble common application regimes (GWAS / particle physics / bioinformatics) while remaining tractable.
 
+Related note:
+- See `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/checkpoints.md` for how simulation checkpoints are interpreted in the current notebooks. In particular, cross-method checkpoints are total budgets, while beta-diagnostic checkpoints are production-only.
+
 ---
 
 
@@ -188,4 +191,3 @@ Before running a setting, choose a truth method:
 - Else if a classical exact test exists (Fisher, Wilcoxon) → use **T1**
 - Else if statistic is a sum with moderate integer totals → consider **T2**
 - Else fallback **T3 high-precision IID** for not-too-small p
-

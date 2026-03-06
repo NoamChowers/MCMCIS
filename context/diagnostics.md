@@ -7,6 +7,10 @@ Scope:
 - tiny p-value regime
 - replicated studies across fixed compute budgets
 
+Related note:
+- See `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/results_replot.md` for the saved-results schema and the disk-only replot workflow from `metadata.json`, `summary.json`, and `run_records.jsonl`.
+- See `/Users/noamchowers/Documents/University/Thesis/Code/MCMCIS/context/checkpoints.md` for the exact checkpoint semantics: continued trajectories, dynamic burn-in, and cross-method MCMC budget accounting.
+
 ## 1) Output artifacts
 
 Save three artifacts per study:

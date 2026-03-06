@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -199,6 +201,20 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def read_json(path: Path) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
 def create_timestamped_run_dir(root: Path, prefix: str) -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(root) / f"{ts}_{prefix}"
@@ -253,6 +269,14 @@ def _set_log_ylim(ax, arrays: list[np.ndarray], q_lo: float = 0.05, q_hi: float 
     hi = hi * pad
     if lo > 0.0 and hi > lo:
         ax.set_ylim(lo, hi)
+
+
+def _has_positive_finite(arrays: list[np.ndarray]) -> bool:
+    for arr in arrays:
+        a = np.asarray(arr, dtype=float)
+        if np.any(np.isfinite(a) & (a > 0.0)):
+            return True
+    return False
 
 
 def _stat_label(problem: PermutationTestProblem) -> str:
@@ -1143,7 +1167,8 @@ def plot_cross_method_max_budget(
 
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
     axes[0].boxplot(est_data, tick_labels=labels, showfliers=False)
-    axes[0].set_yscale("log")
+    if _has_positive_finite(est_data):
+        axes[0].set_yscale("log")
     axes[0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
     _set_log_ylim(axes[0], est_data)
     axes[0].set_title("Estimator distribution")
@@ -1151,13 +1176,15 @@ def plot_cross_method_max_budget(
     axes[0].legend()
 
     axes[1].boxplot(var_data, tick_labels=labels, showfliers=False)
-    axes[1].set_yscale("log")
+    if _has_positive_finite(var_data):
+        axes[1].set_yscale("log")
     _set_log_ylim(axes[1], var_data)
     axes[1].set_title("Variance estimate distribution")
     axes[1].set_ylabel("var_hat")
 
     axes[2].boxplot(rmse_data, tick_labels=labels, showfliers=False)
-    axes[2].set_yscale("log")
+    if _has_positive_finite(rmse_data):
+        axes[2].set_yscale("log")
     _set_log_ylim(axes[2], rmse_data)
     axes[2].set_title("RMSE across repeats")
     axes[2].set_ylabel("root squared error")
@@ -1205,9 +1232,12 @@ def plot_cross_method_convergence(
     for ax in axes:
         ax.set_xscale("log")
         ax.set_xlabel("iterations")
-    axes[0].set_yscale("log")
-    axes[1].set_yscale("log")
-    axes[2].set_yscale("log")
+    if _has_positive_finite([np.asarray([row["mean_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
+        axes[0].set_yscale("log")
+    if _has_positive_finite([np.asarray([row["rmse"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
+        axes[1].set_yscale("log")
+    if _has_positive_finite([np.asarray([row["mean_variance_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
+        axes[2].set_yscale("log")
     axes[0].set_title("Mean estimate vs iterations")
     axes[0].set_ylabel("p_hat")
     axes[1].set_title("RMSE vs iterations")
@@ -1367,7 +1397,8 @@ def plot_beta_sweep_max_budget(
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     axes[0, 0].boxplot(est_data, tick_labels=labels, showfliers=False)
-    axes[0, 0].set_yscale("log")
+    if _has_positive_finite(est_data):
+        axes[0, 0].set_yscale("log")
     axes[0, 0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
     _set_log_ylim(axes[0, 0], est_data)
     axes[0, 0].set_title("Estimator across beta")
@@ -1375,7 +1406,8 @@ def plot_beta_sweep_max_budget(
     axes[0, 0].legend()
 
     axes[0, 1].boxplot(var_data, tick_labels=labels, showfliers=False)
-    axes[0, 1].set_yscale("log")
+    if _has_positive_finite(var_data):
+        axes[0, 1].set_yscale("log")
     _set_log_ylim(axes[0, 1], var_data)
     axes[0, 1].set_title("Estimated variance across beta")
     axes[0, 1].set_ylabel("var_hat")
@@ -1385,7 +1417,8 @@ def plot_beta_sweep_max_budget(
     axes[0, 2].set_ylabel("q_hat")
 
     axes[1, 0].boxplot(ess_data, tick_labels=labels, showfliers=False)
-    axes[1, 0].set_yscale("log")
+    if _has_positive_finite(ess_data):
+        axes[1, 0].set_yscale("log")
     _set_log_ylim(axes[1, 0], ess_data)
     axes[1, 0].set_title("ESS across beta")
     axes[1, 0].set_ylabel("ESS")
@@ -1440,10 +1473,18 @@ def plot_beta_sweep_convergence(
     for ax in axes.flat:
         ax.set_xscale("log")
         ax.set_xlabel("iterations")
-    axes[0, 0].set_yscale("log")
-    axes[0, 1].set_yscale("log")
-    axes[0, 2].set_yscale("log")
-    axes[1, 1].set_yscale("log")
+    beta_est_arrays = [np.asarray([row["mean_estimate"] for row in summary if float(row["beta"]) == beta], dtype=float) for beta in betas]
+    beta_rmse_arrays = [np.asarray([row["rmse"] for row in summary if float(row["beta"]) == beta], dtype=float) for beta in betas]
+    beta_var_arrays = [np.asarray([row["mean_variance_estimate"] for row in summary if float(row["beta"]) == beta], dtype=float) for beta in betas]
+    beta_ess_arrays = [np.asarray([row["mean_ess"] for row in summary if float(row["beta"]) == beta], dtype=float) for beta in betas]
+    if _has_positive_finite(beta_est_arrays):
+        axes[0, 0].set_yscale("log")
+    if _has_positive_finite(beta_rmse_arrays):
+        axes[0, 1].set_yscale("log")
+    if _has_positive_finite(beta_var_arrays):
+        axes[0, 2].set_yscale("log")
+    if _has_positive_finite(beta_ess_arrays):
+        axes[1, 1].set_yscale("log")
     axes[0, 0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
     axes[0, 0].set_title("Mean estimate vs iterations")
     axes[0, 0].set_ylabel("p_hat")
@@ -1564,3 +1605,108 @@ def save_beta_sweep_outputs(
             "settings": study["settings"],
         },
     )
+
+
+def load_cross_method_saved_output(output_dir: Path) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    metadata = read_json(output_dir / "metadata.json")
+    summary = read_json(output_dir / "summary.json")
+    records = read_jsonl(output_dir / "run_records.jsonl")
+    return {
+        "output_dir": output_dir,
+        "metadata": metadata,
+        "summary": summary,
+        "records": records,
+    }
+
+
+def load_beta_sweep_saved_output(output_dir: Path) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    metadata = read_json(output_dir / "metadata.json")
+    summary = read_json(output_dir / "summary.json")
+    records = read_jsonl(output_dir / "run_records.jsonl")
+    return {
+        "output_dir": output_dir,
+        "metadata": metadata,
+        "summary": summary,
+        "records": records,
+    }
+
+
+def regenerate_cross_method_plots_from_saved(
+    output_dir: Path,
+    *,
+    save_dir: Path | None = None,
+) -> dict[str, Path]:
+    saved = load_cross_method_saved_output(output_dir)
+    metadata = saved["metadata"]
+    save_dir = Path(save_dir) if save_dir is not None else Path(output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    max_budget = int(max(metadata["estimation_points"]))
+    beta_workflow = metadata.get("beta_workflow", {})
+    mcmc_budget = int(
+        metadata.get(
+            "mcmc_beta_selection_budget",
+            beta_workflow.get("beta_selection_eval_total", 0),
+        )
+    )
+
+    out = {
+        "cross_method_max_budget": save_dir / "cross_method_max_budget.png",
+        "cross_method_convergence": save_dir / "cross_method_convergence.png",
+        "cross_method_diagnostics": save_dir / "cross_method_diagnostics.png",
+    }
+    plot_cross_method_max_budget(
+        saved["records"],
+        scenario_name=str(metadata["scenario_display"]),
+        exact_p=float(metadata["exact_p"]),
+        max_budget=max_budget,
+        beta_workflow=beta_workflow,
+        save_path=out["cross_method_max_budget"],
+    )
+    plot_cross_method_convergence(
+        saved["summary"],
+        scenario_name=str(metadata["scenario_display"]),
+        exact_p=float(metadata["exact_p"]),
+        mcmc_beta_selection_budget=mcmc_budget,
+        save_path=out["cross_method_convergence"],
+    )
+    plot_cross_method_diagnostics(
+        saved["summary"],
+        scenario_name=str(metadata["scenario_display"]),
+        mcmc_beta_selection_budget=mcmc_budget,
+        save_path=out["cross_method_diagnostics"],
+    )
+    return out
+
+
+def regenerate_beta_sweep_plots_from_saved(
+    output_dir: Path,
+    *,
+    save_dir: Path | None = None,
+) -> dict[str, Path]:
+    saved = load_beta_sweep_saved_output(output_dir)
+    metadata = saved["metadata"]
+    save_dir = Path(save_dir) if save_dir is not None else Path(output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    max_budget = int(max(metadata["settings"]["estimation_points"]))
+    out = {
+        "beta_max_budget": save_dir / "beta_max_budget.png",
+        "beta_convergence": save_dir / "beta_convergence.png",
+    }
+    plot_beta_sweep_max_budget(
+        saved["records"],
+        scenario_name=str(metadata["scenario_display"]),
+        exact_p=float(metadata["exact_p"]),
+        max_budget=max_budget,
+        save_path=out["beta_max_budget"],
+    )
+    plot_beta_sweep_convergence(
+        saved["summary"],
+        scenario_name=str(metadata["scenario_display"]),
+        exact_p=float(metadata["exact_p"]),
+        save_path=out["beta_convergence"],
+    )
+    return out

@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.image as mpimg
 
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.exact.brute_force import BruteForceExactSolver
@@ -9,8 +10,14 @@ from perm_pval.experiments.notebook_studies import (
     MCMCWorkflowConfig,
     SAMCWorkflowConfig,
     build_beta_workflow,
+    load_beta_sweep_saved_output,
+    load_cross_method_saved_output,
+    regenerate_beta_sweep_plots_from_saved,
+    regenerate_cross_method_plots_from_saved,
     run_beta_checkpoint_study,
     run_cross_method_study,
+    save_beta_sweep_outputs,
+    save_cross_method_outputs,
 )
 from perm_pval.stats.two_sample import difference_in_means
 
@@ -60,6 +67,13 @@ def _small_samc_cfg() -> SAMCWorkflowConfig:
         trace_every=5,
         lambda_min_pilot=20,
     )
+
+
+def _assert_same_png_pixels(path_a, path_b) -> None:
+    img_a = mpimg.imread(path_a)
+    img_b = mpimg.imread(path_b)
+    assert img_a.shape == img_b.shape
+    assert np.array_equal(img_a, img_b)
 
 
 def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
@@ -113,3 +127,79 @@ def test_run_beta_checkpoint_study_emits_rows_for_each_checkpoint():
 
     assert len(study["records"]) == 2
     assert sorted({row["checkpoint"] for row in study["records"]}) == [20, 40]
+
+
+def test_saved_cross_method_outputs_can_be_reloaded_and_replotted(tmp_path):
+    scenario = _small_right_tail_scenario()
+    cross_cfg = CrossMethodStudyConfig(
+        estimation_points=(500, 800),
+        repeats=1,
+        iid_density_samples=20,
+        base_seed=123,
+    )
+    mcmc_cfg = _small_mcmc_cfg()
+    samc_cfg = _small_samc_cfg()
+    study = run_cross_method_study(scenario, cross_cfg, mcmc_cfg, samc_cfg)
+
+    out_dir = tmp_path / "cross"
+    save_cross_method_outputs(
+        scenario,
+        study,
+        output_dir=out_dir,
+        cross_cfg=cross_cfg,
+        mcmc_cfg=mcmc_cfg,
+        samc_cfg=samc_cfg,
+    )
+
+    loaded = load_cross_method_saved_output(out_dir)
+    assert loaded["metadata"]["scenario"] == scenario.key
+    regen_dir = tmp_path / "cross_regen"
+    regen = regenerate_cross_method_plots_from_saved(out_dir, save_dir=regen_dir)
+    assert all(path.exists() for path in regen.values())
+    _assert_same_png_pixels(out_dir / "cross_method_max_budget.png", regen["cross_method_max_budget"])
+    _assert_same_png_pixels(out_dir / "cross_method_convergence.png", regen["cross_method_convergence"])
+    _assert_same_png_pixels(out_dir / "cross_method_diagnostics.png", regen["cross_method_diagnostics"])
+
+
+def test_saved_beta_outputs_can_be_reloaded_and_replotted(tmp_path):
+    scenario = _small_right_tail_scenario()
+    mcmc_cfg = _small_mcmc_cfg()
+    beta_workflow = build_beta_workflow(
+        scenario.problem,
+        scenario.exact_p,
+        mcmc_cfg,
+        seed=321,
+    )
+    beta_cfg = BetaSweepStudyConfig(
+        estimation_points=(20, 40),
+        repeats=1,
+        beta_multipliers=(1.0,),
+        chains=1,
+        thin=1,
+        base_seed=999,
+    )
+    study = run_beta_checkpoint_study(
+        scenario.problem,
+        scenario.exact_p,
+        beta_center=float(beta_workflow["beta_used"]),
+        sigma_t=float(beta_workflow["sigma_t"]),
+        beta_cfg=beta_cfg,
+    )
+
+    out_dir = tmp_path / "beta"
+    save_beta_sweep_outputs(
+        study,
+        output_dir=out_dir,
+        scenario_name=scenario.description,
+        exact_p=scenario.exact_p,
+        beta_cfg=beta_cfg,
+        beta_workflow=beta_workflow,
+    )
+
+    loaded = load_beta_sweep_saved_output(out_dir)
+    assert loaded["metadata"]["scenario_display"] == scenario.description
+    regen_dir = tmp_path / "beta_regen"
+    regen = regenerate_beta_sweep_plots_from_saved(out_dir, save_dir=regen_dir)
+    assert all(path.exists() for path in regen.values())
+    _assert_same_png_pixels(out_dir / "beta_max_budget.png", regen["beta_max_budget"])
+    _assert_same_png_pixels(out_dir / "beta_convergence.png", regen["beta_convergence"])

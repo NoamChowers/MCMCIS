@@ -73,7 +73,11 @@ def _common_setup_code() -> str:
         SAMCWorkflowConfig,
         build_beta_workflow,
         create_timestamped_run_dir,
+        load_beta_sweep_saved_output,
+        load_cross_method_saved_output,
         load_selected_scenarios,
+        regenerate_beta_sweep_plots_from_saved,
+        regenerate_cross_method_plots_from_saved,
         run_beta_checkpoint_study,
         run_cross_method_study,
         save_beta_sweep_outputs,
@@ -253,6 +257,28 @@ def build_cross_method_notebook() -> dict:
                 print("SAVE_OUTPUTS=False, so no saved figures to display.")
             """
         ),
+        markdown_cell("## Reload Saved Results Without Rerunning"),
+        code_cell(
+            """
+            RELOAD_SCENARIO_DIR = None
+            # Example:
+            # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260306_120000_cross_method" / "rank_sum_dp_n40"
+
+            if RELOAD_SCENARIO_DIR is not None:
+                saved = load_cross_method_saved_output(RELOAD_SCENARIO_DIR)
+                print(json.dumps({
+                    "scenario": saved["metadata"]["scenario"],
+                    "exact_p": saved["metadata"]["exact_p"],
+                    "mcmc_beta_selection_budget": saved["metadata"]["beta_workflow"]["beta_selection_eval_total"],
+                }, indent=2))
+                regen = regenerate_cross_method_plots_from_saved(RELOAD_SCENARIO_DIR)
+                for name, path in regen.items():
+                    print(name, path)
+                    display(Image(filename=str(path)))
+            else:
+                print("Set RELOAD_SCENARIO_DIR to a saved scenario directory to regenerate plots from disk only.")
+            """
+        ),
     ]
     return notebook(cells)
 
@@ -395,6 +421,28 @@ def build_beta_notebook() -> dict:
                 display(Image(filename=str(scenario_dir / "beta_convergence.png")))
             else:
                 print("SAVE_OUTPUTS=False, so no saved figures to display.")
+            """
+        ),
+        markdown_cell("## Reload Saved Results Without Rerunning"),
+        code_cell(
+            """
+            RELOAD_BETA_DIR = None
+            # Example:
+            # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260306_120000_beta_diag" / "rank_sum_dp_n40"
+
+            if RELOAD_BETA_DIR is not None:
+                saved = load_beta_sweep_saved_output(RELOAD_BETA_DIR)
+                print(json.dumps({
+                    "scenario_display": saved["metadata"]["scenario_display"],
+                    "exact_p": saved["metadata"]["exact_p"],
+                    "beta_center": saved["metadata"]["settings"]["beta_center"],
+                }, indent=2))
+                regen = regenerate_beta_sweep_plots_from_saved(RELOAD_BETA_DIR)
+                for name, path in regen.items():
+                    print(name, path)
+                    display(Image(filename=str(path)))
+            else:
+                print("Set RELOAD_BETA_DIR to a saved beta-study directory to regenerate plots from disk only.")
             """
         ),
     ]
