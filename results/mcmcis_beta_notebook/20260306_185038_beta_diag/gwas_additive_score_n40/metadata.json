@@ -1,0 +1,169 @@
+{
+  "scenario_display": "GWAS-like additive score: Binomial(2, maf=0.15) dosages, n=40, right-tail treated dosage sum with a near-extreme but non-max case set.",
+  "exact_p": 9.121811124035818e-07,
+  "beta_config": {
+    "estimation_points": [
+      333000,
+      1000000,
+      2500000,
+      5000000,
+      10000000
+    ],
+    "repeats": 5,
+    "beta_multipliers": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "chains": 2,
+    "burn_in_fraction": 0.2,
+    "thin": 1,
+    "estimate_variance": true,
+    "obm_batch_size": null,
+    "tilt_mode": "smooth_hinge",
+    "proposal_fraction": 0.075,
+    "proposal_swaps": null,
+    "base_seed": 54321,
+    "n_jobs": 5
+  },
+  "beta_workflow": {
+    "beta0_formula": 3.729266319053424,
+    "beta0_laplace": 3.650390625,
+    "beta_hat_tuned": 4.22076416015625,
+    "beta_used": 3.1655731201171875,
+    "sigma_t": 2.0239365543313843,
+    "p0_for_qtarget": 9.121811124035818e-07,
+    "q_target": 0.030904396624839247,
+    "q_hat_beta_hat": 0.03375,
+    "bracket_succeeded": true,
+    "n_short_chain_calls": 7,
+    "tuning_eval_total": 34007,
+    "tuning_wall_time_sec": 0.5773150409804657,
+    "beta_selection_eval_total": 234017,
+    "beta_selection_wall_time_sec": 6.022751873999368,
+    "local_scan": {
+      "enabled": true,
+      "selected_beta": 3.1655731201171875,
+      "selected_reason": "min_estimated_variance",
+      "steps_per_chain": 20000,
+      "burn_in": 4000,
+      "scan_eval_total": 200010,
+      "scan_wall_time_sec": 5.445436833018903,
+      "rows": [
+        {
+          "beta": 2.110382080078125,
+          "estimate": 6.796524598857153e-07,
+          "variance_estimate": 1.141387717313783e-13,
+          "q_hat": 0.00090625,
+          "ess": 734.4019160510809,
+          "acceptance_rate": 0.561075,
+          "weight_cv": 6.524788967295943,
+          "score": -29.80136139093083
+        },
+        {
+          "beta": 3.1655731201171875,
+          "estimate": 9.22447835955204e-07,
+          "variance_estimate": 1.0878047275451181e-13,
+          "q_hat": 0.0093125,
+          "ess": 72.16429699608652,
+          "acceptance_rate": 0.3991,
+          "weight_cv": 21.03408125983075,
+          "score": -29.84944455495628
+        },
+        {
+          "beta": 4.22076416015625,
+          "estimate": 2.7232915214430413e-06,
+          "variance_estimate": 5.058553778816413e-13,
+          "q_hat": 0.06040625,
+          "ess": 133.05034675905924,
+          "acceptance_rate": 0.288175,
+          "weight_cv": 15.476125459300643,
+          "score": -28.312525580939116
+        },
+        {
+          "beta": 5.2759552001953125,
+          "estimate": 2.480557739598663e-06,
+          "variance_estimate": 4.110135996150107e-12,
+          "q_hat": 0.18940625,
+          "ess": 4.3520959847486616,
+          "acceptance_rate": 0.208975,
+          "weight_cv": 85.7425157584228,
+          "score": -26.21756499888022
+        },
+        {
+          "beta": 6.331146240234375,
+          "estimate": 1.7984606899473228e-05,
+          "variance_estimate": 5.3609496253773696e-11,
+          "q_hat": 0.30821875,
+          "ess": 13.806698234659654,
+          "acceptance_rate": 0.1665,
+          "weight_cv": 48.13227200617915,
+          "score": -23.64929489463066
+        }
+      ]
+    },
+    "history_tail": [
+      {
+        "stage": "bisect",
+        "iter": 3,
+        "beta": 4.106689453125,
+        "q_hat": 0.0,
+        "accept_rate": 0.303
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 4,
+        "beta": 4.3348388671875,
+        "q_hat": 0.05375,
+        "accept_rate": 0.266
+      },
+      {
+        "stage": "bisect",
+        "iter": 4,
+        "beta": 4.3348388671875,
+        "q_hat": 0.05375,
+        "accept_rate": 0.266
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 5,
+        "beta": 4.22076416015625,
+        "q_hat": 0.03375,
+        "accept_rate": 0.297
+      },
+      {
+        "stage": "bisect",
+        "iter": 5,
+        "beta": 4.22076416015625,
+        "q_hat": 0.03375,
+        "accept_rate": 0.297
+      }
+    ],
+    "tune_steps": 2000,
+    "tune_burn_in": 400,
+    "tune_thin": 2
+  },
+  "settings": {
+    "estimation_points": [
+      333000,
+      1000000,
+      2500000,
+      5000000,
+      10000000
+    ],
+    "beta_center": 3.1655731201171875,
+    "sigma_t": 2.0239365543313843,
+    "beta_multipliers": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "chains": 2,
+    "thin": 1,
+    "burn_in_fraction": 0.2
+  }
+}

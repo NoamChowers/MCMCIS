@@ -1,0 +1,169 @@
+{
+  "scenario_display": "Binary treated-successes with exact p around 1e-7.",
+  "exact_p": 3.8542863904376695e-07,
+  "beta_config": {
+    "estimation_points": [
+      333000,
+      1000000,
+      2500000,
+      5000000,
+      10000000
+    ],
+    "repeats": 5,
+    "beta_multipliers": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "chains": 2,
+    "burn_in_fraction": 0.2,
+    "thin": 1,
+    "estimate_variance": true,
+    "obm_batch_size": null,
+    "tilt_mode": "smooth_hinge",
+    "proposal_fraction": 0.075,
+    "proposal_swaps": null,
+    "base_seed": 54321,
+    "n_jobs": 5
+  },
+  "beta_workflow": {
+    "beta0_formula": 3.8430339282662387,
+    "beta0_laplace": 3.396484375,
+    "beta_hat_tuned": 3.6278367042541504,
+    "beta_used": 2.720877528190613,
+    "sigma_t": 1.5506369662980637,
+    "p0_for_qtarget": 3.8542863904376695e-07,
+    "q_target": 0.024916440223237257,
+    "q_hat_beta_hat": 0.02,
+    "bracket_succeeded": true,
+    "n_short_chain_calls": 14,
+    "tuning_eval_total": 48014,
+    "tuning_wall_time_sec": 0.9632767079747282,
+    "beta_selection_eval_total": 248024,
+    "beta_selection_wall_time_sec": 6.4993007079465315,
+    "local_scan": {
+      "enabled": true,
+      "selected_beta": 2.720877528190613,
+      "selected_reason": "min_estimated_variance",
+      "steps_per_chain": 20000,
+      "burn_in": 4000,
+      "scan_eval_total": 200010,
+      "scan_wall_time_sec": 5.536023999971803,
+      "rows": [
+        {
+          "beta": 1.8139183521270752,
+          "estimate": 1.1344794080286265e-06,
+          "variance_estimate": 3.7579503177097953e-13,
+          "q_hat": 0.00140625,
+          "ess": 2096.0287714770175,
+          "acceptance_rate": 0.606125,
+          "weight_cv": 3.7771637514371834,
+          "score": -28.609732528425898
+        },
+        {
+          "beta": 2.720877528190613,
+          "estimate": 2.615602913854464e-07,
+          "variance_estimate": 1.263468394676431e-14,
+          "q_hat": 0.003625,
+          "ess": 248.86653726716872,
+          "acceptance_rate": 0.452375,
+          "weight_cv": 11.29526343409915,
+          "score": -32.00233066848989
+        },
+        {
+          "beta": 3.6278367042541504,
+          "estimate": 4.101966952449486e-07,
+          "variance_estimate": 6.526367952460832e-14,
+          "q_hat": 0.0355,
+          "ess": 3.8885413643948574,
+          "acceptance_rate": 0.323475,
+          "weight_cv": 90.7100150355475,
+          "score": -30.360340722794213
+        },
+        {
+          "beta": 4.534795880317688,
+          "estimate": 5.007389355414662e-07,
+          "variance_estimate": 1.630240138111544e-13,
+          "q_hat": 0.107125,
+          "ess": 12.762552879475775,
+          "acceptance_rate": 0.241325,
+          "weight_cv": 50.063313421194955,
+          "score": -29.444878880960225
+        },
+        {
+          "beta": 5.441755056381226,
+          "estimate": 3.757376323259301e-06,
+          "variance_estimate": 2.4347872547387675e-12,
+          "q_hat": 0.30671875,
+          "ess": 77.86584151902953,
+          "acceptance_rate": 0.1754,
+          "weight_cv": 20.247549458109475,
+          "score": -26.74116173292809
+        }
+      ]
+    },
+    "history_tail": [
+      {
+        "stage": "bisect",
+        "iter": 10,
+        "beta": 3.6253490447998047,
+        "q_hat": 0.00375,
+        "accept_rate": 0.3135
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 11,
+        "beta": 3.627007484436035,
+        "q_hat": 0.0,
+        "accept_rate": 0.371
+      },
+      {
+        "stage": "bisect",
+        "iter": 11,
+        "beta": 3.627007484436035,
+        "q_hat": 0.0,
+        "accept_rate": 0.371
+      },
+      {
+        "stage": "bisect:rep1",
+        "iter": 12,
+        "beta": 3.6278367042541504,
+        "q_hat": 0.02,
+        "accept_rate": 0.338
+      },
+      {
+        "stage": "bisect",
+        "iter": 12,
+        "beta": 3.6278367042541504,
+        "q_hat": 0.02,
+        "accept_rate": 0.338
+      }
+    ],
+    "tune_steps": 2000,
+    "tune_burn_in": 400,
+    "tune_thin": 2
+  },
+  "settings": {
+    "estimation_points": [
+      333000,
+      1000000,
+      2500000,
+      5000000,
+      10000000
+    ],
+    "beta_center": 2.720877528190613,
+    "sigma_t": 1.5506369662980637,
+    "beta_multipliers": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5
+    ],
+    "chains": 2,
+    "thin": 1,
+    "burn_in_fraction": 0.2
+  }
+}
