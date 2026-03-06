@@ -10,7 +10,11 @@ from typing import Any, Iterable, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
+from perm_pval.core.proposals import n_swap_pairs_from_fraction, propose_localized_swaps
 from perm_pval.core.problem import PermutationTestProblem
+from perm_pval.diagnostics.is_weights import effective_sample_size, summarize_weights
+from perm_pval.diagnostics.mcmc import obm_long_run_variance
+from perm_pval.diagnostics.samc import visitation_frequency
 from perm_pval.experiments.exact_scenarios import ExactScenario, load_saved_exact_scenarios
 from perm_pval.methods.beta_tuning import (
     estimate_scale_T,
@@ -19,9 +23,19 @@ from perm_pval.methods.beta_tuning import (
     make_short_chain_q_runner,
     tune_beta_to_target_q,
 )
-from perm_pval.methods.mcmc_is import run_mcmc_is
-from perm_pval.methods.random_sampling import run_random_sampling
-from perm_pval.methods.samc import run_samc
+from perm_pval.methods.mcmc_is import (
+    right_tail_deficit_scaled,
+    right_tail_step_shortfall,
+    run_mcmc_is,
+)
+from perm_pval.methods.random_sampling import run_random_sampling, wilson_interval
+from perm_pval.methods.samc import (
+    _bin_index,
+    _default_stepsize,
+    _paper_pvalue_estimate,
+    _relative_sampling_frequency_error,
+    run_samc,
+)
 
 
 @dataclass(frozen=True)
@@ -417,6 +431,9 @@ def build_beta_workflow(
         scan = local_beta_scan(problem, cfg, beta_center=beta_tuned, sigma_t=float(sigma_t), seed=seed + 7)
         beta_used = float(scan["selected_beta"])
 
+    beta_selection_eval_total = int(tuning_eval_total + int(scan.get("scan_eval_total", 0)))
+    beta_selection_wall_time_sec = float(tuning_wall_time_sec + float(scan.get("scan_wall_time_sec", 0.0)))
+
     return {
         "beta0_formula": beta0_formula,
         "beta0_laplace": float(beta0_laplace),
@@ -430,6 +447,8 @@ def build_beta_workflow(
         "n_short_chain_calls": int(n_short_calls),
         "tuning_eval_total": int(tuning_eval_total),
         "tuning_wall_time_sec": tuning_wall_time_sec,
+        "beta_selection_eval_total": beta_selection_eval_total,
+        "beta_selection_wall_time_sec": beta_selection_wall_time_sec,
         "local_scan": scan,
         "history_tail": tuning["history"][-5:],
         "tune_steps": int(cfg.tune_steps),
@@ -535,130 +554,379 @@ def _annotate_error_fields(row: dict[str, Any], exact_p: float) -> dict[str, Any
     return row
 
 
-def run_cross_method_checkpoint(
+def _run_iid_cumulative_checkpoints(
     problem: PermutationTestProblem,
     exact_p: float,
     *,
-    checkpoint: int,
-    rep_seed: int,
-    beta_workflow: dict[str, Any],
-    samc_setup: dict[str, Any],
-    cross_cfg: CrossMethodStudyConfig,
-    mcmc_cfg: MCMCWorkflowConfig,
-    samc_cfg: SAMCWorkflowConfig,
+    checkpoints: tuple[int, ...],
+    seed: int,
+    confidence_level: float,
 ) -> list[dict[str, Any]]:
+    checkpoints = _sorted_unique_points(checkpoints)
+    rng = np.random.default_rng(seed)
+    max_checkpoint = int(checkpoints[-1])
     rows: list[dict[str, Any]] = []
-    checkpoint = int(checkpoint)
+    next_idx = 0
+    tail_hits = 0
+    t_start = time.perf_counter()
+    for step in range(1, max_checkpoint + 1):
+        y = problem.sample_uniform_labels(rng)
+        tail_hits += int(problem.is_in_tail_y(y))
+        if next_idx < len(checkpoints) and step == checkpoints[next_idx]:
+            estimate = float(tail_hits / step)
+            standard_error = float(np.sqrt(estimate * (1.0 - estimate) / step))
+            ci_low, ci_high = wilson_interval(tail_hits, step, confidence_level=confidence_level)
+            rows.append(
+                _annotate_error_fields(
+                    {
+                        "method": "iid",
+                        "checkpoint": int(step),
+                        "estimate": estimate,
+                        "variance_estimate": float(standard_error ** 2),
+                        "tail_hits": int(tail_hits),
+                        "tail_share_raw": estimate,
+                        "zero_hits": int(tail_hits == 0),
+                        "wall_time_sec": float(time.perf_counter() - t_start),
+                        "eval_excl_tuning": float(step),
+                        "ci_low": float(ci_low),
+                        "ci_high": float(ci_high),
+                    },
+                    exact_p,
+                )
+            )
+            next_idx += 1
+            if next_idx >= len(checkpoints):
+                break
+    return rows
 
-    t0 = time.perf_counter()
-    iid = run_random_sampling(problem, n_samples=checkpoint, seed=rep_seed, confidence_level=cross_cfg.confidence_level)
-    iid_dt = float(time.perf_counter() - t0)
-    rows.append(
-        _annotate_error_fields(
-            {
-                "method": "iid",
-                "checkpoint": checkpoint,
-                "estimate": float(iid.estimate),
-                "variance_estimate": float(iid.standard_error ** 2),
-                "tail_hits": int(iid.tail_hits),
-                "tail_share_raw": float(iid.estimate),
-                "zero_hits": int(iid.tail_hits == 0),
-                "wall_time_sec": iid_dt,
-                "eval_excl_tuning": float(iid.n_samples),
-                "ci_low": float(iid.ci_low),
-                "ci_high": float(iid.ci_high),
-            },
-            exact_p,
+
+def _run_single_chain_full_trace(
+    problem: PermutationTestProblem,
+    rng: np.random.Generator,
+    *,
+    beta: float,
+    sigma_t: float,
+    n_steps: int,
+    init: str,
+    tilt_mode: str,
+    n_swap_pairs: int,
+    checkpoint_steps: tuple[int, ...],
+) -> dict[str, Any]:
+    if init == "observed":
+        y = problem.y_obs.copy()
+    elif init == "random":
+        y = problem.sample_uniform_labels(rng)
+    else:
+        raise ValueError("init must be either 'observed' or 'random'.")
+
+    t_cur = problem.compute_stat(y)
+    if tilt_mode == "smooth_hinge":
+        q_cur = right_tail_deficit_scaled(t_cur, problem.t_obs, sigma_t)
+    else:
+        q_cur = right_tail_step_shortfall(t_cur, problem.t_obs)
+
+    t_trace = np.empty(n_steps, dtype=float)
+    q_trace = np.empty(n_steps, dtype=float)
+    tail_trace = np.empty(n_steps, dtype=np.int8)
+    accepted_trace = np.zeros(n_steps, dtype=np.int8)
+    elapsed_by_step: dict[int, float] = {}
+
+    accepted = 0
+    t_start = time.perf_counter()
+    checkpoint_set = set(int(v) for v in checkpoint_steps)
+
+    for step in range(1, n_steps + 1):
+        y_prop = propose_localized_swaps(y, rng, n_swap_pairs=n_swap_pairs)
+        t_prop = problem.compute_stat(y_prop)
+        if tilt_mode == "smooth_hinge":
+            q_prop = right_tail_deficit_scaled(t_prop, problem.t_obs, sigma_t)
+        else:
+            q_prop = right_tail_step_shortfall(t_prop, problem.t_obs)
+
+        log_alpha = -beta * (q_prop - q_cur)
+        if log_alpha >= 0.0 or np.log(rng.random()) < log_alpha:
+            y = y_prop
+            t_cur = t_prop
+            q_cur = q_prop
+            accepted += 1
+            accepted_trace[step - 1] = 1
+
+        t_trace[step - 1] = float(t_cur)
+        q_trace[step - 1] = float(q_cur)
+        tail_trace[step - 1] = int(problem.is_in_tail(t_cur))
+        if step in checkpoint_set:
+            elapsed_by_step[int(step)] = float(time.perf_counter() - t_start)
+
+    return {
+        "t_trace": t_trace,
+        "q_trace": q_trace,
+        "tail_trace": tail_trace,
+        "accepted_trace": accepted_trace,
+        "accepted_total": int(accepted),
+        "elapsed_by_step": elapsed_by_step,
+    }
+
+
+def _mcmc_prefix_row(
+    *,
+    exact_p: float,
+    checkpoint: int,
+    steps_per_chain: int,
+    burn_in: int,
+    thin: int,
+    beta: float,
+    sigma_t: float,
+    tilt_mode: str,
+    estimate_variance: bool,
+    obm_batch_size: int | None,
+    traces: list[dict[str, Any]],
+    n_chains: int,
+) -> dict[str, Any]:
+    t_chunks: list[np.ndarray] = []
+    q_chunks: list[np.ndarray] = []
+    tail_chunks: list[np.ndarray] = []
+    retained_lengths: list[int] = []
+    acceptance_rates: list[float] = []
+    total_accepted = 0
+    total_proposals = int(steps_per_chain * n_chains)
+    wall_time_sec = 0.0
+
+    for trace in traces:
+        chain_t = trace["t_trace"][burn_in:steps_per_chain:thin]
+        chain_q = trace["q_trace"][burn_in:steps_per_chain:thin]
+        chain_tail = trace["tail_trace"][burn_in:steps_per_chain:thin]
+        t_chunks.append(chain_t)
+        q_chunks.append(chain_q)
+        tail_chunks.append(chain_tail)
+        retained_lengths.append(int(chain_q.size))
+
+        chain_accepted = int(np.sum(trace["accepted_trace"][:steps_per_chain]))
+        total_accepted += chain_accepted
+        acceptance_rates.append(float(chain_accepted / steps_per_chain))
+        wall_time_sec += float(trace["elapsed_by_step"][steps_per_chain])
+
+    q_samples = np.concatenate(q_chunks)
+    tail_indicators = np.concatenate(tail_chunks)
+    log_weights = beta * q_samples
+    shift = float(np.max(log_weights))
+    weights = np.exp(log_weights - shift)
+
+    weight_sum = float(np.sum(weights))
+    estimate = float(np.dot(weights, tail_indicators) / weight_sum)
+    ess = float(effective_sample_size(weights))
+    weight_summary = summarize_weights(weights)
+
+    snis_variance_obm = np.nan
+    snis_mcse_obm = np.nan
+    if estimate_variance:
+        n_total = int(weights.size)
+        mean_w = float(np.mean(weights))
+        h_all = weights * (tail_indicators - estimate)
+        if mean_w > 0.0 and n_total >= 4:
+            start = 0
+            var_mean_h = 0.0
+            for m in retained_lengths:
+                stop = start + m
+                h_chain = h_all[start:stop]
+                start = stop
+                sigma2_chain, _ = obm_long_run_variance(h_chain, batch_size=obm_batch_size)
+                if np.isfinite(sigma2_chain) and m > 0:
+                    var_mean_h += (m * sigma2_chain) / (n_total * n_total)
+            snis_variance_obm = float(var_mean_h / (mean_w * mean_w))
+            snis_mcse_obm = float(np.sqrt(max(snis_variance_obm, 0.0)))
+
+    return _annotate_error_fields(
+        {
+            "method": "mcmc_is",
+            "checkpoint": int(checkpoint),
+            "estimate": estimate,
+            "variance_estimate": float(snis_variance_obm) if np.isfinite(snis_variance_obm) else np.nan,
+            "snis_mcse_obm": float(snis_mcse_obm) if np.isfinite(snis_mcse_obm) else np.nan,
+            "tail_hits": int(np.sum(tail_indicators)),
+            "tail_share_raw": float(np.mean(tail_indicators)),
+            "ess": ess,
+            "acceptance_rate": float(total_accepted / total_proposals),
+            "weight_cv": float(weight_summary.cv),
+            "beta": float(beta),
+            "sigma_t": float(sigma_t),
+            "tilt_mode": str(tilt_mode),
+            "wall_time_sec": float(wall_time_sec),
+            "eval_excl_tuning": float(_mcmc_eval_count(steps_per_chain, n_chains)),
+            "n_weighted_samples": int(weights.size),
+            "acceptance_rates": acceptance_rates,
+        },
+        exact_p,
+    )
+
+
+def _run_mcmc_cumulative_checkpoints(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    *,
+    checkpoints: tuple[int, ...],
+    reported_checkpoints: tuple[int, ...] | None = None,
+    beta: float,
+    sigma_t: float,
+    cfg: MCMCWorkflowConfig | BetaSweepStudyConfig,
+    seed: int,
+) -> list[dict[str, Any]]:
+    checkpoints = _sorted_unique_points(checkpoints)
+    if reported_checkpoints is None:
+        reported_checkpoints = checkpoints
+    reported_checkpoints = tuple(int(v) for v in reported_checkpoints)
+    if len(reported_checkpoints) != len(checkpoints):
+        raise ValueError("reported_checkpoints must match checkpoints length.")
+    max_total_steps = int(checkpoints[-1])
+    max_steps_per_chain = _steps_per_chain(max_total_steps, cfg.chains)
+    steps_per_checkpoint = {int(cp): _steps_per_chain(int(cp), cfg.chains) for cp in checkpoints}
+    unique_step_checkpoints = tuple(sorted(set(steps_per_checkpoint.values())))
+
+    if cfg.proposal_swaps is not None:
+        n_swap_pairs = int(cfg.proposal_swaps)
+    else:
+        n_swap_pairs = n_swap_pairs_from_fraction(
+            problem.n_treated,
+            problem.n_control,
+            proposal_fraction=cfg.proposal_fraction,
         )
-    )
 
-    steps_per_chain = _steps_per_chain(checkpoint, mcmc_cfg.chains)
-    burn_in = _burn_in(steps_per_chain, mcmc_cfg.burn_in_fraction)
-    t0 = time.perf_counter()
-    mcmc = run_mcmc_is(
-        problem,
-        beta=float(beta_workflow["beta_used"]),
-        sigma_t=float(beta_workflow["sigma_t"]),
-        n_steps=steps_per_chain,
-        burn_in=burn_in,
-        thin=mcmc_cfg.thin,
-        n_chains=mcmc_cfg.chains,
-        seed=rep_seed + 1,
-        init="random",
-        tilt_mode=str(mcmc_cfg.tilt_mode),
-        proposal_fraction=mcmc_cfg.proposal_fraction,
-        proposal_swaps=mcmc_cfg.proposal_swaps,
-        estimate_variance=bool(mcmc_cfg.estimate_variance),
-        obm_batch_size=mcmc_cfg.obm_batch_size,
-    )
-    mcmc_dt = float(time.perf_counter() - t0)
-    rows.append(
-        _annotate_error_fields(
-            {
-                "method": "mcmc_is",
-                "checkpoint": checkpoint,
-                "estimate": float(mcmc.estimate),
-                "variance_estimate": (
-                    float(mcmc.snis_variance_obm)
-                    if mcmc.snis_variance_obm is not None and np.isfinite(mcmc.snis_variance_obm)
-                    else np.nan
-                ),
-                "snis_mcse_obm": (
-                    float(mcmc.snis_mcse_obm)
-                    if mcmc.snis_mcse_obm is not None and np.isfinite(mcmc.snis_mcse_obm)
-                    else np.nan
-                ),
-                "tail_hits": int(mcmc.tail_hits_weighted_sample),
-                "tail_share_raw": float(mcmc.tail_share_raw_sample),
-                "ess": float(mcmc.ess),
-                "acceptance_rate": float(mcmc.overall_acceptance_rate),
-                "weight_cv": float(mcmc.weight_summary.cv),
-                "beta": float(mcmc.beta),
-                "sigma_t": float(mcmc.sigma_t),
-                "tilt_mode": str(mcmc.tilt_mode),
-                "wall_time_sec": mcmc_dt,
-                "eval_excl_tuning": float(_mcmc_eval_count(steps_per_chain, mcmc_cfg.chains)),
-                "n_weighted_samples": int(mcmc.n_weighted_samples),
-            },
-            exact_p,
+    seed_seq = np.random.SeedSequence(seed)
+    traces: list[dict[str, Any]] = []
+    for ss in seed_seq.spawn(cfg.chains):
+        rng = np.random.default_rng(ss)
+        traces.append(
+            _run_single_chain_full_trace(
+                problem,
+                rng,
+                beta=beta,
+                sigma_t=sigma_t,
+                n_steps=max_steps_per_chain,
+                init="random",
+                tilt_mode=str(cfg.tilt_mode),
+                n_swap_pairs=n_swap_pairs,
+                checkpoint_steps=unique_step_checkpoints,
+            )
         )
-    )
 
-    samc_burn_in = _burn_in(checkpoint, samc_cfg.burn_in_fraction)
-    t0 = time.perf_counter()
-    samc = run_samc(
-        problem,
-        n_steps=checkpoint,
-        burn_in=samc_burn_in,
-        bin_edges=samc_setup["bin_edges"],
-        seed=rep_seed + 2,
-        init="random",
-        t0=samc_cfg.t0,
-        trace_every=samc_cfg.trace_every,
-        proposal_fraction=samc_cfg.proposal_fraction,
-        proposal_swaps=samc_cfg.proposal_swaps,
-        convergence_tolerance=samc_cfg.convergence_tolerance,
-    )
-    samc_dt = float(time.perf_counter() - t0)
-    rows.append(
-        _annotate_error_fields(
-            {
-                "method": "samc",
-                "checkpoint": checkpoint,
-                "estimate": float(samc.estimate),
-                "variance_estimate": samc_variance_proxy(float(samc.estimate), checkpoint, samc_burn_in),
-                "acceptance_rate": float(samc.acceptance_rate),
-                "samc_max_rel_freq_error": float(samc.max_abs_relative_frequency_error),
-                "samc_converged": int(samc.convergence_reached),
-                "samc_pi0": float(samc.pi0_adjustment),
-                "samc_empty_bins": int(samc.empty_bin_indices.size),
-                "wall_time_sec": samc_dt,
-                "eval_excl_tuning": float(checkpoint + 1),
-            },
-            exact_p,
+    rows: list[dict[str, Any]] = []
+    for checkpoint, report_checkpoint in zip(checkpoints, reported_checkpoints):
+        steps_per_chain = steps_per_checkpoint[int(checkpoint)]
+        burn_in = _burn_in(steps_per_chain, cfg.burn_in_fraction)
+        row = _mcmc_prefix_row(
+                exact_p=exact_p,
+                checkpoint=int(report_checkpoint),
+                steps_per_chain=steps_per_chain,
+                burn_in=burn_in,
+                thin=int(cfg.thin),
+                beta=float(beta),
+                sigma_t=float(sigma_t),
+                tilt_mode=str(cfg.tilt_mode),
+                estimate_variance=bool(cfg.estimate_variance),
+                obm_batch_size=cfg.obm_batch_size,
+                traces=traces,
+                n_chains=int(cfg.chains),
+            )
+        row["mcmc_chain_budget"] = int(checkpoint)
+        row["mcmc_reported_budget"] = int(report_checkpoint)
+        rows.append(row)
+    return rows
+
+
+def _run_samc_cumulative_checkpoints(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    *,
+    checkpoints: tuple[int, ...],
+    samc_setup: dict[str, Any],
+    cfg: SAMCWorkflowConfig,
+    seed: int,
+) -> list[dict[str, Any]]:
+    checkpoints = _sorted_unique_points(checkpoints)
+    max_steps = int(checkpoints[-1])
+    bin_edges = np.asarray(samc_setup["bin_edges"], dtype=float)
+    k = int(bin_edges.size - 1)
+    tail_bin_index = int(k - 1)
+    target = np.full(k, 1.0 / k, dtype=float)
+
+    if cfg.proposal_swaps is not None:
+        n_swap_pairs = int(cfg.proposal_swaps)
+    else:
+        n_swap_pairs = n_swap_pairs_from_fraction(
+            problem.n_treated,
+            problem.n_control,
+            proposal_fraction=cfg.proposal_fraction,
         )
-    )
 
+    rng = np.random.default_rng(seed)
+    y = problem.sample_uniform_labels(rng)
+    t_cur = problem.compute_stat(y)
+    b_cur = _bin_index(t_cur, bin_edges)
+    theta = np.zeros(k, dtype=float)
+    bin_trace = np.empty(max_steps, dtype=np.int64)
+    theta_at_checkpoint: dict[int, np.ndarray] = {}
+    elapsed_by_checkpoint: dict[int, float] = {}
+    accepted_by_checkpoint: dict[int, int] = {}
+
+    accepted = 0
+    t_start = time.perf_counter()
+    checkpoint_set = set(int(v) for v in checkpoints)
+
+    for step in range(1, max_steps + 1):
+        y_prop = propose_localized_swaps(y, rng, n_swap_pairs=n_swap_pairs)
+        t_prop = problem.compute_stat(y_prop)
+        b_prop = _bin_index(t_prop, bin_edges)
+
+        log_alpha = theta[b_cur] - theta[b_prop]
+        if log_alpha >= 0.0 or np.log(rng.random()) < log_alpha:
+            y = y_prop
+            t_cur = t_prop
+            b_cur = b_prop
+            accepted += 1
+
+        gamma = _default_stepsize(step, t0=cfg.t0)
+        theta -= gamma * target
+        theta[b_cur] += gamma
+        theta -= np.mean(theta)
+        bin_trace[step - 1] = b_cur
+
+        if step in checkpoint_set:
+            theta_at_checkpoint[int(step)] = theta.copy()
+            elapsed_by_checkpoint[int(step)] = float(time.perf_counter() - t_start)
+            accepted_by_checkpoint[int(step)] = int(accepted)
+
+    rows: list[dict[str, Any]] = []
+    for checkpoint in checkpoints:
+        burn_in = _burn_in(int(checkpoint), cfg.burn_in_fraction)
+        retained_bins = bin_trace[burn_in:int(checkpoint)]
+        visit_counts = np.bincount(retained_bins, minlength=k).astype(np.int64)
+        rel_freq_error = _relative_sampling_frequency_error(visit_counts)
+        max_abs_rel_freq_error = float(np.max(np.abs(rel_freq_error)))
+        estimate, pi0_adjustment, empty_bin_indices = _paper_pvalue_estimate(
+            theta=theta_at_checkpoint[int(checkpoint)],
+            target=target,
+            visit_counts=visit_counts,
+            tail_bin_index=tail_bin_index,
+        )
+        rows.append(
+            _annotate_error_fields(
+                {
+                    "method": "samc",
+                    "checkpoint": int(checkpoint),
+                    "estimate": float(estimate),
+                    "variance_estimate": samc_variance_proxy(float(estimate), int(checkpoint), burn_in),
+                    "acceptance_rate": float(accepted_by_checkpoint[int(checkpoint)] / int(checkpoint)),
+                    "samc_max_rel_freq_error": max_abs_rel_freq_error,
+                    "samc_converged": int(max_abs_rel_freq_error < cfg.convergence_tolerance),
+                    "samc_pi0": float(pi0_adjustment),
+                    "samc_empty_bins": int(empty_bin_indices.size),
+                    "wall_time_sec": float(elapsed_by_checkpoint[int(checkpoint)]),
+                    "eval_excl_tuning": float(int(checkpoint) + 1),
+                    "samc_visit_total": int(np.sum(visit_counts)),
+                    "samc_tail_bin_freq": float(visitation_frequency(visit_counts)[tail_bin_index]),
+                },
+                exact_p,
+            )
+        )
     return rows
 
 
@@ -709,6 +977,9 @@ def summarize_records(
                 "var_calibration_ratio": var_calib,
                 "mean_wall_time_sec": float(np.mean([row["wall_time_sec"] for row in sub])),
                 "mean_eval_excl_tuning": float(np.mean([row["eval_excl_tuning"] for row in sub])),
+                "mean_eval_incl_tuning": (
+                    float(np.mean([row.get("eval_incl_tuning", row["eval_excl_tuning"]) for row in sub]))
+                ),
                 "mean_q_tilt_tail_share": (
                     float(np.mean([row.get("tail_share_raw", np.nan) for row in sub if np.isfinite(row.get("tail_share_raw", np.nan))]))
                     if any(np.isfinite(row.get("tail_share_raw", np.nan)) for row in sub)
@@ -759,27 +1030,60 @@ def run_cross_method_study(
         seed=cross_cfg.base_seed + 10_000,
     )
     samc_setup = tune_samc_setup(scenario.problem, samc_cfg, seed=cross_cfg.base_seed + 20_000)
+    beta_selection_budget = int(beta_workflow["beta_selection_eval_total"])
+    mcmc_chain_checkpoints = tuple(int(cp - beta_selection_budget) for cp in checkpoints)
+    if any(cp <= 0 for cp in mcmc_chain_checkpoints):
+        raise ValueError(
+            "Cross-method estimation_points must all exceed the fixed MCMC-IS beta-selection budget. "
+            f"Received estimation_points={list(checkpoints)}, beta_selection_budget={beta_selection_budget}."
+        )
 
     records: list[dict[str, Any]] = []
     for rep in range(cross_cfg.repeats):
         rep_seed = int(cross_cfg.base_seed + 1_000 * rep)
-        for checkpoint in checkpoints:
-            rows = run_cross_method_checkpoint(
+        rows = []
+        rows.extend(
+            _run_iid_cumulative_checkpoints(
                 scenario.problem,
                 scenario.exact_p,
-                checkpoint=checkpoint,
-                rep_seed=rep_seed,
-                beta_workflow=beta_workflow,
-                samc_setup=samc_setup,
-                cross_cfg=cross_cfg,
-                mcmc_cfg=mcmc_cfg,
-                samc_cfg=samc_cfg,
+                checkpoints=checkpoints,
+                seed=rep_seed,
+                confidence_level=cross_cfg.confidence_level,
             )
-            for row in rows:
-                row["scenario"] = scenario.key
-                row["scenario_display"] = scenario.description
-                row["replicate"] = int(rep)
-                records.append(row)
+        )
+        rows.extend(
+            _run_mcmc_cumulative_checkpoints(
+                scenario.problem,
+                scenario.exact_p,
+                checkpoints=mcmc_chain_checkpoints,
+                reported_checkpoints=checkpoints,
+                beta=float(beta_workflow["beta_used"]),
+                sigma_t=float(beta_workflow["sigma_t"]),
+                cfg=mcmc_cfg,
+                seed=rep_seed + 1,
+            )
+        )
+        rows.extend(
+            _run_samc_cumulative_checkpoints(
+                scenario.problem,
+                scenario.exact_p,
+                checkpoints=checkpoints,
+                samc_setup=samc_setup,
+                cfg=samc_cfg,
+                seed=rep_seed + 2,
+            )
+        )
+        for row in rows:
+            row["scenario"] = scenario.key
+            row["scenario_display"] = scenario.description
+            row["replicate"] = int(rep)
+            if row["method"] == "mcmc_is":
+                row["beta_selection_budget"] = int(beta_selection_budget)
+                row["eval_incl_tuning"] = float(int(row["mcmc_chain_budget"]) + beta_selection_budget)
+            else:
+                row["beta_selection_budget"] = 0
+                row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+            records.append(row)
 
     summary = summarize_records(records)
     density_summary = iid_stat_density_summary(
@@ -796,6 +1100,7 @@ def run_cross_method_study(
         "exact_n_perm": int(scenario.exact_n_perm),
         "estimation_points": list(checkpoints),
         "beta_workflow": beta_workflow,
+        "mcmc_beta_selection_budget": beta_selection_budget,
         "samc_setup": {
             "lambda_min": float(samc_setup["lambda_min"]),
             "bin_edges": np.asarray(samc_setup["bin_edges"], dtype=float),
@@ -862,6 +1167,7 @@ def plot_cross_method_max_budget(
         title = (
             f"{title}\nMCMC-IS beta (laplace/tuned/used): "
             f"{beta_workflow['beta0_laplace']:.4g} / {beta_workflow['beta_hat_tuned']:.4g} / {beta_workflow['beta_used']:.4g}"
+            f" | beta-selection budget={int(beta_workflow.get('beta_selection_eval_total', 0)):,}"
         )
     fig.suptitle(title)
     plt.tight_layout()
@@ -876,6 +1182,7 @@ def plot_cross_method_convergence(
     *,
     scenario_name: str,
     exact_p: float,
+    mcmc_beta_selection_budget: int = 0,
     save_path: Path | None = None,
 ) -> None:
     methods = ["iid", "mcmc_is", "samc"]
@@ -908,7 +1215,10 @@ def plot_cross_method_convergence(
     axes[2].set_title("Mean variance estimate vs iterations")
     axes[2].set_ylabel("var_hat")
     axes[0].legend()
-    fig.suptitle(f"Cross-method convergence: {scenario_name} (true p={exact_p:.3e})")
+    fig.suptitle(
+        f"Cross-method convergence: {scenario_name} (true p={exact_p:.3e})\n"
+        f"MCMC-IS total budget includes fixed beta-selection budget={int(mcmc_beta_selection_budget):,}"
+    )
     plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -920,6 +1230,7 @@ def plot_cross_method_diagnostics(
     summary: list[dict[str, Any]],
     *,
     scenario_name: str,
+    mcmc_beta_selection_budget: int = 0,
     save_path: Path | None = None,
 ) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
@@ -973,7 +1284,10 @@ def plot_cross_method_diagnostics(
     axes[1, 1].set_xlabel("iterations")
     axes[1, 1].set_ylabel("percent")
 
-    fig.suptitle(f"Cross-method diagnostics by checkpoint: {scenario_name}")
+    fig.suptitle(
+        f"Cross-method diagnostics by checkpoint: {scenario_name}\n"
+        f"MCMC-IS total budget includes fixed beta-selection budget={int(mcmc_beta_selection_budget):,}"
+    )
     plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -996,54 +1310,21 @@ def run_beta_checkpoint_study(
         beta = float(beta_center * multiplier)
         for rep in range(beta_cfg.repeats):
             rep_seed = int(beta_cfg.base_seed + 10_000 * beta_idx + 100 * rep)
-            for checkpoint in checkpoints:
-                steps_per_chain = _steps_per_chain(checkpoint, beta_cfg.chains)
-                burn_in = _burn_in(steps_per_chain, beta_cfg.burn_in_fraction)
-                t_start = time.perf_counter()
-                res = run_mcmc_is(
-                    problem,
-                    beta=beta,
-                    sigma_t=sigma_t,
-                    n_steps=steps_per_chain,
-                    burn_in=burn_in,
-                    thin=beta_cfg.thin,
-                    n_chains=beta_cfg.chains,
-                    seed=rep_seed,
-                    init="random",
-                    tilt_mode=str(beta_cfg.tilt_mode),
-                    proposal_fraction=beta_cfg.proposal_fraction,
-                    proposal_swaps=beta_cfg.proposal_swaps,
-                    estimate_variance=bool(beta_cfg.estimate_variance),
-                    obm_batch_size=beta_cfg.obm_batch_size,
-                )
-                wall_time_sec = float(time.perf_counter() - t_start)
-                row = {
-                    "checkpoint": int(checkpoint),
-                    "beta_multiplier": float(multiplier),
-                    "beta": float(beta),
-                    "replicate": int(rep),
-                    "seed": int(rep_seed),
-                    "estimate": float(res.estimate),
-                    "variance_estimate": (
-                        float(res.snis_variance_obm)
-                        if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm)
-                        else np.nan
-                    ),
-                    "snis_mcse_obm": (
-                        float(res.snis_mcse_obm)
-                        if res.snis_mcse_obm is not None and np.isfinite(res.snis_mcse_obm)
-                        else np.nan
-                    ),
-                    "q_tilt_tail_share": float(res.tail_share_raw_sample),
-                    "ess": float(res.ess),
-                    "acceptance_rate": float(res.overall_acceptance_rate),
-                    "tail_hits": int(res.tail_hits_weighted_sample),
-                    "n_weighted_samples": int(res.n_weighted_samples),
-                    "weight_cv": float(res.weight_summary.cv),
-                    "eval_excl_tuning": float(_mcmc_eval_count(steps_per_chain, beta_cfg.chains)),
-                    "wall_time_sec": wall_time_sec,
-                }
-                _annotate_error_fields(row, exact_p)
+            beta_rows = _run_mcmc_cumulative_checkpoints(
+                problem,
+                exact_p,
+                checkpoints=checkpoints,
+                beta=beta,
+                sigma_t=sigma_t,
+                cfg=beta_cfg,
+                seed=rep_seed,
+            )
+            for row in beta_rows:
+                row["beta_multiplier"] = float(multiplier)
+                row["beta"] = float(beta)
+                row["replicate"] = int(rep)
+                row["seed"] = int(rep_seed)
+                row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
                 rows.append(row)
 
     summary = summarize_records(rows, group_fields=("checkpoint", "beta"))
@@ -1208,11 +1489,13 @@ def save_cross_method_outputs(
         study["summary"],
         scenario_name=study["scenario_display"],
         exact_p=float(study["exact_p"]),
+        mcmc_beta_selection_budget=int(study.get("mcmc_beta_selection_budget", 0)),
         save_path=output_dir / "cross_method_convergence.png",
     )
     plot_cross_method_diagnostics(
         study["summary"],
         scenario_name=study["scenario_display"],
+        mcmc_beta_selection_budget=int(study.get("mcmc_beta_selection_budget", 0)),
         save_path=output_dir / "cross_method_diagnostics.png",
     )
     plot_iid_stat_density(

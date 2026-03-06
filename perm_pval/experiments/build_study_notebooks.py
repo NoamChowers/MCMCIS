@@ -102,7 +102,8 @@ def build_cross_method_notebook() -> dict:
             ## Configuration
 
             `ESTIMATION_POINTS` controls the intermediate checkpoints.  
-            The largest checkpoint is used for the main boxplots; all checkpoints are used for convergence diagnostics.
+            The largest checkpoint is used for the main boxplots; all checkpoints are used for convergence diagnostics.  
+            In the cross-method notebook these are total budgets. For MCMC-IS, a fixed beta-selection budget is deducted first, and the production chain uses the remaining budget.
             """
         ),
         code_cell(
@@ -216,6 +217,11 @@ def build_cross_method_notebook() -> dict:
                         samc_cfg=samc_cfg,
                     )
 
+                print(json.dumps({
+                    "scenario": scenario.key,
+                    "mcmc_beta_selection_budget": study["mcmc_beta_selection_budget"],
+                    "beta_used": study["beta_workflow"]["beta_used"],
+                }, indent=2))
                 summary_df = pd.DataFrame(study["summary"]).sort_values(["checkpoint", "method"])
                 display(summary_df[[
                     "checkpoint",
@@ -223,6 +229,7 @@ def build_cross_method_notebook() -> dict:
                     "mean_estimate",
                     "rmse",
                     "mean_variance_estimate",
+                    "mean_eval_incl_tuning",
                     "mean_q_tilt_tail_share",
                     "mean_ess",
                     "mean_zero_rate",

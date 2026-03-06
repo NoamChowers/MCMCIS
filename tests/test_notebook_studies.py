@@ -65,7 +65,7 @@ def _small_samc_cfg() -> SAMCWorkflowConfig:
 def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     scenario = _small_right_tail_scenario()
     cross_cfg = CrossMethodStudyConfig(
-        estimation_points=(20, 40),
+        estimation_points=(500, 800),
         repeats=1,
         iid_density_samples=20,
         base_seed=123,
@@ -78,8 +78,12 @@ def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     )
 
     assert len(study["records"]) == 2 * 3
-    assert sorted({row["checkpoint"] for row in study["records"]}) == [20, 40]
+    assert sorted({row["checkpoint"] for row in study["records"]}) == [500, 800]
     assert sorted({row["method"] for row in study["records"]}) == ["iid", "mcmc_is", "samc"]
+    assert int(study["mcmc_beta_selection_budget"]) > 0
+    mcmc_rows = [row for row in study["records"] if row["method"] == "mcmc_is"]
+    assert all(int(row["mcmc_chain_budget"]) < int(row["checkpoint"]) for row in mcmc_rows)
+    assert all(int(row["beta_selection_budget"]) == int(study["mcmc_beta_selection_budget"]) for row in mcmc_rows)
 
 
 def test_run_beta_checkpoint_study_emits_rows_for_each_checkpoint():
