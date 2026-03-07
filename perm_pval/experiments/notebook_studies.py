@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
-import math
 import multiprocessing as mp
 import time
 import warnings
@@ -70,11 +69,15 @@ class MCMCWorkflowConfig:
     proposal_fraction: float = 0.075
     proposal_swaps: int | None = None
     local_scan_enabled: bool = True
-    local_scan_multipliers: tuple[float, ...] = (0.50, 0.75, 1.00, 1.25, 1.5)
-    local_scan_total_steps: int = 40_000
+    local_scan_q_multipliers: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00, 1.50, 2.00)
+    local_scan_screen_total_steps: int = 12_000
+    local_scan_finalist_count: int = 3
+    local_scan_total_steps: int = 64_000
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
     local_scan_thin: int = 1
+    local_scan_screen_min_tail_hits: int = 25
+    local_scan_final_min_tail_hits: int = 20
     local_scan_min_ess: float = 10.0
     local_scan_min_ess_fraction: float = 1e-3
     local_scan_q_lower_factor: float = 0.25
@@ -109,7 +112,7 @@ class CrossMethodStudyConfig:
 class BetaSweepStudyConfig:
     estimation_points: tuple[int, ...]
     repeats: int = 5
-    beta_multipliers: tuple[float, ...] = (0.50, 0.75, 1.00, 1.25, 1.5)
+    beta_multipliers: tuple[float, ...] = (0.10, 0.25, 0.50, 1.00, 1.25, 2.00)
     chains: int = 2
     burn_in_fraction: float = 0.20
     thin: int = 1
@@ -263,6 +266,192 @@ def samc_variance_proxy(p_hat: float, n_steps: int, burn_in: int) -> float:
     return float(max(p_hat * (1.0 - p_hat) / n_eff, 0.0))
 
 
+def _kept_samples_per_chain(n_steps: int, burn_in: int, thin: int) -> int:
+    if n_steps <= burn_in:
+        return 0
+    return int(1 + (n_steps - 1 - burn_in) // thin)
+
+
+def _local_scan_steps(total_steps: int, n_chains: int, burn_in_fraction: float) -> tuple[int, int]:
+    steps_per_chain = _steps_per_chain(total_steps, n_chains)
+    burn_in = _burn_in(steps_per_chain, burn_in_fraction)
+    return steps_per_chain, burn_in
+
+
+def _local_scan_q_floor(total_steps: int, cfg: MCMCWorkflowConfig, min_tail_hits: int) -> float:
+    steps_per_chain, burn_in = _local_scan_steps(
+        total_steps,
+        cfg.local_scan_chains,
+        cfg.local_scan_burn_in_fraction,
+    )
+    kept_total = int(cfg.local_scan_chains * _kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin))
+    if kept_total <= 0:
+        return float("inf")
+    return float(min_tail_hits / kept_total)
+
+
+def _snis_design_variance_objective(
+    *,
+    log_weights: np.ndarray,
+    tail_indicators: np.ndarray,
+    p_reference: float,
+    n_chains: int,
+    chain_kept_samples: int,
+    obm_batch_size: int | None,
+) -> float:
+    logw = np.asarray(log_weights, dtype=float)
+    tail = np.asarray(tail_indicators, dtype=float)
+    if logw.ndim != 1 or tail.ndim != 1 or logw.size != tail.size or logw.size < 4:
+        return float("nan")
+    if not np.isfinite(p_reference) or p_reference < 0.0:
+        return float("nan")
+    if n_chains <= 0 or chain_kept_samples <= 0:
+        return float("nan")
+
+    shift = float(np.max(logw))
+    weights = np.exp(logw - shift)
+    mean_w = float(np.mean(weights))
+    n_total = int(weights.size)
+    if not np.isfinite(mean_w) or mean_w <= 0.0:
+        return float("nan")
+    if n_chains * chain_kept_samples != n_total:
+        return float("nan")
+
+    h_all = weights * (tail - float(p_reference))
+    var_mean_h = 0.0
+    start = 0
+    for _ in range(n_chains):
+        stop = start + chain_kept_samples
+        h_chain = h_all[start:stop]
+        start = stop
+        sigma2_chain, _ = obm_long_run_variance(
+            h_chain,
+            batch_size=obm_batch_size,
+        )
+        if np.isfinite(sigma2_chain) and chain_kept_samples > 0:
+            var_mean_h += (chain_kept_samples * float(sigma2_chain)) / (n_total * n_total)
+    if not np.isfinite(var_mean_h) or var_mean_h <= 0.0:
+        return float("nan")
+    return float(var_mean_h / (mean_w * mean_w))
+
+
+def _local_scan_pool_indices(rows: list[dict[str, Any]]) -> tuple[list[int], bool]:
+    eligible_indices = [idx for idx, row in enumerate(rows) if bool(row["guardrail_passed"])]
+    if eligible_indices:
+        return eligible_indices, True
+    fallback_indices = [
+        idx for idx, row in enumerate(rows)
+        if np.isfinite(row["selection_objective_p0"]) and float(row["selection_objective_p0"]) > 0.0
+    ]
+    return fallback_indices, False
+
+
+def _run_local_scan_stage(
+    problem: PermutationTestProblem,
+    cfg: MCMCWorkflowConfig,
+    *,
+    candidates: list[dict[str, float]],
+    p0_reference: float,
+    sigma_t: float,
+    q_target: float,
+    total_steps: int,
+    seed: int,
+    stage: str,
+) -> dict[str, Any]:
+    steps_per_chain, burn_in = _local_scan_steps(
+        total_steps,
+        cfg.local_scan_chains,
+        cfg.local_scan_burn_in_fraction,
+    )
+    rows: list[dict[str, Any]] = []
+    chain_kept_samples = _kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin)
+    t_start = time.perf_counter()
+    for idx, candidate in enumerate(candidates):
+        beta = float(candidate["beta"])
+        q_scan_target = float(candidate["q_scan_target"])
+        res = run_mcmc_is(
+            problem,
+            beta=beta,
+            sigma_t=sigma_t,
+            n_steps=steps_per_chain,
+            burn_in=burn_in,
+            thin=cfg.local_scan_thin,
+            n_chains=cfg.local_scan_chains,
+            seed=seed + 10_000 * idx,
+            init="random",
+            tilt_mode=str(cfg.tilt_mode),
+            proposal_fraction=cfg.proposal_fraction,
+            proposal_swaps=cfg.proposal_swaps,
+            estimate_variance=True,
+            obm_batch_size=cfg.obm_batch_size,
+        )
+        var_hat = (
+            float(res.snis_variance_obm)
+            if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm) and res.snis_variance_obm > 0.0
+            else np.nan
+        )
+        q_hat = float(res.tail_share_raw_sample)
+        q_log_ratio_abs = (
+            float(abs(np.log(q_hat / q_target)))
+            if q_hat > 0.0 and np.isfinite(q_hat) and q_target > 0.0 and np.isfinite(q_target)
+            else float("inf")
+        )
+        ess = float(res.ess)
+        weight_cv = float(res.weight_summary.cv)
+        n_weighted_samples = int(res.n_weighted_samples)
+        tail_hits_weighted_sample = int(res.tail_hits_weighted_sample)
+        selection_objective_p0 = _snis_design_variance_objective(
+            log_weights=np.asarray(res.log_weights, dtype=float),
+            tail_indicators=np.asarray(res.tail_indicators, dtype=np.int8),
+            p_reference=float(p0_reference),
+            n_chains=int(cfg.local_scan_chains),
+            chain_kept_samples=int(chain_kept_samples),
+            obm_batch_size=cfg.obm_batch_size,
+        )
+        ess_guardrail_min = float(max(cfg.local_scan_min_ess, cfg.local_scan_min_ess_fraction * n_weighted_samples))
+        guardrail_fail_reasons: list[str] = []
+        if not np.isfinite(selection_objective_p0) or selection_objective_p0 <= 0.0:
+            guardrail_fail_reasons.append("selection_objective_p0_nonpositive")
+        if not np.isfinite(ess) or ess < ess_guardrail_min:
+            guardrail_fail_reasons.append("ess_below_guardrail")
+        rows.append(
+            {
+                "stage": stage,
+                "beta": float(beta),
+                "q_scan_target": q_scan_target,
+                "q_scan_target_ratio": float(q_scan_target / q_target) if q_target > 0.0 else float("nan"),
+                "estimate": float(res.estimate),
+                "variance_estimate": var_hat,
+                "selection_objective_p0": selection_objective_p0,
+                "q_hat": q_hat,
+                "q_log_ratio_abs": q_log_ratio_abs,
+                "ess": ess,
+                "n_weighted_samples": n_weighted_samples,
+                "tail_hits_weighted_sample": tail_hits_weighted_sample,
+                "ess_guardrail_min": ess_guardrail_min,
+                "acceptance_rate": float(res.overall_acceptance_rate),
+                "weight_cv": weight_cv,
+                "guardrail_passed": int(not guardrail_fail_reasons),
+                "guardrail_fail_reasons": guardrail_fail_reasons,
+                "screen_rank": None,
+                "advanced_to_final": None,
+                "advanced_reason": None,
+                "objective_ratio_to_best": None,
+                "within_objective_tolerance": None,
+                "variance_ratio_to_best": None,
+                "within_variance_tolerance": None,
+            }
+        )
+
+    return {
+        "rows": rows,
+        "steps_per_chain": int(steps_per_chain),
+        "burn_in": int(burn_in),
+        "eval_total": int(len(candidates) * _mcmc_eval_count(steps_per_chain, cfg.local_scan_chains)),
+        "wall_time_sec": float(time.perf_counter() - t_start),
+    }
+
+
 def _count_short_chain_calls_from_history(history: list[dict[str, Any]]) -> int:
     n = 0
     for record in history:
@@ -338,10 +527,16 @@ def local_beta_scan(
     cfg: MCMCWorkflowConfig,
     *,
     beta_center: float,
+    pilot_t: np.ndarray,
+    p0_for_qtarget: float,
     sigma_t: float,
     q_target: float,
     seed: int,
 ) -> dict[str, Any]:
+    if cfg.local_scan_screen_total_steps <= 0:
+        raise ValueError("local_scan_screen_total_steps must be positive.")
+    if cfg.local_scan_finalist_count <= 0:
+        raise ValueError("local_scan_finalist_count must be positive.")
     if cfg.local_scan_variance_near_min_ratio < 1.0:
         raise ValueError("local_scan_variance_near_min_ratio must be >= 1.")
     if not cfg.local_scan_enabled:
@@ -362,105 +557,153 @@ def local_beta_scan(
             "selected_reason": "beta_center_nonpositive",
         }
 
-    betas = [
-        float(beta_center * mult)
-        for mult in cfg.local_scan_multipliers
-        if float(beta_center * mult) > 0.0
+    q_multipliers = tuple(float(mult) for mult in cfg.local_scan_q_multipliers)
+    screen_q_floor = _local_scan_q_floor(
+        int(cfg.local_scan_screen_total_steps),
+        cfg,
+        int(cfg.local_scan_screen_min_tail_hits),
+    )
+    final_q_floor = _local_scan_q_floor(
+        int(cfg.local_scan_total_steps),
+        cfg,
+        int(cfg.local_scan_final_min_tail_hits),
+    )
+    q_candidates = [
+        float(min(max(q_target * mult, final_q_floor), 1.0 - 1e-12))
+        for mult in q_multipliers
+        if mult > 0.0
     ]
-    steps_per_chain = _steps_per_chain(cfg.local_scan_total_steps, cfg.local_scan_chains)
-    burn_in = _burn_in(steps_per_chain, cfg.local_scan_burn_in_fraction)
-
-    rows: list[dict[str, Any]] = []
-    t_start = time.perf_counter()
-    for idx, beta in enumerate(betas):
-        res = run_mcmc_is(
-            problem,
-            beta=beta,
-            sigma_t=sigma_t,
-            n_steps=steps_per_chain,
-            burn_in=burn_in,
-            thin=cfg.local_scan_thin,
-            n_chains=cfg.local_scan_chains,
-            seed=seed + 10_000 * idx,
-            init="random",
-            tilt_mode=str(cfg.tilt_mode),
-            proposal_fraction=cfg.proposal_fraction,
-            proposal_swaps=cfg.proposal_swaps,
-            estimate_variance=True,
-            obm_batch_size=cfg.obm_batch_size,
+    candidates: list[dict[str, float]] = []
+    seen_betas: list[float] = []
+    for q_candidate in q_candidates:
+        beta_candidate = (
+            float(beta_center)
+            if np.isclose(q_candidate, q_target, rtol=1e-12, atol=1e-15)
+            else float(
+                init_beta_from_iid_pilot(
+                    pilot_T=pilot_t,
+                    T_obs=problem.t_obs,
+                    sigma_T=sigma_t,
+                    p0=p0_for_qtarget,
+                    q_target=q_candidate,
+                    beta_max=cfg.beta_max_init,
+                )
+            )
         )
-        var_hat = (
-            float(res.snis_variance_obm)
-            if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm) and res.snis_variance_obm > 0.0
-            else np.nan
-        )
-        q_hat = float(res.tail_share_raw_sample)
-        q_log_ratio_abs = (
-            float(abs(np.log(q_hat / q_target)))
-            if q_hat > 0.0 and np.isfinite(q_hat) and q_target > 0.0 and np.isfinite(q_target)
-            else float("inf")
-        )
-        ess = float(res.ess)
-        weight_cv = float(res.weight_summary.cv)
-        n_weighted_samples = int(res.n_weighted_samples)
-        ess_guardrail_min = float(max(cfg.local_scan_min_ess, cfg.local_scan_min_ess_fraction * n_weighted_samples))
-        guardrail_fail_reasons: list[str] = []
-        if not np.isfinite(var_hat) or var_hat <= 0.0:
-            guardrail_fail_reasons.append("variance_estimate_nonpositive")
-        if not np.isfinite(q_hat) or q_hat < float(cfg.local_scan_q_lower_factor * q_target):
-            guardrail_fail_reasons.append("q_hat_below_guardrail")
-        if not np.isfinite(q_hat) or q_hat > float(cfg.local_scan_q_upper_factor * q_target):
-            guardrail_fail_reasons.append("q_hat_above_guardrail")
-        if not np.isfinite(ess) or ess < ess_guardrail_min:
-            guardrail_fail_reasons.append("ess_below_guardrail")
-        rows.append(
+        if beta_candidate <= 0.0 or not np.isfinite(beta_candidate):
+            continue
+        if any(np.isclose(beta_candidate, beta_prev, rtol=1e-10, atol=1e-12) for beta_prev in seen_betas):
+            continue
+        seen_betas.append(beta_candidate)
+        candidates.append(
             {
-                "beta": float(beta),
-                "estimate": float(res.estimate),
-                "variance_estimate": var_hat,
-                "q_hat": q_hat,
-                "q_log_ratio_abs": q_log_ratio_abs,
-                "ess": ess,
-                "n_weighted_samples": n_weighted_samples,
-                "ess_guardrail_min": ess_guardrail_min,
-                "acceptance_rate": float(res.overall_acceptance_rate),
-                "weight_cv": weight_cv,
-                "guardrail_passed": int(not guardrail_fail_reasons),
-                "guardrail_fail_reasons": guardrail_fail_reasons,
-                "variance_ratio_to_best": None,
-                "within_variance_tolerance": None,
+                "beta": beta_candidate,
+                "q_scan_target": float(q_candidate),
             }
         )
+    candidates = sorted(candidates, key=lambda row: float(row["beta"]))
+    t_start = time.perf_counter()
 
-    eligible_indices = [idx for idx, row in enumerate(rows) if bool(row["guardrail_passed"])]
-    candidate_indices = eligible_indices or [
-        idx for idx, row in enumerate(rows)
-        if np.isfinite(row["variance_estimate"]) and float(row["variance_estimate"]) > 0.0
+    screen = _run_local_scan_stage(
+        problem,
+        cfg,
+        candidates=candidates,
+        p0_reference=float(p0_for_qtarget),
+        sigma_t=sigma_t,
+        q_target=q_target,
+        total_steps=int(cfg.local_scan_screen_total_steps),
+        seed=seed,
+        stage="screen",
+    )
+    screen_rows = screen["rows"]
+    screen_pool_indices, screen_used_guardrails = _local_scan_pool_indices(screen_rows)
+    ranked_screen_indices = sorted(
+        screen_pool_indices,
+        key=lambda idx: (
+            float(screen_rows[idx]["selection_objective_p0"]),
+            float(screen_rows[idx]["beta"]),
+        ),
+    )
+    target_finalist_count = min(int(cfg.local_scan_finalist_count), len(candidates))
+    if len(ranked_screen_indices) < target_finalist_count:
+        supplemental_indices = [
+            idx
+            for idx, row in enumerate(screen_rows)
+            if idx not in ranked_screen_indices
+            and np.isfinite(row["selection_objective_p0"])
+            and float(row["selection_objective_p0"]) > 0.0
+        ]
+        supplemental_indices = sorted(
+            supplemental_indices,
+            key=lambda idx: (
+                float(screen_rows[idx]["selection_objective_p0"]),
+                float(screen_rows[idx]["beta"]),
+            ),
+        )
+        ranked_screen_indices.extend(supplemental_indices)
+    if not ranked_screen_indices:
+        ranked_screen_indices = list(range(len(screen_rows)))
+
+    finalist_indices = [int(idx) for idx in ranked_screen_indices[:target_finalist_count]]
+    if len(finalist_indices) < target_finalist_count:
+        for idx in range(len(screen_rows)):
+            if idx in finalist_indices:
+                continue
+            finalist_indices.append(int(idx))
+            if len(finalist_indices) >= target_finalist_count:
+                break
+
+    finalist_candidates = [
+        {
+            "beta": float(screen_rows[idx]["beta"]),
+            "q_scan_target": float(screen_rows[idx]["q_scan_target"]),
+        }
+        for idx in finalist_indices
     ]
+    for rank, idx in enumerate(ranked_screen_indices):
+        screen_rows[idx]["screen_rank"] = int(rank)
+    for idx, row in enumerate(screen_rows):
+        row["advanced_to_final"] = int(idx in finalist_indices)
+        if idx in ranked_screen_indices[:target_finalist_count]:
+            row["advanced_reason"] = "screen_objective_rank"
+
+    final = _run_local_scan_stage(
+        problem,
+        cfg,
+        candidates=finalist_candidates,
+        p0_reference=float(p0_for_qtarget),
+        sigma_t=sigma_t,
+        q_target=q_target,
+        total_steps=int(cfg.local_scan_total_steps),
+        seed=seed + 1_000_000,
+        stage="final",
+    )
+    rows = final["rows"]
+    candidate_indices, final_used_guardrails = _local_scan_pool_indices(rows)
     if candidate_indices:
-        best_var_hat = float(min(float(rows[idx]["variance_estimate"]) for idx in candidate_indices))
-        variance_limit = float(best_var_hat * cfg.local_scan_variance_near_min_ratio)
+        best_objective = float(min(float(rows[idx]["selection_objective_p0"]) for idx in candidate_indices))
+        objective_limit = float(best_objective * cfg.local_scan_variance_near_min_ratio)
         near_min_indices: list[int] = []
         for idx in candidate_indices:
-            var_hat = float(rows[idx]["variance_estimate"])
-            ratio = float(var_hat / best_var_hat) if best_var_hat > 0.0 else float("inf")
-            within_tol = bool(var_hat <= variance_limit)
-            rows[idx]["variance_ratio_to_best"] = ratio
-            rows[idx]["within_variance_tolerance"] = int(within_tol)
+            objective = float(rows[idx]["selection_objective_p0"])
+            ratio = float(objective / best_objective) if best_objective > 0.0 else float("inf")
+            within_tol = bool(objective <= objective_limit)
+            rows[idx]["objective_ratio_to_best"] = ratio
+            rows[idx]["within_objective_tolerance"] = int(within_tol)
             if within_tol:
                 near_min_indices.append(idx)
         best_idx = min(
             near_min_indices,
             key=lambda idx: (
                 float(rows[idx]["beta"]),
-                float(rows[idx]["variance_estimate"]),
+                float(rows[idx]["selection_objective_p0"]),
             ),
         )
         selected_beta = float(rows[best_idx]["beta"])
         selected_reason = (
-            "smallest_beta_within_variance_tolerance"
-            if eligible_indices
-            else "smallest_beta_within_variance_tolerance_no_guardrail_survivors"
+            "two_stage_smallest_beta_within_objective_tolerance"
+            if final_used_guardrails
+            else "two_stage_smallest_beta_within_objective_tolerance_no_guardrail_survivors"
         )
     else:
         selected_beta = float(beta_center)
@@ -470,24 +713,50 @@ def local_beta_scan(
         "enabled": True,
         "selected_beta": selected_beta,
         "selected_reason": selected_reason,
-        "steps_per_chain": int(steps_per_chain),
-        "burn_in": int(burn_in),
-        "scan_eval_total": int(len(betas) * _mcmc_eval_count(steps_per_chain, cfg.local_scan_chains)),
+        "steps_per_chain": int(final["steps_per_chain"]),
+        "burn_in": int(final["burn_in"]),
+        "screen_steps_per_chain": int(screen["steps_per_chain"]),
+        "screen_burn_in": int(screen["burn_in"]),
+        "screen_eval_total": int(screen["eval_total"]),
+        "final_eval_total": int(final["eval_total"]),
+        "scan_eval_total": int(screen["eval_total"] + final["eval_total"]),
         "scan_wall_time_sec": float(time.perf_counter() - t_start),
+        "screen_wall_time_sec": float(screen["wall_time_sec"]),
+        "final_wall_time_sec": float(final["wall_time_sec"]),
         "selection_metrics": {
             "selection_rule": {
-                "type": "smallest_beta_within_variance_tolerance",
-                "variance_near_min_ratio": float(cfg.local_scan_variance_near_min_ratio),
+                "type": "two_stage_smallest_beta_within_objective_tolerance",
+                "objective": "design_point_obm_p0",
+                "objective_near_min_ratio": float(cfg.local_scan_variance_near_min_ratio),
                 "preference_within_tolerance": "smaller_beta",
             },
+            "screening_rule": {
+                "type": "low_budget_filter",
+                "screen_total_steps": int(cfg.local_scan_screen_total_steps),
+                "final_total_steps": int(cfg.local_scan_total_steps),
+                "finalist_count": int(cfg.local_scan_finalist_count),
+                "screen_ranking": "smallest_design_point_obm_objective",
+                "screen_min_tail_hits": int(cfg.local_scan_screen_min_tail_hits),
+                "final_min_tail_hits": int(cfg.local_scan_final_min_tail_hits),
+                "screen_q_floor": float(screen_q_floor),
+                "final_q_floor": float(final_q_floor),
+                "screen_tail_hits_used_for_ranking": False,
+                "screen_used_guardrails": bool(screen_used_guardrails),
+                "final_used_guardrails": bool(final_used_guardrails),
+            },
+            "q_ladder": {
+                "type": "pilot_mapped_q_targets",
+                "q_target_center": float(q_target),
+                "q_multipliers": [float(mult) for mult in q_multipliers],
+                "q_candidates": [float(row["q_scan_target"]) for row in candidates],
+            },
             "guardrails": {
-                "variance_estimate_positive": True,
-                "q_hat_min_factor": float(cfg.local_scan_q_lower_factor),
-                "q_hat_max_factor": float(cfg.local_scan_q_upper_factor),
+                "selection_objective_p0_positive": True,
                 "min_ess": float(cfg.local_scan_min_ess),
                 "min_ess_fraction_of_weighted_samples": float(cfg.local_scan_min_ess_fraction),
             },
         },
+        "screen_rows": screen_rows,
         "rows": rows,
     }
 
@@ -540,7 +809,9 @@ def build_beta_workflow(
     )
     tuning_wall_time_sec = float(time.perf_counter() - t_start)
     n_short_calls = _count_short_chain_calls_from_history(tuning["history"])
-    tuning_eval_total = int(cfg.pilot_samples + n_short_calls * (cfg.tune_steps + 1))
+    pilot_eval_total = int(cfg.pilot_samples)
+    tuning_chain_eval_total = int(n_short_calls * (cfg.tune_steps + 1))
+    tuning_eval_total = int(pilot_eval_total + tuning_chain_eval_total)
     beta_tuned = float(tuning["beta_hat"])
 
     if cfg.beta_override is not None:
@@ -558,13 +829,16 @@ def build_beta_workflow(
             problem,
             cfg,
             beta_center=beta_tuned,
+            pilot_t=pilot_t,
+            p0_for_qtarget=p0_for_qtarget,
             sigma_t=float(sigma_t),
             q_target=q_target,
             seed=seed + 7,
         )
         beta_used = float(scan["selected_beta"])
 
-    beta_selection_eval_total = int(tuning_eval_total + int(scan.get("scan_eval_total", 0)))
+    scan_eval_total = int(scan.get("scan_eval_total", 0))
+    beta_selection_eval_total = int(tuning_eval_total + scan_eval_total)
     beta_selection_wall_time_sec = float(tuning_wall_time_sec + float(scan.get("scan_wall_time_sec", 0.0)))
 
     return {
@@ -578,9 +852,21 @@ def build_beta_workflow(
         "q_hat_beta_hat": float(tuning["q_hat"]),
         "bracket_succeeded": bool(tuning["bracket_succeeded"]),
         "n_short_chain_calls": int(n_short_calls),
+        "pilot_eval_total": pilot_eval_total,
+        "tuning_chain_eval_total": tuning_chain_eval_total,
         "tuning_eval_total": int(tuning_eval_total),
+        "scan_eval_total": scan_eval_total,
         "tuning_wall_time_sec": tuning_wall_time_sec,
         "beta_selection_eval_total": beta_selection_eval_total,
+        "beta_selection_budget_breakdown": {
+            "pilot_eval_total": pilot_eval_total,
+            "tuning_chain_eval_total": tuning_chain_eval_total,
+            "tuning_eval_total": int(tuning_eval_total),
+            "screen_eval_total": int(scan.get("screen_eval_total", 0)),
+            "final_eval_total": int(scan.get("final_eval_total", 0)),
+            "scan_eval_total": scan_eval_total,
+            "beta_selection_eval_total": beta_selection_eval_total,
+        },
         "beta_selection_wall_time_sec": beta_selection_wall_time_sec,
         "local_scan": scan,
         "history_tail": tuning["history"][-5:],
@@ -1472,7 +1758,7 @@ def plot_cross_method_max_budget(
         title = (
             f"{title}\nMCMC-IS beta (laplace/tuned/used): "
             f"{beta_workflow['beta0_laplace']:.4g} / {beta_workflow['beta_hat_tuned']:.4g} / {beta_workflow['beta_used']:.4g}"
-            f" | beta-selection budget={int(beta_workflow.get('beta_selection_eval_total', 0)):,}"
+            f" | beta-selection budget (pilot+tuning+scan)={int(beta_workflow.get('beta_selection_eval_total', 0)):,}"
         )
     fig.suptitle(title)
     plt.tight_layout()
@@ -1519,7 +1805,7 @@ def plot_cross_method_convergence(
     axes[0].legend()
     fig.suptitle(
         f"Cross-method convergence: {scenario_name} (true p={exact_p:.3e})\n"
-        f"MCMC-IS total budget includes fixed beta-selection budget={int(mcmc_beta_selection_budget):,}"
+        f"MCMC-IS total budget includes fixed beta-selection budget (pilot+tuning+scan)={int(mcmc_beta_selection_budget):,}"
     )
     plt.tight_layout()
     if save_path is not None:
@@ -1588,7 +1874,7 @@ def plot_cross_method_diagnostics(
 
     fig.suptitle(
         f"Cross-method diagnostics by checkpoint: {scenario_name}\n"
-        f"MCMC-IS total budget includes fixed beta-selection budget={int(mcmc_beta_selection_budget):,}"
+        f"MCMC-IS total budget includes fixed beta-selection budget (pilot+tuning+scan)={int(mcmc_beta_selection_budget):,}"
     )
     plt.tight_layout()
     if save_path is not None:

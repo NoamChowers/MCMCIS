@@ -127,7 +127,7 @@ def build_cross_method_notebook() -> dict:
                 "poisson_diffmeans_righttail_tiny_n200",
             ]
 
-            ESTIMATION_POINTS = (10_000, 100_000, 1_000_000) if not FAST_MODE else (2_000, 10_000, 20_000)
+            ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
             N_REPEATS = 5 if not FAST_MODE else 2
             N_JOBS = min(N_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
@@ -144,7 +144,8 @@ def build_cross_method_notebook() -> dict:
             mcmc_cfg = MCMCWorkflowConfig(
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
                 tune_steps=2_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=40_000 if not FAST_MODE else 4_000,
+                local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
+                local_scan_total_steps=64_000 if not FAST_MODE else 6_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
@@ -326,7 +327,8 @@ def build_beta_notebook() -> dict:
             mcmc_cfg = MCMCWorkflowConfig(
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
                 tune_steps=2_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=40_000 if not FAST_MODE else 4_000,
+                local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
+                local_scan_total_steps=64_000 if not FAST_MODE else 6_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
