@@ -69,17 +69,14 @@ class MCMCWorkflowConfig:
     proposal_fraction: float = 0.075
     proposal_swaps: int | None = None
     local_scan_enabled: bool = True
-    local_scan_q_multipliers: tuple[float, ...] = (0.25, 0.50, 0.75, 1.00, 1.50, 2.00)
+    local_scan_q_multipliers: tuple[float, ...] = (0.05, 0.25, 0.50, 1.00, 1.50)
     local_scan_screen_total_steps: int = 12_000
     local_scan_finalist_count: int = 3
     local_scan_total_steps: int = 64_000
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
     local_scan_thin: int = 1
-    local_scan_screen_min_tail_hits: int = 25
-    local_scan_final_min_tail_hits: int = 20
-    local_scan_min_ess: float = 10.0
-    local_scan_min_ess_fraction: float = 1e-3
+    local_scan_min_ess: float = 5.0
     local_scan_q_lower_factor: float = 0.25
     local_scan_q_upper_factor: float = 4.0
     local_scan_variance_near_min_ratio: float = 1.20
@@ -278,18 +275,6 @@ def _local_scan_steps(total_steps: int, n_chains: int, burn_in_fraction: float) 
     return steps_per_chain, burn_in
 
 
-def _local_scan_q_floor(total_steps: int, cfg: MCMCWorkflowConfig, min_tail_hits: int) -> float:
-    steps_per_chain, burn_in = _local_scan_steps(
-        total_steps,
-        cfg.local_scan_chains,
-        cfg.local_scan_burn_in_fraction,
-    )
-    kept_total = int(cfg.local_scan_chains * _kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin))
-    if kept_total <= 0:
-        return float("inf")
-    return float(min_tail_hits / kept_total)
-
-
 def _snis_design_variance_objective(
     *,
     log_weights: np.ndarray,
@@ -346,6 +331,70 @@ def _local_scan_pool_indices(rows: list[dict[str, Any]]) -> tuple[list[int], boo
     return fallback_indices, False
 
 
+def _build_q_scan_candidates(
+    *,
+    problem: PermutationTestProblem,
+    cfg: MCMCWorkflowConfig,
+    beta_center: float,
+    pilot_t: np.ndarray,
+    p0_for_qtarget: float,
+    sigma_t: float,
+    q_target: float,
+    q_multipliers: Iterable[float],
+    existing_betas: Iterable[float] = (),
+) -> list[dict[str, float]]:
+    candidates: list[dict[str, float]] = []
+    seen_betas = [float(beta) for beta in existing_betas]
+    for mult in q_multipliers:
+        q_multiplier = float(mult)
+        if q_multiplier <= 0.0 or not np.isfinite(q_multiplier):
+            continue
+        q_candidate = float(min(q_target * q_multiplier, 1.0 - 1e-12))
+        beta_candidate = (
+            float(beta_center)
+            if np.isclose(q_candidate, q_target, rtol=1e-12, atol=1e-15)
+            else float(
+                init_beta_from_iid_pilot(
+                    pilot_T=pilot_t,
+                    T_obs=problem.t_obs,
+                    sigma_T=sigma_t,
+                    p0=p0_for_qtarget,
+                    q_target=q_candidate,
+                    beta_max=cfg.beta_max_init,
+                )
+            )
+        )
+        if beta_candidate <= 0.0 or not np.isfinite(beta_candidate):
+            continue
+        if any(np.isclose(beta_candidate, beta_prev, rtol=1e-10, atol=1e-12) for beta_prev in seen_betas):
+            continue
+        seen_betas.append(beta_candidate)
+        candidates.append(
+            {
+                "beta": beta_candidate,
+                "q_scan_target": q_candidate,
+                "q_multiplier": q_multiplier,
+            }
+        )
+    return candidates
+
+
+def _refinement_q_multipliers(ladder: list[float], best_idx: int) -> tuple[float, float]:
+    if len(ladder) < 2:
+        return tuple()
+    if best_idx <= 0:
+        left = float((ladder[0] * ladder[0]) / ladder[1])
+        right = float(np.sqrt(ladder[0] * ladder[1]))
+        return (left, right)
+    if best_idx >= len(ladder) - 1:
+        left = float(np.sqrt(ladder[-2] * ladder[-1]))
+        right = float((ladder[-1] * ladder[-1]) / ladder[-2])
+        return (left, right)
+    left = float(np.sqrt(ladder[best_idx - 1] * ladder[best_idx]))
+    right = float(np.sqrt(ladder[best_idx] * ladder[best_idx + 1]))
+    return (left, right)
+
+
 def _run_local_scan_stage(
     problem: PermutationTestProblem,
     cfg: MCMCWorkflowConfig,
@@ -369,6 +418,7 @@ def _run_local_scan_stage(
     for idx, candidate in enumerate(candidates):
         beta = float(candidate["beta"])
         q_scan_target = float(candidate["q_scan_target"])
+        q_multiplier = float(candidate.get("q_multiplier", float("nan")))
         res = run_mcmc_is(
             problem,
             beta=beta,
@@ -408,7 +458,7 @@ def _run_local_scan_stage(
             chain_kept_samples=int(chain_kept_samples),
             obm_batch_size=cfg.obm_batch_size,
         )
-        ess_guardrail_min = float(max(cfg.local_scan_min_ess, cfg.local_scan_min_ess_fraction * n_weighted_samples))
+        ess_guardrail_min = float(cfg.local_scan_min_ess)
         guardrail_fail_reasons: list[str] = []
         if not np.isfinite(selection_objective_p0) or selection_objective_p0 <= 0.0:
             guardrail_fail_reasons.append("selection_objective_p0_nonpositive")
@@ -420,6 +470,7 @@ def _run_local_scan_stage(
                 "beta": float(beta),
                 "q_scan_target": q_scan_target,
                 "q_scan_target_ratio": float(q_scan_target / q_target) if q_target > 0.0 else float("nan"),
+                "q_multiplier": q_multiplier,
                 "estimate": float(res.estimate),
                 "variance_estimate": var_hat,
                 "selection_objective_p0": selection_objective_p0,
@@ -557,65 +608,100 @@ def local_beta_scan(
             "selected_reason": "beta_center_nonpositive",
         }
 
-    q_multipliers = tuple(float(mult) for mult in cfg.local_scan_q_multipliers)
-    screen_q_floor = _local_scan_q_floor(
-        int(cfg.local_scan_screen_total_steps),
-        cfg,
-        int(cfg.local_scan_screen_min_tail_hits),
+    initial_q_multipliers = tuple(
+        float(mult)
+        for mult in cfg.local_scan_q_multipliers
+        if float(mult) > 0.0 and np.isfinite(float(mult))
     )
-    final_q_floor = _local_scan_q_floor(
-        int(cfg.local_scan_total_steps),
-        cfg,
-        int(cfg.local_scan_final_min_tail_hits),
+    initial_candidates = _build_q_scan_candidates(
+        problem=problem,
+        cfg=cfg,
+        beta_center=float(beta_center),
+        pilot_t=pilot_t,
+        p0_for_qtarget=float(p0_for_qtarget),
+        sigma_t=float(sigma_t),
+        q_target=float(q_target),
+        q_multipliers=initial_q_multipliers,
     )
-    q_candidates = [
-        float(min(max(q_target * mult, final_q_floor), 1.0 - 1e-12))
-        for mult in q_multipliers
-        if mult > 0.0
-    ]
-    candidates: list[dict[str, float]] = []
-    seen_betas: list[float] = []
-    for q_candidate in q_candidates:
-        beta_candidate = (
-            float(beta_center)
-            if np.isclose(q_candidate, q_target, rtol=1e-12, atol=1e-15)
-            else float(
-                init_beta_from_iid_pilot(
-                    pilot_T=pilot_t,
-                    T_obs=problem.t_obs,
-                    sigma_T=sigma_t,
-                    p0=p0_for_qtarget,
-                    q_target=q_candidate,
-                    beta_max=cfg.beta_max_init,
-                )
-            )
-        )
-        if beta_candidate <= 0.0 or not np.isfinite(beta_candidate):
-            continue
-        if any(np.isclose(beta_candidate, beta_prev, rtol=1e-10, atol=1e-12) for beta_prev in seen_betas):
-            continue
-        seen_betas.append(beta_candidate)
-        candidates.append(
-            {
-                "beta": beta_candidate,
-                "q_scan_target": float(q_candidate),
-            }
-        )
-    candidates = sorted(candidates, key=lambda row: float(row["beta"]))
+    if not initial_candidates:
+        return {
+            "enabled": True,
+            "selected_beta": float(beta_center),
+            "rows": [],
+            "screen_rows": [],
+            "scan_eval_total": 0,
+            "scan_wall_time_sec": 0.0,
+            "selected_reason": "no_local_scan_candidates",
+        }
     t_start = time.perf_counter()
 
-    screen = _run_local_scan_stage(
+    initial_screen = _run_local_scan_stage(
         problem,
         cfg,
-        candidates=candidates,
+        candidates=initial_candidates,
         p0_reference=float(p0_for_qtarget),
         sigma_t=sigma_t,
         q_target=q_target,
         total_steps=int(cfg.local_scan_screen_total_steps),
         seed=seed,
-        stage="screen",
+        stage="screen_initial",
     )
-    screen_rows = screen["rows"]
+    initial_rows = initial_screen["rows"]
+    initial_pool_indices, initial_used_guardrails = _local_scan_pool_indices(initial_rows)
+    ranked_initial_indices = sorted(
+        initial_pool_indices,
+        key=lambda idx: (
+            float(initial_rows[idx]["selection_objective_p0"]),
+            float(initial_rows[idx]["beta"]),
+        ),
+    )
+    if not ranked_initial_indices:
+        ranked_initial_indices = list(range(len(initial_rows)))
+    best_initial_idx = int(ranked_initial_indices[0]) if ranked_initial_indices else None
+    best_initial_q_multiplier = (
+        float(initial_rows[best_initial_idx]["q_multiplier"])
+        if best_initial_idx is not None
+        else None
+    )
+
+    refinement_q_multipliers: tuple[float, ...] = tuple()
+    refinement_candidates: list[dict[str, float]] = []
+    refinement_rows: list[dict[str, Any]] = []
+    refinement_eval_total = 0
+    refinement_wall_time_sec = 0.0
+    if best_initial_idx is not None and len(initial_candidates) >= 2:
+        refinement_q_multipliers = _refinement_q_multipliers(
+            [float(candidate["q_multiplier"]) for candidate in initial_candidates],
+            best_initial_idx,
+        )
+        refinement_candidates = _build_q_scan_candidates(
+            problem=problem,
+            cfg=cfg,
+            beta_center=float(beta_center),
+            pilot_t=pilot_t,
+            p0_for_qtarget=float(p0_for_qtarget),
+            sigma_t=float(sigma_t),
+            q_target=float(q_target),
+            q_multipliers=refinement_q_multipliers,
+            existing_betas=[float(candidate["beta"]) for candidate in initial_candidates],
+        )
+    if refinement_candidates:
+        refinement_screen = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=refinement_candidates,
+            p0_reference=float(p0_for_qtarget),
+            sigma_t=sigma_t,
+            q_target=q_target,
+            total_steps=int(cfg.local_scan_screen_total_steps),
+            seed=seed + 500_000,
+            stage="screen_refine",
+        )
+        refinement_rows = refinement_screen["rows"]
+        refinement_eval_total = int(refinement_screen["eval_total"])
+        refinement_wall_time_sec = float(refinement_screen["wall_time_sec"])
+
+    screen_rows = list(initial_rows) + list(refinement_rows)
     screen_pool_indices, screen_used_guardrails = _local_scan_pool_indices(screen_rows)
     ranked_screen_indices = sorted(
         screen_pool_indices,
@@ -624,7 +710,7 @@ def local_beta_scan(
             float(screen_rows[idx]["beta"]),
         ),
     )
-    target_finalist_count = min(int(cfg.local_scan_finalist_count), len(candidates))
+    target_finalist_count = min(int(cfg.local_scan_finalist_count), len(screen_rows))
     if len(ranked_screen_indices) < target_finalist_count:
         supplemental_indices = [
             idx
@@ -657,6 +743,7 @@ def local_beta_scan(
         {
             "beta": float(screen_rows[idx]["beta"]),
             "q_scan_target": float(screen_rows[idx]["q_scan_target"]),
+            "q_multiplier": float(screen_rows[idx]["q_multiplier"]),
         }
         for idx in finalist_indices
     ]
@@ -715,13 +802,13 @@ def local_beta_scan(
         "selected_reason": selected_reason,
         "steps_per_chain": int(final["steps_per_chain"]),
         "burn_in": int(final["burn_in"]),
-        "screen_steps_per_chain": int(screen["steps_per_chain"]),
-        "screen_burn_in": int(screen["burn_in"]),
-        "screen_eval_total": int(screen["eval_total"]),
+        "screen_steps_per_chain": int(initial_screen["steps_per_chain"]),
+        "screen_burn_in": int(initial_screen["burn_in"]),
+        "screen_eval_total": int(initial_screen["eval_total"] + refinement_eval_total),
         "final_eval_total": int(final["eval_total"]),
-        "scan_eval_total": int(screen["eval_total"] + final["eval_total"]),
+        "scan_eval_total": int(initial_screen["eval_total"] + refinement_eval_total + final["eval_total"]),
         "scan_wall_time_sec": float(time.perf_counter() - t_start),
-        "screen_wall_time_sec": float(screen["wall_time_sec"]),
+        "screen_wall_time_sec": float(initial_screen["wall_time_sec"] + refinement_wall_time_sec),
         "final_wall_time_sec": float(final["wall_time_sec"]),
         "selection_metrics": {
             "selection_rule": {
@@ -731,29 +818,29 @@ def local_beta_scan(
                 "preference_within_tolerance": "smaller_beta",
             },
             "screening_rule": {
-                "type": "low_budget_filter",
+                "type": "adaptive_q_ladder_single_refinement",
                 "screen_total_steps": int(cfg.local_scan_screen_total_steps),
                 "final_total_steps": int(cfg.local_scan_total_steps),
                 "finalist_count": int(cfg.local_scan_finalist_count),
                 "screen_ranking": "smallest_design_point_obm_objective",
-                "screen_min_tail_hits": int(cfg.local_scan_screen_min_tail_hits),
-                "final_min_tail_hits": int(cfg.local_scan_final_min_tail_hits),
-                "screen_q_floor": float(screen_q_floor),
-                "final_q_floor": float(final_q_floor),
+                "initial_screen_used_guardrails": bool(initial_used_guardrails),
                 "screen_tail_hits_used_for_ranking": False,
                 "screen_used_guardrails": bool(screen_used_guardrails),
                 "final_used_guardrails": bool(final_used_guardrails),
             },
             "q_ladder": {
-                "type": "pilot_mapped_q_targets",
+                "type": "adaptive_single_refinement",
                 "q_target_center": float(q_target),
-                "q_multipliers": [float(mult) for mult in q_multipliers],
-                "q_candidates": [float(row["q_scan_target"]) for row in candidates],
+                "initial_q_multipliers": [float(mult) for mult in initial_q_multipliers],
+                "best_initial_q_multiplier": best_initial_q_multiplier,
+                "refinement_q_multipliers": [float(mult) for mult in refinement_q_multipliers],
+                "initial_q_candidates": [float(row["q_scan_target"]) for row in initial_candidates],
+                "refinement_q_candidates": [float(row["q_scan_target"]) for row in refinement_candidates],
+                "all_screen_q_candidates": [float(row["q_scan_target"]) for row in screen_rows],
             },
             "guardrails": {
                 "selection_objective_p0_positive": True,
                 "min_ess": float(cfg.local_scan_min_ess),
-                "min_ess_fraction_of_weighted_samples": float(cfg.local_scan_min_ess_fraction),
             },
         },
         "screen_rows": screen_rows,
