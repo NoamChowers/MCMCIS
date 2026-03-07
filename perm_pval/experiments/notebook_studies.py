@@ -14,7 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from perm_pval.core.proposals import n_swap_pairs_from_fraction, propose_localized_swaps
+from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.diagnostics.is_weights import effective_sample_size, summarize_weights
 from perm_pval.diagnostics.mcmc import obm_long_run_variance
@@ -66,8 +66,7 @@ class MCMCWorkflowConfig:
     estimate_variance: bool = True
     obm_batch_size: int | None = None
     tilt_mode: str = "smooth_hinge"
-    proposal_fraction: float = 0.075
-    proposal_swaps: int | None = None
+    proposal_size: float | int = 0.075
     local_scan_enabled: bool = True
     local_scan_q_multipliers: tuple[float, ...] = (0.05, 0.25, 0.50, 1.00, 1.50)
     local_scan_screen_total_steps: int = 12_000
@@ -90,8 +89,7 @@ class SAMCWorkflowConfig:
     trace_every: int = 200
     convergence_tolerance: float = 20.0
     lambda_min_pilot: int = 10_000
-    proposal_fraction: float = 0.075
-    proposal_swaps: int | None = None
+    proposal_size: float | int = 0.075
 
 
 @dataclass(frozen=True)
@@ -116,8 +114,7 @@ class BetaSweepStudyConfig:
     estimate_variance: bool = True
     obm_batch_size: int | None = None
     tilt_mode: str = "smooth_hinge"
-    proposal_fraction: float = 0.075
-    proposal_swaps: int | None = None
+    proposal_size: float | int = 0.075
     base_seed: int = 54_321
     n_jobs: int = 1
 
@@ -430,8 +427,7 @@ def _run_local_scan_stage(
             seed=seed + 10_000 * idx,
             init="random",
             tilt_mode=str(cfg.tilt_mode),
-            proposal_fraction=cfg.proposal_fraction,
-            proposal_swaps=cfg.proposal_swaps,
+            proposal_size=cfg.proposal_size,
             estimate_variance=True,
             obm_batch_size=cfg.obm_batch_size,
         )
@@ -876,8 +872,7 @@ def build_beta_workflow(
         problem,
         sigma_T=sigma_t,
         thin=cfg.tune_thin,
-        proposal_fraction=cfg.proposal_fraction,
-        proposal_swaps=cfg.proposal_swaps,
+        proposal_size=cfg.proposal_size,
         seed=seed + 1,
     )
     tuning = tune_beta_to_target_q(
@@ -1287,14 +1282,11 @@ def _run_mcmc_cumulative_checkpoints(
     steps_per_checkpoint = {int(cp): _steps_per_chain(int(cp), cfg.chains) for cp in checkpoints}
     unique_step_checkpoints = tuple(sorted(set(steps_per_checkpoint.values())))
 
-    if cfg.proposal_swaps is not None:
-        n_swap_pairs = int(cfg.proposal_swaps)
-    else:
-        n_swap_pairs = n_swap_pairs_from_fraction(
-            problem.n_treated,
-            problem.n_control,
-            proposal_fraction=cfg.proposal_fraction,
-        )
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=cfg.proposal_size,
+    )
 
     seed_seq = np.random.SeedSequence(seed)
     traces: list[dict[str, Any]] = []
@@ -1354,14 +1346,11 @@ def _run_samc_cumulative_checkpoints(
     tail_bin_index = int(k - 1)
     target = np.full(k, 1.0 / k, dtype=float)
 
-    if cfg.proposal_swaps is not None:
-        n_swap_pairs = int(cfg.proposal_swaps)
-    else:
-        n_swap_pairs = n_swap_pairs_from_fraction(
-            problem.n_treated,
-            problem.n_control,
-            proposal_fraction=cfg.proposal_fraction,
-        )
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=cfg.proposal_size,
+    )
 
     rng = np.random.default_rng(seed)
     y = problem.sample_uniform_labels(rng)

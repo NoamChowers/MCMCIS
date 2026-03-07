@@ -149,14 +149,14 @@ def build_cross_method_notebook() -> dict:
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_fraction=0.075,
+                proposal_size=0.075,
             )
             samc_cfg = SAMCWorkflowConfig(
                 n_bins=40,
                 t0=1_000.0,
                 trace_every=200 if not FAST_MODE else 50,
                 lambda_min_pilot=10_000 if not FAST_MODE else 500,
-                proposal_fraction=0.075,
+                proposal_size=0.075,
             )
 
             print(json.dumps({
@@ -332,7 +332,7 @@ def build_beta_notebook() -> dict:
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_fraction=0.075,
+                proposal_size=0.075,
             )
             beta_cfg = BetaSweepStudyConfig(
                 estimation_points=ESTIMATION_POINTS,
@@ -341,7 +341,7 @@ def build_beta_notebook() -> dict:
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_fraction=0.075,
+                proposal_size=0.075,
                 base_seed=BASE_SEED,
                 n_jobs=N_JOBS,
             )

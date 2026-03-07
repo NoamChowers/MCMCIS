@@ -53,6 +53,7 @@ def _small_mcmc_cfg() -> MCMCWorkflowConfig:
         tune_thin=1,
         tune_max_bracket=4,
         tune_max_bisect=4,
+        local_scan_screen_total_steps=10,
         local_scan_total_steps=20,
         local_scan_chains=1,
         local_scan_thin=1,

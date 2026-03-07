@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from numbers import Integral, Real
 from typing import Tuple
 
 import numpy as np
@@ -38,12 +39,45 @@ def n_swap_pairs_from_fraction(
     """
     Convert a proposal fraction to an integer number of treated/control swap pairs.
     """
-    if proposal_fraction <= 0.0:
-        raise ValueError("proposal_fraction must be positive.")
+    if proposal_fraction <= 0.0 or proposal_fraction > 1.0:
+        raise ValueError("proposal_fraction must satisfy 0 < proposal_fraction <= 1.")
     max_pairs = min(int(n_treated), int(n_control))
     if max_pairs <= 0:
         raise ValueError("Both groups must be non-empty.")
     return max(1, int(round(proposal_fraction * max_pairs)))
+
+
+def resolve_n_swap_pairs(
+    n_treated: int,
+    n_control: int,
+    proposal_size: float | int = 0.075,
+) -> int:
+    """
+    Resolve proposal size to an integer number of treated/control swap pairs.
+
+    ``proposal_size`` is interpreted as:
+    - ``int``: absolute number of swap pairs
+    - ``float``: fraction of the smaller group size
+    """
+    max_pairs = min(int(n_treated), int(n_control))
+    if max_pairs <= 0:
+        raise ValueError("Both groups must be non-empty.")
+    if isinstance(proposal_size, bool):
+        raise TypeError("proposal_size must be an int swap count or float proposal fraction.")
+    if isinstance(proposal_size, Integral):
+        n_swap_pairs = int(proposal_size)
+        if n_swap_pairs < 1 or n_swap_pairs > max_pairs:
+            raise ValueError(
+                "proposal_size must satisfy 1 <= proposal_size <= min group size when given as an int."
+            )
+        return n_swap_pairs
+    if isinstance(proposal_size, Real):
+        return n_swap_pairs_from_fraction(
+            n_treated,
+            n_control,
+            proposal_fraction=float(proposal_size),
+        )
+    raise TypeError("proposal_size must be an int swap count or float proposal fraction.")
 
 
 def propose_localized_swaps(

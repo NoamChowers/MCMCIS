@@ -5,7 +5,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from perm_pval.core.proposals import n_swap_pairs_from_fraction, propose_localized_swaps
+from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.methods.mcmc_is import right_tail_deficit_scaled
 
@@ -395,8 +395,7 @@ def make_short_chain_q_runner(
     sigma_T: float,
     *,
     thin: int = 1,
-    proposal_fraction: float = 0.075,
-    proposal_swaps: int | None = None,
+    proposal_size: float | int = 0.075,
     seed: Optional[int] = None,
 ) -> Callable[[float, Any, int, int], dict[str, Any]]:
     """
@@ -408,19 +407,11 @@ def make_short_chain_q_runner(
         raise ValueError("sigma_T must be finite and positive.")
     if thin <= 0:
         raise ValueError("thin must be positive.")
-    if proposal_fraction <= 0.0:
-        raise ValueError("proposal_fraction must be positive.")
-    if proposal_swaps is not None and proposal_swaps <= 0:
-        raise ValueError("proposal_swaps must be a positive integer when provided.")
-
-    if proposal_swaps is not None:
-        n_swap_pairs = int(proposal_swaps)
-    else:
-        n_swap_pairs = n_swap_pairs_from_fraction(
-            problem.n_treated,
-            problem.n_control,
-            proposal_fraction=proposal_fraction,
-        )
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=proposal_size,
+    )
 
     seed_seq = np.random.SeedSequence(seed)
 

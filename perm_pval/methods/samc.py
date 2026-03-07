@@ -5,7 +5,7 @@ from typing import Optional
 
 import numpy as np
 
-from perm_pval.core.proposals import n_swap_pairs_from_fraction, propose_localized_swaps
+from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.diagnostics.samc import visitation_frequency
 
@@ -163,8 +163,7 @@ def run_samc(
     init: str = "random",
     trace_every: int = 10,
     lambda_min: Optional[float] = None,
-    proposal_fraction: float = 0.075,
-    proposal_swaps: Optional[int] = None,
+    proposal_size: float | int = 0.075,
     convergence_tolerance: float = 20.0,
 ) -> SAMCResult:
     """
@@ -190,8 +189,6 @@ def run_samc(
         raise ValueError("trace_every must be positive.")
     if n_bins < 2:
         raise ValueError("n_bins must be at least 2.")
-    if proposal_fraction <= 0.0:
-        raise ValueError("proposal_fraction must be positive.")
     if convergence_tolerance <= 0.0:
         raise ValueError("convergence_tolerance must be positive.")
 
@@ -202,16 +199,11 @@ def run_samc(
             "Current SAMC implementation follows Yu et al. (2011) right-tail formulation only."
         )
 
-    if proposal_swaps is not None:
-        n_swap_pairs = int(proposal_swaps)
-        if n_swap_pairs <= 0:
-            raise ValueError("proposal_swaps must be a positive integer.")
-    else:
-        n_swap_pairs = n_swap_pairs_from_fraction(
-            problem.n_treated,
-            problem.n_control,
-            proposal_fraction=proposal_fraction,
-        )
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=proposal_size,
+    )
 
     if bin_edges is None:
         bin_edges = _auto_bin_edges_paper_right(

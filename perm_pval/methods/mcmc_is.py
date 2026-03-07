@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 import numpy as np
 
-from perm_pval.core.proposals import n_swap_pairs_from_fraction, propose_localized_swaps
+from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.diagnostics.is_weights import (
     ISWeightSummary,
@@ -171,8 +171,7 @@ def run_mcmc_is(
     seed: Optional[int] = None,
     init: str = "random",
     tilt_mode: Literal["smooth_hinge", "step"] = "smooth_hinge",
-    proposal_fraction: float = 0.075,
-    proposal_swaps: int | None = None,
+    proposal_size: float | int = 0.075,
     estimate_variance: bool = True,
     obm_batch_size: int | None = None,
 ) -> MCMCISResult:
@@ -208,10 +207,6 @@ def run_mcmc_is(
         raise ValueError("thin must be positive.")
     if n_chains <= 0:
         raise ValueError("n_chains must be positive.")
-    if proposal_fraction <= 0.0:
-        raise ValueError("proposal_fraction must be positive.")
-    if proposal_swaps is not None and proposal_swaps <= 0:
-        raise ValueError("proposal_swaps must be a positive integer when provided.")
     if beta < 0.0:
         raise ValueError("beta must be non-negative.")
     if tilt_mode not in ("smooth_hinge", "step"):
@@ -224,14 +219,11 @@ def run_mcmc_is(
             "g_beta(y) ∝ f(y) * exp(-beta * ((t_obs - T(y)) / sigma_t)_+)."
         )
 
-    if proposal_swaps is not None:
-        n_swap_pairs = int(proposal_swaps)
-    else:
-        n_swap_pairs = n_swap_pairs_from_fraction(
-            problem.n_treated,
-            problem.n_control,
-            proposal_fraction=proposal_fraction,
-        )
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=proposal_size,
+    )
 
     seed_seq = np.random.SeedSequence(seed)
     child_seqs = seed_seq.spawn(n_chains)
