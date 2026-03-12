@@ -119,6 +119,43 @@ class BetaSweepStudyConfig:
     n_jobs: int = 1
 
 
+DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS: tuple[float, ...] = (
+    1e-5,
+    3e-5,
+    1e-4,
+    3e-4,
+    1e-3,
+    3e-3,
+    1e-2,
+    3e-2,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.33,
+)
+DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS: tuple[int, ...] = (1, 2, 3, 4)
+MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES: tuple[str, ...] = (
+    "selobj",
+    "varhat",
+    "selobj_hits_soft",
+    "selobj_acc_soft",
+    "selobj_qmatch_soft",
+    "selobj_hits_acc_soft",
+    "varhat_hits_soft",
+    "varhat_acc_soft",
+    "varhat_qmatch_soft",
+    "varhat_hits_acc_soft",
+    "selobj_guardrailed",
+    "varhat_guardrailed",
+)
+MCMC_OBJECTIVE_GRID_ALL_OBJECTIVES: tuple[str, ...] = (
+    "oracle_rmse",
+    "oracle_abs_log10",
+    *MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES,
+)
+
+
 @dataclass(frozen=True)
 class LoadedScenario:
     key: str
@@ -958,47 +995,6 @@ def build_beta_workflow(
     }
 
 
-def map_log10_q_multiplier_to_mcmc_candidate(
-    problem: PermutationTestProblem,
-    *,
-    pilot_t: np.ndarray,
-    sigma_t: float,
-    p0_for_qtarget: float,
-    q_target: float,
-    log10_q_multiplier: float,
-    beta_max: float,
-    q_clip_min: float = 1e-6,
-    q_clip_max: float = 0.95,
-) -> dict[str, Any]:
-    q_multiplier = float(10.0 ** float(log10_q_multiplier))
-    q_raw = float(q_target * q_multiplier)
-    q_trial = float(np.clip(q_raw, q_clip_min, q_clip_max))
-    beta_trial = float(
-        init_beta_from_iid_pilot(
-            pilot_T=pilot_t,
-            T_obs=problem.t_obs,
-            sigma_T=sigma_t,
-            p0=p0_for_qtarget,
-            q_target=q_trial,
-            beta_max=beta_max,
-        )
-    )
-    if not np.isfinite(beta_trial) or beta_trial <= 0.0:
-        raise ValueError(
-            "Pilot-based q-to-beta mapping produced a non-finite or non-positive beta. "
-            f"Received q_trial={q_trial}, beta_trial={beta_trial}."
-        )
-    return {
-        "log10_q_multiplier": float(log10_q_multiplier),
-        "q_multiplier": q_multiplier,
-        "q_target": float(q_target),
-        "q_trial_raw": q_raw,
-        "q_trial": q_trial,
-        "beta_trial": beta_trial,
-        "q_clipped": int(not np.isclose(q_trial, q_raw, rtol=1e-12, atol=1e-15)),
-    }
-
-
 def run_mcmc_trial_candidate(
     problem: PermutationTestProblem,
     exact_p: float,
@@ -1090,151 +1086,259 @@ def run_mcmc_trial_candidate(
     return row
 
 
-def summarize_mcmc_trial_repeats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    if not rows:
-        raise ValueError("rows must be non-empty.")
-    summary = summarize_records(list(rows), group_fields=("trial_number",))[0]
-    first = rows[0]
-    estimates = np.asarray([float(row["estimate"]) for row in rows], dtype=float)
-    abs_log = np.asarray([float(row.get("abs_log10_error", np.nan)) for row in rows], dtype=float)
-    var_hat = np.asarray([float(row.get("variance_estimate", np.nan)) for row in rows], dtype=float)
-    selection_objective = np.asarray([float(row.get("selection_objective_p0", np.nan)) for row in rows], dtype=float)
-    tail_hits = np.asarray([float(row.get("tail_hits", np.nan)) for row in rows], dtype=float)
-
-    oracle_rmse = float(np.sqrt(np.mean(np.asarray([float(row["squared_error"]) for row in rows], dtype=float))))
-    oracle_abs_log10 = float(np.mean(abs_log)) if abs_log.size and np.all(np.isfinite(abs_log)) else float("inf")
-    positive_selection = selection_objective[np.isfinite(selection_objective) & (selection_objective > 0.0)]
-    diag_selection_objective = float(np.mean(positive_selection)) if positive_selection.size == selection_objective.size else float("inf")
-    positive_var = var_hat[np.isfinite(var_hat) & (var_hat > 0.0)]
-    diag_variance = float(np.median(positive_var)) if positive_var.size else float("inf")
-    mean_tail_hits = float(np.mean(tail_hits)) if tail_hits.size else float("nan")
-    diag_repeat_stability = (
-        float(np.var(estimates, ddof=0))
-        if estimates.size and np.all(np.isfinite(estimates)) and np.isfinite(mean_tail_hits) and mean_tail_hits > 0.0
-        else float("inf")
-    )
-
-    summary.update(
-        {
-            "trial_number": int(first["trial_number"]),
-            "beta": float(first["beta"]),
-            "sigma_t": float(first["sigma_t"]),
-            "proposal_size": int(first["proposal_size"]),
-            "n_swap_pairs": int(first["n_swap_pairs"]),
-            "log10_q_multiplier": float(first["log10_q_multiplier"]),
-            "q_multiplier": float(first["q_multiplier"]),
-            "q_target": float(first["q_target"]),
-            "q_trial": float(first["q_trial"]),
-            "q_trial_raw": float(first["q_trial_raw"]),
-            "q_clipped": int(first["q_clipped"]),
-            "mean_tail_hits": mean_tail_hits,
-            "objective_oracle_rmse": float(oracle_rmse),
-            "objective_oracle_abs_log10": float(oracle_abs_log10),
-            "objective_diag_selection_objective_p0": float(diag_selection_objective),
-            "objective_diag_variance_estimate": float(diag_variance),
-            "objective_diag_repeat_stability": float(diag_repeat_stability),
-        }
-    )
-    return summary
-
-
-def select_best_mcmc_trial_by_objective(
-    trial_summaries: list[dict[str, Any]],
+def build_mcmc_objective_grid_candidates(
+    problem: PermutationTestProblem,
     *,
-    objective_names: Iterable[str] | None = None,
-) -> dict[str, dict[str, Any]]:
-    if objective_names is None:
-        objective_names = (
-            "oracle_rmse",
-            "oracle_abs_log10",
-            "diag_selection_objective_p0",
-            "diag_variance_estimate",
-            "diag_repeat_stability",
-        )
-    objective_names = tuple(str(name) for name in objective_names)
-    out: dict[str, dict[str, Any]] = {}
-    for objective_name in objective_names:
-        key = f"objective_{objective_name}"
-        if not trial_summaries:
-            raise ValueError("trial_summaries must be non-empty.")
-        best = min(
-            trial_summaries,
-            key=lambda row: (
-                float(row.get(key, float("inf"))),
-                float(row.get("beta", float("inf"))),
-                int(row.get("n_swap_pairs", 10**9)),
-                int(row.get("trial_number", 10**9)),
-            ),
-        )
-        selected = dict(best)
-        selected["selected_objective"] = str(objective_name)
-        selected["selected_objective_value"] = float(best.get(key, float("inf")))
-        out[str(objective_name)] = selected
-    return out
+    pilot_t: np.ndarray,
+    sigma_t: float,
+    p0_for_qtarget: float,
+    q_target: float,
+    q_multipliers: tuple[float, ...] = DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS,
+    n_swap_pairs_values: tuple[int, ...] = DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS,
+    beta_max: float,
+    q_floor: float = 1e-12,
+) -> list[dict[str, Any]]:
+    q_grid = tuple(float(v) for v in q_multipliers)
+    if not q_grid:
+        raise ValueError("q_multipliers must be non-empty.")
+    swap_values = tuple(int(v) for v in n_swap_pairs_values)
+    if not swap_values:
+        raise ValueError("n_swap_pairs_values must be non-empty.")
+    max_swaps = min(int(problem.n_treated), int(problem.n_control))
+
+    candidates: list[dict[str, Any]] = []
+    for q_index, q_multiplier in enumerate(q_grid):
+        if q_multiplier <= 0.0:
+            raise ValueError("q_multipliers must all be positive.")
+        q_raw = float(q_target * q_multiplier)
+        q_trial = float(max(q_raw, float(q_floor)))
+        for n_swap_pairs in swap_values:
+            if n_swap_pairs < 1 or n_swap_pairs > max_swaps:
+                raise ValueError(
+                    f"n_swap_pairs must lie in [1, {max_swaps}], received {n_swap_pairs}."
+                )
+            config_id = f"q{q_index:02d}_s{n_swap_pairs}"
+            candidate = {
+                "config_id": config_id,
+                "label": config_id,
+                "q_index": int(q_index),
+                "q_multiplier": float(q_multiplier),
+                "q_target": float(q_target),
+                "q_trial_raw": float(q_raw),
+                "q_trial": float(q_trial),
+                "q_floor": float(q_floor),
+                "q_floor_applied": int(not np.isclose(q_trial, q_raw, rtol=1e-12, atol=1e-15)),
+                "n_swap_pairs": int(n_swap_pairs),
+                "proposal_size": int(n_swap_pairs),
+                "sigma_t": float(sigma_t),
+            }
+            try:
+                beta_trial = float(
+                    init_beta_from_iid_pilot(
+                        pilot_T=pilot_t,
+                        T_obs=problem.t_obs,
+                        sigma_T=sigma_t,
+                        p0=p0_for_qtarget,
+                        q_target=q_trial,
+                        beta_max=beta_max,
+                    )
+                )
+                if np.isfinite(beta_trial) and beta_trial > 0.0:
+                    candidate["beta"] = float(beta_trial)
+                    candidate["status"] = "ok"
+                    candidate["invalid_reason"] = None
+                else:
+                    candidate["beta"] = np.nan
+                    candidate["status"] = "invalid_q_map"
+                    candidate["invalid_reason"] = (
+                        "Pilot-based q-to-beta mapping produced a non-finite or non-positive beta."
+                    )
+            except Exception as exc:
+                candidate["beta"] = np.nan
+                candidate["status"] = "invalid_q_map"
+                candidate["invalid_reason"] = str(exc)
+            candidates.append(candidate)
+    return candidates
 
 
-def deduplicate_selected_trial_configs(
-    selected_by_objective: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    grouped: dict[tuple[float, int], dict[str, Any]] = {}
-    objective_to_config: dict[str, str] = {}
-    for objective_name, row in sorted(selected_by_objective.items()):
-        key = (round(float(row["beta"]), 12), int(row["n_swap_pairs"]))
-        group = grouped.setdefault(
-            key,
-            {
-                "beta": float(row["beta"]),
-                "proposal_size": int(row["n_swap_pairs"]),
-                "n_swap_pairs": int(row["n_swap_pairs"]),
-                "sigma_t": float(row["sigma_t"]),
-                "log10_q_multiplier": float(row["log10_q_multiplier"]),
-                "q_multiplier": float(row["q_multiplier"]),
-                "q_target": float(row["q_target"]),
-                "q_trial": float(row["q_trial"]),
-                "q_trial_raw": float(row["q_trial_raw"]),
-                "q_clipped": int(row["q_clipped"]),
-                "trial_numbers": [],
-                "selected_by_objectives": [],
-            },
-        )
-        group["trial_numbers"].append(int(row["trial_number"]))
-        group["selected_by_objectives"].append(str(objective_name))
-    configs: list[dict[str, Any]] = []
-    for idx, (_key, group) in enumerate(sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))):
-        config_id = f"cfg_{idx:02d}"
-        config = dict(group)
-        config["config_id"] = config_id
-        config["label"] = config_id
-        config["trial_numbers"] = sorted(set(int(v) for v in config["trial_numbers"]))
-        config["selected_by_objectives"] = sorted(set(str(v) for v in config["selected_by_objectives"]))
-        configs.append(config)
-        for objective_name in config["selected_by_objectives"]:
-            objective_to_config[str(objective_name)] = config_id
+def _positive_finite(value: Any) -> bool:
+    return bool(np.isfinite(value) and float(value) > 0.0)
+
+
+def _objective_grid_penalties(row: dict[str, Any]) -> dict[str, float]:
+    tail_hits = int(row.get("tail_hits", 0))
+    acceptance_rate = float(row.get("acceptance_rate", np.nan))
+    q_real = float(row.get("q_tilt_tail_share", np.nan))
+    q_trial = float(row.get("q_trial", np.nan))
+    n_weighted_samples = int(row.get("n_weighted_samples", 0))
+
+    p_hits = float(max(1.0, 25.0 / max(tail_hits, 1)))
+    if not np.isfinite(acceptance_rate) or acceptance_rate <= 0.0:
+        p_acc = float("inf")
+    else:
+        p_acc = float(max(1.0, 0.05 / acceptance_rate))
+    if n_weighted_samples > 0:
+        q_eps = float(max(1.0 / float(n_weighted_samples), 1e-12))
+    else:
+        q_eps = 1e-12
+    if not np.isfinite(q_real) or not np.isfinite(q_trial) or q_trial <= 0.0:
+        p_q = float("inf")
+    else:
+        p_q = float(1.0 + abs(np.log((q_real + q_eps) / (q_trial + q_eps))))
     return {
-        "configs": configs,
-        "objective_to_config": objective_to_config,
+        "P_hits": p_hits,
+        "P_acc": p_acc,
+        "P_q": p_q,
+        "q_eps": q_eps,
     }
 
 
-def _mcmc_optuna_trial_worker(
+def score_mcmc_objective_grid_repeat_row(row: dict[str, Any]) -> dict[str, Any]:
+    penalties = _objective_grid_penalties(row)
+    selobj = float(row.get("selection_objective_p0", np.nan))
+    varhat = float(row.get("variance_estimate", np.nan))
+    tail_hits = int(row.get("tail_hits", 0))
+    acceptance_rate = float(row.get("acceptance_rate", np.nan))
+
+    selobj_valid = _positive_finite(selobj)
+    varhat_valid = _positive_finite(varhat)
+    base_selobj = float(selobj) if selobj_valid else float("inf")
+    base_varhat = float(varhat) if varhat_valid else float("inf")
+
+    scored = dict(row)
+    scored.update(penalties)
+    scored["objective_oracle_abs_log10"] = float(row.get("abs_log10_error", float("inf")))
+    scored["objective_selobj"] = base_selobj
+    scored["objective_varhat"] = base_varhat
+    scored["objective_selobj_hits_soft"] = (
+        float(base_selobj * penalties["P_hits"]) if np.isfinite(base_selobj) else float("inf")
+    )
+    scored["objective_selobj_acc_soft"] = (
+        float(base_selobj * penalties["P_acc"]) if np.isfinite(base_selobj) else float("inf")
+    )
+    scored["objective_selobj_qmatch_soft"] = (
+        float(base_selobj * penalties["P_q"]) if np.isfinite(base_selobj) else float("inf")
+    )
+    scored["objective_selobj_hits_acc_soft"] = (
+        float(base_selobj * penalties["P_hits"] * penalties["P_acc"])
+        if np.isfinite(base_selobj)
+        else float("inf")
+    )
+    scored["objective_varhat_hits_soft"] = (
+        float(base_varhat * penalties["P_hits"]) if np.isfinite(base_varhat) else float("inf")
+    )
+    scored["objective_varhat_acc_soft"] = (
+        float(base_varhat * penalties["P_acc"]) if np.isfinite(base_varhat) else float("inf")
+    )
+    scored["objective_varhat_qmatch_soft"] = (
+        float(base_varhat * penalties["P_q"]) if np.isfinite(base_varhat) else float("inf")
+    )
+    scored["objective_varhat_hits_acc_soft"] = (
+        float(base_varhat * penalties["P_hits"] * penalties["P_acc"])
+        if np.isfinite(base_varhat)
+        else float("inf")
+    )
+    scored["objective_selobj_guardrailed"] = (
+        base_selobj
+        if np.isfinite(base_selobj) and tail_hits >= 25 and np.isfinite(acceptance_rate) and acceptance_rate >= 0.05
+        else float("inf")
+    )
+    scored["objective_varhat_guardrailed"] = (
+        base_varhat
+        if np.isfinite(base_varhat) and tail_hits >= 25 and np.isfinite(acceptance_rate) and acceptance_rate >= 0.05
+        else float("inf")
+    )
+    return scored
+
+
+def _invalid_mcmc_objective_grid_repeat_row(
+    *,
+    candidate: dict[str, Any],
+    exact_p: float,
+    sigma_t: float,
+    total_budget: int,
+    repeat_idx: int,
+    seed: int,
+    status: str,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    row = {
+        "method": "mcmc_is",
+        "checkpoint": int(total_budget),
+        "estimate": np.nan,
+        "variance_estimate": np.nan,
+        "snis_mcse_obm": np.nan,
+        "tail_hits": 0,
+        "tail_share_raw": 0.0,
+        "q_tilt_tail_share": 0.0,
+        "ess": np.nan,
+        "acceptance_rate": 0.0,
+        "weight_cv": np.nan,
+        "beta": float(candidate.get("beta", np.nan)),
+        "sigma_t": float(sigma_t),
+        "tilt_mode": "smooth_hinge",
+        "selection_objective_p0": np.nan,
+        "proposal_size": int(candidate["proposal_size"]),
+        "n_swap_pairs": int(candidate["n_swap_pairs"]),
+        "wall_time_sec": 0.0,
+        "eval_excl_tuning": 0.0,
+        "eval_incl_tuning": 0.0,
+        "n_weighted_samples": 0,
+        "steps_per_chain": 0,
+        "burn_in": 0,
+        "chains": 0,
+        "thin": 1,
+        "zero_hits": 1,
+        "exact_p": float(exact_p),
+        "squared_error": float("inf"),
+        "abs_log10_error": float("inf"),
+        "abs_rel_error": float("inf"),
+        "config_id": str(candidate["config_id"]),
+        "label": str(candidate["label"]),
+        "q_index": int(candidate["q_index"]),
+        "q_multiplier": float(candidate["q_multiplier"]),
+        "q_target": float(candidate["q_target"]),
+        "q_trial_raw": float(candidate["q_trial_raw"]),
+        "q_trial": float(candidate["q_trial"]),
+        "q_floor": float(candidate["q_floor"]),
+        "q_floor_applied": int(candidate["q_floor_applied"]),
+        "trial_repeat": int(repeat_idx),
+        "trial_budget": int(total_budget),
+        "seed": int(seed),
+        "status": str(status),
+        "invalid_reason": error_message,
+    }
+    return score_mcmc_objective_grid_repeat_row(row)
+
+
+def _mcmc_objective_grid_repeat_worker(
     *,
     problem: PermutationTestProblem,
     exact_p: float,
     sigma_t: float,
     p0_reference: float,
     trial_budget: int,
-    trial_repeats: int,
     mcmc_cfg: MCMCWorkflowConfig,
     candidate: dict[str, Any],
-    trial_number: int,
-    seed_base: int,
+    repeat_idx: int,
+    seed: int,
 ) -> dict[str, Any]:
-    records: list[dict[str, Any]] = []
-    for rep in range(int(trial_repeats)):
+    if str(candidate["status"]) != "ok":
+        return _invalid_mcmc_objective_grid_repeat_row(
+            candidate=candidate,
+            exact_p=exact_p,
+            sigma_t=sigma_t,
+            total_budget=trial_budget,
+            repeat_idx=repeat_idx,
+            seed=seed,
+            status="invalid_q_map",
+            error_message=str(candidate.get("invalid_reason")),
+        )
+    try:
         row = run_mcmc_trial_candidate(
             problem,
             exact_p,
-            beta=float(candidate["beta_trial"]),
+            beta=float(candidate["beta"]),
             sigma_t=float(sigma_t),
             proposal_size=int(candidate["n_swap_pairs"]),
             p0_reference=float(p0_reference),
@@ -1245,165 +1349,472 @@ def _mcmc_optuna_trial_worker(
             estimate_variance=bool(mcmc_cfg.estimate_variance),
             obm_batch_size=mcmc_cfg.obm_batch_size,
             tilt_mode=str(mcmc_cfg.tilt_mode),
-            seed=int(seed_base + 1_000 * rep),
+            seed=int(seed),
         )
-        row.update(
+    except Exception as exc:
+        return _invalid_mcmc_objective_grid_repeat_row(
+            candidate=candidate,
+            exact_p=exact_p,
+            sigma_t=sigma_t,
+            total_budget=trial_budget,
+            repeat_idx=repeat_idx,
+            seed=seed,
+            status="invalid_run",
+            error_message=str(exc),
+        )
+    row.update(
+        {
+            "config_id": str(candidate["config_id"]),
+            "label": str(candidate["label"]),
+            "q_index": int(candidate["q_index"]),
+            "q_multiplier": float(candidate["q_multiplier"]),
+            "q_target": float(candidate["q_target"]),
+            "q_trial_raw": float(candidate["q_trial_raw"]),
+            "q_trial": float(candidate["q_trial"]),
+            "q_floor": float(candidate["q_floor"]),
+            "q_floor_applied": int(candidate["q_floor_applied"]),
+            "trial_repeat": int(repeat_idx),
+            "trial_budget": int(trial_budget),
+            "seed": int(seed),
+            "status": "ok",
+            "invalid_reason": None,
+        }
+    )
+    return score_mcmc_objective_grid_repeat_row(row)
+
+
+def _objective_value_key(value: Any) -> float:
+    if np.isfinite(value):
+        return float(value)
+    return float("inf")
+
+
+def _aggregate_objective_values(values: np.ndarray) -> tuple[float, float, float, float, float]:
+    if values.size == 0:
+        return (float("inf"),) * 5
+    finite = np.all(np.isfinite(values))
+    if not finite:
+        return (float("inf"),) * 5
+    return (
+        float(np.mean(values)),
+        float(np.median(values)),
+        float(np.std(values, ddof=0)),
+        float(np.min(values)),
+        float(np.max(values)),
+    )
+
+
+def summarize_mcmc_objective_grid_configs(
+    repeat_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not repeat_rows:
+        raise ValueError("repeat_rows must be non-empty.")
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in repeat_rows:
+        groups.setdefault(str(row["config_id"]), []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for config_id in sorted(groups):
+        rows = sorted(groups[config_id], key=lambda row: int(row["trial_repeat"]))
+        first = rows[0]
+        squared_error = np.asarray([float(row.get("squared_error", np.inf)) for row in rows], dtype=float)
+        abs_log = np.asarray([float(row.get("abs_log10_error", np.inf)) for row in rows], dtype=float)
+        oracle_rmse = float(np.sqrt(np.mean(squared_error))) if np.all(np.isfinite(squared_error)) else float("inf")
+        oracle_abs = float(np.mean(abs_log)) if np.all(np.isfinite(abs_log)) else float("inf")
+        statuses = [str(row.get("status", "ok")) for row in rows]
+        n_ok = sum(status == "ok" for status in statuses)
+        n_invalid_q_map = sum(status == "invalid_q_map" for status in statuses)
+        n_invalid_run = sum(status == "invalid_run" for status in statuses)
+        if n_ok == len(rows):
+            config_status = "ok"
+        elif n_invalid_q_map == len(rows):
+            config_status = "invalid_q_map"
+        elif n_invalid_run == len(rows):
+            config_status = "invalid_run"
+        else:
+            config_status = "mixed"
+
+        summary = {
+            "config_id": str(first["config_id"]),
+            "label": str(first["label"]),
+            "q_index": int(first["q_index"]),
+            "q_multiplier": float(first["q_multiplier"]),
+            "q_target": float(first["q_target"]),
+            "q_trial_raw": float(first["q_trial_raw"]),
+            "q_trial": float(first["q_trial"]),
+            "q_floor": float(first["q_floor"]),
+            "q_floor_applied": int(first["q_floor_applied"]),
+            "beta": float(first["beta"]) if np.isfinite(first.get("beta", np.nan)) else np.nan,
+            "proposal_size": int(first["proposal_size"]),
+            "n_swap_pairs": int(first["n_swap_pairs"]),
+            "sigma_t": float(first["sigma_t"]),
+            "status": config_status,
+            "n_repeats": int(len(rows)),
+            "n_ok": int(n_ok),
+            "n_invalid_q_map": int(n_invalid_q_map),
+            "n_invalid_run": int(n_invalid_run),
+            "mean_oracle_rmse": float(oracle_rmse),
+            "mean_oracle_abs_log10": float(oracle_abs),
+        }
+        for metric_name in ("tail_hits", "q_tilt_tail_share", "acceptance_rate", "ess", "weight_cv"):
+            values = np.asarray([float(row.get(metric_name, np.nan)) for row in rows], dtype=float)
+            finite = values[np.isfinite(values)]
+            summary[f"mean_{metric_name}"] = float(np.mean(finite)) if finite.size else np.nan
+            summary[f"std_{metric_name}"] = float(np.std(finite, ddof=0)) if finite.size else np.nan
+        for objective_name in MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES:
+            values = np.asarray([float(row.get(f"objective_{objective_name}", np.inf)) for row in rows], dtype=float)
+            mean_v, median_v, std_v, min_v, max_v = _aggregate_objective_values(values)
+            summary[f"mean_objective_{objective_name}"] = mean_v
+            summary[f"median_objective_{objective_name}"] = median_v
+            summary[f"std_objective_{objective_name}"] = std_v
+            summary[f"min_objective_{objective_name}"] = min_v
+            summary[f"max_objective_{objective_name}"] = max_v
+        out.append(summary)
+    return sorted(out, key=lambda row: (int(row["q_index"]), int(row["n_swap_pairs"])))
+
+
+def _select_objective_grid_winner(
+    rows: list[dict[str, Any]],
+    *,
+    metric_key: str,
+) -> dict[str, Any] | None:
+    finite_rows = [row for row in rows if np.isfinite(row.get(metric_key, np.inf))]
+    if not finite_rows:
+        return None
+    return min(
+        finite_rows,
+        key=lambda row: (
+            float(row[metric_key]),
+            int(row["q_index"]),
+            int(row["n_swap_pairs"]),
+            float(row["beta"]) if np.isfinite(row.get("beta", np.nan)) else float("inf"),
+        ),
+    )
+
+
+def _objective_grid_similarity(
+    *,
+    q_index: int,
+    n_swap_pairs: int,
+    oracle_q_index: int,
+    oracle_n_swap_pairs: int,
+    q_grid_size: int,
+    max_swap_distance: int,
+) -> tuple[int, int, float]:
+    q_distance = abs(int(q_index) - int(oracle_q_index))
+    swap_distance = abs(int(n_swap_pairs) - int(oracle_n_swap_pairs))
+    denominator = max(1, int(q_grid_size - 1) + int(max_swap_distance))
+    similarity = 1.0 - float(q_distance + swap_distance) / float(denominator)
+    return q_distance, swap_distance, similarity
+
+
+def select_mcmc_objective_grid_winners(
+    config_summary: list[dict[str, Any]],
+    *,
+    q_multipliers: tuple[float, ...],
+    n_swap_pairs_values: tuple[int, ...],
+) -> dict[str, Any]:
+    if not config_summary:
+        raise ValueError("config_summary must be non-empty.")
+    max_swap_distance = max(n_swap_pairs_values) - min(n_swap_pairs_values) if n_swap_pairs_values else 0
+    oracle_winner = _select_objective_grid_winner(config_summary, metric_key="mean_oracle_rmse")
+    winner_rows: list[dict[str, Any]] = []
+    objective_to_config: dict[str, str] = {}
+
+    for objective_name in MCMC_OBJECTIVE_GRID_ALL_OBJECTIVES:
+        metric_key = (
+            "mean_oracle_rmse"
+            if objective_name == "oracle_rmse"
+            else "mean_oracle_abs_log10"
+            if objective_name == "oracle_abs_log10"
+            else f"mean_objective_{objective_name}"
+        )
+        selected = _select_objective_grid_winner(config_summary, metric_key=metric_key)
+        row = {
+            "objective_name": str(objective_name),
+            "objective_kind": "oracle" if objective_name.startswith("oracle_") else "realistic",
+            "metric_key": metric_key,
+        }
+        if selected is None:
+            row.update(
+                {
+                    "config_id": None,
+                    "label": None,
+                    "q_index": None,
+                    "q_multiplier": None,
+                    "n_swap_pairs": None,
+                    "beta": None,
+                    "selected_objective_value": float("inf"),
+                    "oracle_exact_match": np.nan,
+                    "oracle_fuzzy_similarity": np.nan,
+                    "oracle_q_index_distance": np.nan,
+                    "oracle_swap_distance": np.nan,
+                    "winner_status": "no_finite_winner",
+                }
+            )
+        else:
+            if oracle_winner is None:
+                q_distance = swap_distance = 0
+                similarity = np.nan
+                exact_match = np.nan
+            else:
+                q_distance, swap_distance, similarity = _objective_grid_similarity(
+                    q_index=int(selected["q_index"]),
+                    n_swap_pairs=int(selected["n_swap_pairs"]),
+                    oracle_q_index=int(oracle_winner["q_index"]),
+                    oracle_n_swap_pairs=int(oracle_winner["n_swap_pairs"]),
+                    q_grid_size=len(q_multipliers),
+                    max_swap_distance=max_swap_distance,
+                )
+                exact_match = int(
+                    int(selected["q_index"]) == int(oracle_winner["q_index"])
+                    and int(selected["n_swap_pairs"]) == int(oracle_winner["n_swap_pairs"])
+                )
+            row.update(
+                {
+                    "config_id": str(selected["config_id"]),
+                    "label": str(selected["label"]),
+                    "q_index": int(selected["q_index"]),
+                    "q_multiplier": float(selected["q_multiplier"]),
+                    "n_swap_pairs": int(selected["n_swap_pairs"]),
+                    "beta": float(selected["beta"]) if np.isfinite(selected.get("beta", np.nan)) else np.nan,
+                    "selected_objective_value": float(selected[metric_key]),
+                    "oracle_exact_match": exact_match,
+                    "oracle_fuzzy_similarity": similarity,
+                    "oracle_q_index_distance": q_distance,
+                    "oracle_swap_distance": swap_distance,
+                    "winner_status": str(selected.get("status", "ok")),
+                }
+            )
+            objective_to_config[str(objective_name)] = str(selected["config_id"])
+        winner_rows.append(row)
+
+    return {
+        "oracle_winner": next(row for row in winner_rows if row["objective_name"] == "oracle_rmse"),
+        "objective_winners": winner_rows,
+        "objective_to_config": objective_to_config,
+    }
+
+
+def summarize_mcmc_objective_grid_seed_noise(
+    repeat_rows: list[dict[str, Any]],
+    *,
+    objective_winners: list[dict[str, Any]],
+    q_multipliers: tuple[float, ...],
+    n_swap_pairs_values: tuple[int, ...],
+) -> dict[str, Any]:
+    realistic_winners = {
+        str(row["objective_name"]): row
+        for row in objective_winners
+        if str(row["objective_kind"]) == "realistic"
+    }
+    max_swap_distance = max(n_swap_pairs_values) - min(n_swap_pairs_values) if n_swap_pairs_values else 0
+    repeats = sorted({int(row["trial_repeat"]) for row in repeat_rows})
+    repeat_winner_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+
+    for objective_name in MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES:
+        aggregate_winner = realistic_winners.get(str(objective_name))
+        winner_counts: dict[str, int] = {}
+        exact_matches: list[float] = []
+        fuzzy_scores: list[float] = []
+
+        for repeat_idx in repeats:
+            sub = [row for row in repeat_rows if int(row["trial_repeat"]) == int(repeat_idx)]
+            finite_rows = [row for row in sub if np.isfinite(row.get(f"objective_{objective_name}", np.inf))]
+            if finite_rows:
+                selected = min(
+                    finite_rows,
+                    key=lambda row: (
+                        float(row[f"objective_{objective_name}"]),
+                        int(row["q_index"]),
+                        int(row["n_swap_pairs"]),
+                        float(row["beta"]) if np.isfinite(row.get("beta", np.nan)) else float("inf"),
+                    ),
+                )
+                config_id = str(selected["config_id"])
+                winner_counts[config_id] = winner_counts.get(config_id, 0) + 1
+                if aggregate_winner is not None and aggregate_winner.get("config_id") is not None:
+                    q_distance, swap_distance, similarity = _objective_grid_similarity(
+                        q_index=int(selected["q_index"]),
+                        n_swap_pairs=int(selected["n_swap_pairs"]),
+                        oracle_q_index=int(aggregate_winner["q_index"]),
+                        oracle_n_swap_pairs=int(aggregate_winner["n_swap_pairs"]),
+                        q_grid_size=len(q_multipliers),
+                        max_swap_distance=max_swap_distance,
+                    )
+                    exact_match = int(config_id == str(aggregate_winner["config_id"]))
+                else:
+                    q_distance = np.nan
+                    swap_distance = np.nan
+                    similarity = np.nan
+                    exact_match = np.nan
+                repeat_winner_rows.append(
+                    {
+                        "objective_name": str(objective_name),
+                        "trial_repeat": int(repeat_idx),
+                        "config_id": config_id,
+                        "q_index": int(selected["q_index"]),
+                        "q_multiplier": float(selected["q_multiplier"]),
+                        "n_swap_pairs": int(selected["n_swap_pairs"]),
+                        "beta": float(selected["beta"]) if np.isfinite(selected.get("beta", np.nan)) else np.nan,
+                        "objective_value": float(selected[f"objective_{objective_name}"]),
+                        "aggregate_config_id": None if aggregate_winner is None else aggregate_winner.get("config_id"),
+                        "aggregate_exact_match": exact_match,
+                        "aggregate_fuzzy_similarity": similarity,
+                        "aggregate_q_index_distance": q_distance,
+                        "aggregate_swap_distance": swap_distance,
+                    }
+                )
+                if np.isfinite(exact_match):
+                    exact_matches.append(float(exact_match))
+                if np.isfinite(similarity):
+                    fuzzy_scores.append(float(similarity))
+            else:
+                repeat_winner_rows.append(
+                    {
+                        "objective_name": str(objective_name),
+                        "trial_repeat": int(repeat_idx),
+                        "config_id": None,
+                        "q_index": None,
+                        "q_multiplier": None,
+                        "n_swap_pairs": None,
+                        "beta": None,
+                        "objective_value": float("inf"),
+                        "aggregate_config_id": None if aggregate_winner is None else aggregate_winner.get("config_id"),
+                        "aggregate_exact_match": np.nan,
+                        "aggregate_fuzzy_similarity": np.nan,
+                        "aggregate_q_index_distance": np.nan,
+                        "aggregate_swap_distance": np.nan,
+                    }
+                )
+
+        summary_rows.append(
             {
-                "trial_number": int(trial_number),
-                "trial_repeat": int(rep),
-                "trial_budget": int(trial_budget),
-                "log10_q_multiplier": float(candidate["log10_q_multiplier"]),
-                "q_multiplier": float(candidate["q_multiplier"]),
-                "q_target": float(candidate["q_target"]),
-                "q_trial_raw": float(candidate["q_trial_raw"]),
-                "q_trial": float(candidate["q_trial"]),
-                "q_clipped": int(candidate["q_clipped"]),
+                "objective_name": str(objective_name),
+                "aggregate_config_id": None if aggregate_winner is None else aggregate_winner.get("config_id"),
+                "exact_match_rate": float(np.mean(exact_matches)) if exact_matches else np.nan,
+                "mean_fuzzy_similarity": float(np.mean(fuzzy_scores)) if fuzzy_scores else np.nan,
+                "winner_frequency": {
+                    key: int(value)
+                    for key, value in sorted(winner_counts.items(), key=lambda item: (-item[1], item[0]))
+                },
             }
         )
-        records.append(row)
-    summary = summarize_mcmc_trial_repeats(records)
-    return {"trial_number": int(trial_number), "records": records, "summary": summary}
+    return {
+        "summary": summary_rows,
+        "repeat_winners": repeat_winner_rows,
+    }
 
 
-def run_mcmc_optuna_trial_table(
+def run_mcmc_objective_grid_study(
     problem: PermutationTestProblem,
     exact_p: float,
     *,
     mcmc_cfg: MCMCWorkflowConfig,
-    trials_per_scenario: int,
+    q_multipliers: tuple[float, ...] = DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS,
+    n_swap_pairs_values: tuple[int, ...] = DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS,
     trial_repeats: int,
     trial_budget: int,
     base_seed: int,
-    q_log10_bounds: tuple[float, float] = (-3.0, 3.0),
-    q_clip_min: float = 1e-6,
-    q_clip_max: float = 0.95,
+    q_floor: float = 1e-12,
     n_jobs: int = 1,
 ) -> dict[str, Any]:
-    try:
-        import optuna
-    except ImportError as exc:
-        raise ImportError(
-            "optuna is required for the offline MCMC-IS hyperparameter notebook. "
-            "Install the project dev dependencies (for example, `uv pip install -e '.[dev]'`)."
-        ) from exc
-
     p0_for_qtarget = float(exact_p) if mcmc_cfg.use_true_p0_for_q_target else float(mcmc_cfg.p0_guess)
     pilot_t = iid_pilot_statistics(problem, n_samples=mcmc_cfg.pilot_samples, seed=base_seed)
     sigma_t = estimate_scale_T(pilot_t, method=mcmc_cfg.scale_method)
     q_target = float(p0_for_qtarget ** float(mcmc_cfg.d_alpha))
-
-    n_swap_pairs_max = max(1, min(int(problem.n_treated), int(problem.n_control)) // 2)
-    lower, upper = float(q_log10_bounds[0]), float(q_log10_bounds[1])
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=optuna.samplers.RandomSampler(seed=int(base_seed)),
+    candidates = build_mcmc_objective_grid_candidates(
+        problem,
+        pilot_t=pilot_t,
+        sigma_t=float(sigma_t),
+        p0_for_qtarget=p0_for_qtarget,
+        q_target=q_target,
+        q_multipliers=tuple(float(v) for v in q_multipliers),
+        n_swap_pairs_values=tuple(int(v) for v in n_swap_pairs_values),
+        beta_max=float(mcmc_cfg.beta_max_init),
+        q_floor=float(q_floor),
     )
 
-    asked_trials: list[tuple[Any, dict[str, Any], int]] = []
-    for trial_idx in range(int(trials_per_scenario)):
-        trial = study.ask()
-        log10_q_multiplier = float(trial.suggest_float("log10_q_multiplier", lower, upper))
-        n_swap_pairs = int(trial.suggest_int("n_swap_pairs", 1, n_swap_pairs_max))
-        candidate = map_log10_q_multiplier_to_mcmc_candidate(
-            problem,
-            pilot_t=pilot_t,
-            sigma_t=float(sigma_t),
-            p0_for_qtarget=p0_for_qtarget,
-            q_target=q_target,
-            log10_q_multiplier=log10_q_multiplier,
-            beta_max=float(mcmc_cfg.beta_max_init),
-            q_clip_min=float(q_clip_min),
-            q_clip_max=float(q_clip_max),
-        )
-        candidate["n_swap_pairs"] = int(n_swap_pairs)
-        candidate["proposal_size"] = int(n_swap_pairs)
-        asked_trials.append((trial, candidate, int(base_seed + 100_000 * trial_idx)))
-
-    trial_records: list[dict[str, Any]] = []
-    trial_summary: list[dict[str, Any]] = []
-    n_workers = _effective_n_jobs(n_jobs, len(asked_trials))
+    jobs = [
+        (dict(candidate), int(rep), int(base_seed + 100_000 * cfg_idx + 1_000 * rep))
+        for cfg_idx, candidate in enumerate(candidates)
+        for rep in range(int(trial_repeats))
+    ]
+    repeat_rows: list[dict[str, Any]] = []
+    n_workers = _effective_n_jobs(n_jobs, len(jobs))
     executor = _try_make_process_pool(n_workers) if n_workers > 1 else None
 
-    def _finalize_trial(optuna_trial: Any, result: dict[str, Any]) -> None:
-        summary = dict(result["summary"])
-        trial_records.extend(result["records"])
-        trial_summary.append(summary)
-        for key, value in summary.items():
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                optuna_trial.set_user_attr(str(key), value)
-        anchor_value = float(summary["objective_oracle_rmse"])
-        if not np.isfinite(anchor_value):
-            anchor_value = 1e300
-        study.tell(optuna_trial, anchor_value)
-
     if executor is None:
-        for optuna_trial, candidate, seed_base in asked_trials:
-            result = _mcmc_optuna_trial_worker(
-                problem=problem,
-                exact_p=exact_p,
-                sigma_t=float(sigma_t),
-                p0_reference=p0_for_qtarget,
-                trial_budget=int(trial_budget),
-                trial_repeats=int(trial_repeats),
-                mcmc_cfg=mcmc_cfg,
-                candidate=candidate,
-                trial_number=int(optuna_trial.number),
-                seed_base=int(seed_base),
-            )
-            _finalize_trial(optuna_trial, result)
-    else:
-        with executor:
-            futures = {
-                executor.submit(
-                    _mcmc_optuna_trial_worker,
+        for candidate, repeat_idx, seed in jobs:
+            repeat_rows.append(
+                _mcmc_objective_grid_repeat_worker(
                     problem=problem,
                     exact_p=exact_p,
                     sigma_t=float(sigma_t),
                     p0_reference=p0_for_qtarget,
                     trial_budget=int(trial_budget),
-                    trial_repeats=int(trial_repeats),
                     mcmc_cfg=mcmc_cfg,
                     candidate=candidate,
-                    trial_number=int(optuna_trial.number),
-                    seed_base=int(seed_base),
-                ): optuna_trial
-                for optuna_trial, candidate, seed_base in asked_trials
-            }
+                    repeat_idx=int(repeat_idx),
+                    seed=int(seed),
+                )
+            )
+    else:
+        with executor:
+            futures = [
+                executor.submit(
+                    _mcmc_objective_grid_repeat_worker,
+                    problem=problem,
+                    exact_p=exact_p,
+                    sigma_t=float(sigma_t),
+                    p0_reference=p0_for_qtarget,
+                    trial_budget=int(trial_budget),
+                    mcmc_cfg=mcmc_cfg,
+                    candidate=candidate,
+                    repeat_idx=int(repeat_idx),
+                    seed=int(seed),
+                )
+                for candidate, repeat_idx, seed in jobs
+            ]
             for future in cf.as_completed(futures):
-                _finalize_trial(futures[future], future.result())
+                repeat_rows.append(future.result())
 
-    trial_records = sorted(
-        trial_records,
-        key=lambda row: (int(row["trial_number"]), int(row["trial_repeat"])),
+    repeat_rows = sorted(
+        repeat_rows,
+        key=lambda row: (int(row["q_index"]), int(row["n_swap_pairs"]), int(row["trial_repeat"])),
     )
-    trial_summary = sorted(trial_summary, key=lambda row: int(row["trial_number"]))
-    selected_by_objective = select_best_mcmc_trial_by_objective(trial_summary)
-    dedup = deduplicate_selected_trial_configs(selected_by_objective)
-
+    config_summary = summarize_mcmc_objective_grid_configs(repeat_rows)
+    winner_payload = select_mcmc_objective_grid_winners(
+        config_summary,
+        q_multipliers=tuple(float(v) for v in q_multipliers),
+        n_swap_pairs_values=tuple(int(v) for v in n_swap_pairs_values),
+    )
+    seed_noise = summarize_mcmc_objective_grid_seed_noise(
+        repeat_rows,
+        objective_winners=winner_payload["objective_winners"],
+        q_multipliers=tuple(float(v) for v in q_multipliers),
+        n_swap_pairs_values=tuple(int(v) for v in n_swap_pairs_values),
+    )
     return {
-        "trial_records": trial_records,
-        "trial_summary": trial_summary,
-        "objective_best": selected_by_objective,
-        "selected_configs": dedup["configs"],
-        "objective_to_config": dedup["objective_to_config"],
-        "trial_context": {
+        "repeat_records": repeat_rows,
+        "config_summary": config_summary,
+        "oracle_winner": winner_payload["oracle_winner"],
+        "objective_winners": winner_payload["objective_winners"],
+        "objective_to_config": winner_payload["objective_to_config"],
+        "objective_seed_noise": seed_noise["summary"],
+        "repeat_winner_records": seed_noise["repeat_winners"],
+        "study_context": {
             "exact_p": float(exact_p),
             "p0_for_qtarget": p0_for_qtarget,
             "q_target": q_target,
             "sigma_t": float(sigma_t),
             "pilot_samples": int(mcmc_cfg.pilot_samples),
-            "q_log10_bounds": [lower, upper],
-            "q_clip_min": float(q_clip_min),
-            "q_clip_max": float(q_clip_max),
-            "trials_per_scenario": int(trials_per_scenario),
+            "q_multipliers": [float(v) for v in q_multipliers],
+            "n_swap_pairs_values": [int(v) for v in n_swap_pairs_values],
             "trial_repeats": int(trial_repeats),
             "trial_budget": int(trial_budget),
-            "n_swap_pairs_min": 1,
-            "n_swap_pairs_max": int(n_swap_pairs_max),
-            "sampler": "RandomSampler",
-            "study_direction": "minimize",
-            "study_anchor_objective": "objective_oracle_rmse",
-            "study_name": str(study.study_name),
+            "q_floor": float(q_floor),
         },
     }
 
@@ -1454,7 +1865,7 @@ def _named_mcmc_replicate_worker(
         row["seed"] = int(rep_seed)
         row["proposal_size"] = config_spec["proposal_size"]
         row["n_swap_pairs"] = int(resolved_swaps)
-        row["source"] = str(config_spec.get("source", "optuna"))
+        row["source"] = str(config_spec.get("source", "grid"))
         row["selected_by_objectives"] = list(config_spec.get("selected_by_objectives", []))
     return rows
 
@@ -2839,33 +3250,48 @@ def save_beta_sweep_outputs(
     )
 
 
-def save_mcmc_optuna_offline_outputs(
+def save_mcmc_objective_grid_outputs(
     study: dict[str, Any],
     *,
     output_dir: Path,
     scenario_name: str,
     exact_p: float,
     notebook_config: dict[str, Any],
-    production_baseline_dir: Path | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(output_dir / "trial_records.jsonl", study["trial_records"])
-    write_json(output_dir / "trial_summary.json", study["trial_summary"])
-    write_jsonl(output_dir / "final_records.jsonl", study["final_records"])
-    write_json(output_dir / "final_summary.json", study["final_summary"])
+    write_jsonl(output_dir / "repeat_records.jsonl", study["repeat_records"])
     write_json(
-        output_dir / "metadata.json",
+        output_dir / "config_summary.json",
         {
             "scenario_display": scenario_name,
             "exact_p": float(exact_p),
             "notebook_config": notebook_config,
-            "trial_context": study["trial_context"],
-            "objective_best": study["objective_best"],
-            "selected_configs": study["selected_configs"],
+            "study_context": study["study_context"],
+            "config_summary": study["config_summary"],
+        },
+    )
+    write_json(
+        output_dir / "objective_winners.json",
+        {
+            "scenario_display": scenario_name,
+            "exact_p": float(exact_p),
+            "notebook_config": notebook_config,
+            "study_context": study["study_context"],
+            "oracle_winner": study["oracle_winner"],
+            "objective_winners": study["objective_winners"],
             "objective_to_config": study["objective_to_config"],
-            "final_settings": study["final_settings"],
-            "production_baseline_dir": str(production_baseline_dir) if production_baseline_dir is not None else None,
+        },
+    )
+    write_json(
+        output_dir / "objective_seed_noise.json",
+        {
+            "scenario_display": scenario_name,
+            "exact_p": float(exact_p),
+            "notebook_config": notebook_config,
+            "study_context": study["study_context"],
+            "objective_seed_noise": study["objective_seed_noise"],
+            "repeat_winner_records": study["repeat_winner_records"],
         },
     )
 
@@ -2896,20 +3322,18 @@ def load_beta_sweep_saved_output(output_dir: Path) -> dict[str, Any]:
     }
 
 
-def load_mcmc_optuna_offline_saved_output(output_dir: Path) -> dict[str, Any]:
+def load_mcmc_objective_grid_saved_output(output_dir: Path) -> dict[str, Any]:
     output_dir = Path(output_dir)
-    metadata = read_json(output_dir / "metadata.json")
-    trial_summary = read_json(output_dir / "trial_summary.json")
-    trial_records = read_jsonl(output_dir / "trial_records.jsonl")
-    final_summary = read_json(output_dir / "final_summary.json")
-    final_records = read_jsonl(output_dir / "final_records.jsonl")
+    config_summary_payload = read_json(output_dir / "config_summary.json")
+    objective_winners_payload = read_json(output_dir / "objective_winners.json")
+    objective_seed_noise_payload = read_json(output_dir / "objective_seed_noise.json")
+    repeat_records = read_jsonl(output_dir / "repeat_records.jsonl")
     return {
         "output_dir": output_dir,
-        "metadata": metadata,
-        "trial_summary": trial_summary,
-        "trial_records": trial_records,
-        "final_summary": final_summary,
-        "final_records": final_records,
+        "config_summary_payload": config_summary_payload,
+        "objective_winners_payload": objective_winners_payload,
+        "objective_seed_noise_payload": objective_seed_noise_payload,
+        "repeat_records": repeat_records,
     }
 
 

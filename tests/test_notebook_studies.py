@@ -9,22 +9,22 @@ from perm_pval.experiments.notebook_studies import (
     CrossMethodStudyConfig,
     LoadedScenario,
     MCMCWorkflowConfig,
+    MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES,
     SAMCWorkflowConfig,
     build_beta_workflow,
-    deduplicate_selected_trial_configs,
+    build_mcmc_objective_grid_candidates,
     load_beta_sweep_saved_output,
     load_cross_method_saved_output,
-    map_log10_q_multiplier_to_mcmc_candidate,
     regenerate_beta_sweep_plots_from_saved,
     regenerate_cross_method_plots_from_saved,
     run_beta_checkpoint_study,
     run_cross_method_study,
-    run_mcmc_optuna_trial_table,
-    run_named_mcmc_checkpoint_study,
+    run_mcmc_objective_grid_study,
     save_beta_sweep_outputs,
     save_cross_method_outputs,
-    select_best_mcmc_trial_by_objective,
-    summarize_mcmc_trial_repeats,
+    score_mcmc_objective_grid_repeat_row,
+    select_mcmc_objective_grid_winners,
+    summarize_mcmc_objective_grid_configs,
 )
 from perm_pval.methods.beta_tuning import estimate_scale_T, iid_pilot_statistics
 from perm_pval.stats.two_sample import difference_in_means
@@ -305,200 +305,174 @@ def test_beta_study_parallel_matches_serial():
     assert _strip_runtime_summary_fields(serial["summary"]) == _strip_runtime_summary_fields(parallel["summary"])
 
 
-def test_map_log10_q_multiplier_to_mcmc_candidate_clips_high_q_and_returns_finite_beta():
+def test_build_mcmc_objective_grid_candidates_retains_invalid_q_map_rows():
     scenario = _small_right_tail_scenario()
     pilot_t = iid_pilot_statistics(scenario.problem, n_samples=40, seed=123)
     sigma_t = estimate_scale_T(pilot_t, method="sd")
 
-    candidate = map_log10_q_multiplier_to_mcmc_candidate(
+    candidates = build_mcmc_objective_grid_candidates(
         scenario.problem,
         pilot_t=pilot_t,
         sigma_t=sigma_t,
         p0_for_qtarget=scenario.exact_p,
         q_target=0.1,
-        log10_q_multiplier=3.0,
+        q_multipliers=(1e-5, 1.0),
+        n_swap_pairs_values=(1, 2),
         beta_max=1e6,
-        q_clip_min=1e-6,
-        q_clip_max=0.95,
+        q_floor=1e-12,
     )
 
-    assert candidate["q_clipped"] == 1
-    assert candidate["q_trial"] == pytest.approx(0.95)
-    assert np.isfinite(candidate["beta_trial"])
-    assert candidate["beta_trial"] > 0.0
+    assert [c["q_multiplier"] for c in candidates[:2]] == [1e-5, 1e-5]
+    assert [c["n_swap_pairs"] for c in candidates[:2]] == [1, 2]
+    assert len(candidates) == 4
+    assert any(c["status"] == "invalid_q_map" for c in candidates)
+    assert any(c["status"] == "ok" and np.isfinite(c["beta"]) and c["beta"] > 0.0 for c in candidates)
 
 
-def test_map_log10_q_multiplier_to_mcmc_candidate_raises_when_q_map_has_no_positive_beta():
-    scenario = _small_right_tail_scenario()
-    pilot_t = iid_pilot_statistics(scenario.problem, n_samples=40, seed=123)
-    sigma_t = estimate_scale_T(pilot_t, method="sd")
+def test_score_mcmc_objective_grid_repeat_row_uses_exact_penalties():
+    row = score_mcmc_objective_grid_repeat_row(
+        {
+            "selection_objective_p0": 2.0,
+            "variance_estimate": 3.0,
+            "tail_hits": 5,
+            "acceptance_rate": 0.025,
+            "q_tilt_tail_share": 0.001,
+            "q_trial": 0.01,
+            "n_weighted_samples": 100,
+            "abs_log10_error": 0.3,
+        }
+    )
 
-    with pytest.raises(ValueError, match="non-finite or non-positive beta"):
-        map_log10_q_multiplier_to_mcmc_candidate(
-            scenario.problem,
-            pilot_t=pilot_t,
-            sigma_t=sigma_t,
-            p0_for_qtarget=scenario.exact_p,
-            q_target=1e-4,
-            log10_q_multiplier=-4.0,
-            beta_max=1e6,
-            q_clip_min=1e-6,
-            q_clip_max=0.95,
+    p_hits = 5.0
+    p_acc = 2.0
+    p_q = 1.0 + abs(np.log((0.001 + 0.01) / (0.01 + 0.01)))
+
+    assert row["P_hits"] == pytest.approx(p_hits)
+    assert row["P_acc"] == pytest.approx(p_acc)
+    assert row["P_q"] == pytest.approx(p_q)
+    assert row["objective_selobj"] == pytest.approx(2.0)
+    assert row["objective_varhat"] == pytest.approx(3.0)
+    assert row["objective_selobj_hits_soft"] == pytest.approx(2.0 * p_hits)
+    assert row["objective_selobj_acc_soft"] == pytest.approx(2.0 * p_acc)
+    assert row["objective_selobj_qmatch_soft"] == pytest.approx(2.0 * p_q)
+    assert row["objective_selobj_hits_acc_soft"] == pytest.approx(2.0 * p_hits * p_acc)
+    assert row["objective_varhat_hits_soft"] == pytest.approx(3.0 * p_hits)
+    assert row["objective_varhat_acc_soft"] == pytest.approx(3.0 * p_acc)
+    assert row["objective_varhat_qmatch_soft"] == pytest.approx(3.0 * p_q)
+    assert row["objective_varhat_hits_acc_soft"] == pytest.approx(3.0 * p_hits * p_acc)
+    assert np.isinf(row["objective_selobj_guardrailed"])
+    assert np.isinf(row["objective_varhat_guardrailed"])
+
+
+def test_objective_grid_aggregation_and_winner_tie_breaks_are_deterministic():
+    rows = []
+    for repeat_idx in range(2):
+        base = {
+            "checkpoint": 10,
+            "exact_p": 1.0,
+            "tail_hits": 30,
+            "acceptance_rate": 0.2,
+            "q_tilt_tail_share": 0.01,
+            "q_trial": 0.01,
+            "q_trial_raw": 0.01,
+            "q_target": 0.1,
+            "q_floor": 1e-12,
+            "q_floor_applied": 0,
+            "n_weighted_samples": 100,
+            "sigma_t": 1.0,
+            "proposal_size": 1,
+            "status": "ok",
+            "invalid_reason": None,
+            "wall_time_sec": 1.0,
+            "eval_excl_tuning": 10.0,
+            "eval_incl_tuning": 10.0,
+            "ess": 10.0,
+            "weight_cv": 2.0,
+            "zero_hits": 0,
+            "steps_per_chain": 10,
+            "burn_in": 2,
+            "chains": 1,
+            "thin": 1,
+            "trial_budget": 10,
+            "seed": 100 + repeat_idx,
+            "trial_repeat": repeat_idx,
+        }
+        rows.append(
+            score_mcmc_objective_grid_repeat_row(
+                {
+                    **base,
+                    "config_id": "q00_s1",
+                    "label": "q00_s1",
+                    "q_index": 0,
+                    "q_multiplier": 0.1,
+                    "n_swap_pairs": 1,
+                    "beta": 1.0,
+                    "estimate": 1.3,
+                    "squared_error": 0.09,
+                    "abs_log10_error": 0.1,
+                    "variance_estimate": 1.0,
+                    "selection_objective_p0": 1.0,
+                }
+            )
+        )
+        rows.append(
+            score_mcmc_objective_grid_repeat_row(
+                {
+                    **base,
+                    "config_id": "q01_s2",
+                    "label": "q01_s2",
+                    "q_index": 1,
+                    "q_multiplier": 0.2,
+                    "n_swap_pairs": 2,
+                    "proposal_size": 2,
+                    "beta": 2.0,
+                    "estimate": 1.1,
+                    "squared_error": 0.01,
+                    "abs_log10_error": 0.05,
+                    "variance_estimate": 1.0,
+                    "selection_objective_p0": 1.0,
+                }
+            )
         )
 
+    config_summary = summarize_mcmc_objective_grid_configs(rows)
+    winners = select_mcmc_objective_grid_winners(
+        config_summary,
+        q_multipliers=(0.1, 0.2),
+        n_swap_pairs_values=(1, 2, 3, 4),
+    )
 
-def test_trial_objective_summary_and_deduplication_handle_invalid_rows():
-    invalid_rows = [
-        {
-            "trial_number": 0,
-            "estimate": 0.0,
-            "squared_error": 1.0,
-            "variance_estimate": np.nan,
-            "exact_p": 1.0,
-            "wall_time_sec": 1.0,
-            "eval_excl_tuning": 10.0,
-            "selection_objective_p0": np.nan,
-            "tail_hits": 0,
-            "beta": 1.0,
-            "sigma_t": 1.0,
-            "proposal_size": 1,
-            "n_swap_pairs": 1,
-            "log10_q_multiplier": -1.0,
-            "q_multiplier": 0.1,
-            "q_target": 1e-3,
-            "q_trial": 1e-4,
-            "q_trial_raw": 1e-4,
-            "q_clipped": 0,
-        },
-        {
-            "trial_number": 0,
-            "estimate": 0.0,
-            "squared_error": 1.0,
-            "variance_estimate": np.nan,
-            "exact_p": 1.0,
-            "wall_time_sec": 1.0,
-            "eval_excl_tuning": 10.0,
-            "selection_objective_p0": np.nan,
-            "tail_hits": 0,
-            "beta": 1.0,
-            "sigma_t": 1.0,
-            "proposal_size": 1,
-            "n_swap_pairs": 1,
-            "log10_q_multiplier": -1.0,
-            "q_multiplier": 0.1,
-            "q_target": 1e-3,
-            "q_trial": 1e-4,
-            "q_trial_raw": 1e-4,
-            "q_clipped": 0,
-        },
-    ]
-    valid_rows = [
-        {
-            "trial_number": 1,
-            "estimate": 0.9,
-            "squared_error": 0.01,
-            "variance_estimate": 0.02,
-            "exact_p": 1.0,
-            "wall_time_sec": 1.0,
-            "eval_excl_tuning": 10.0,
-            "selection_objective_p0": 0.03,
-            "tail_hits": 4,
-            "tail_share_raw": 0.2,
-            "acceptance_rate": 0.4,
-            "weight_cv": 2.0,
-            "ess": 10.0,
-            "beta": 0.5,
-            "sigma_t": 1.0,
-            "proposal_size": 1,
-            "n_swap_pairs": 1,
-            "log10_q_multiplier": -0.5,
-            "q_multiplier": 10 ** -0.5,
-            "q_target": 1e-3,
-            "q_trial": 3e-4,
-            "q_trial_raw": 3e-4,
-            "q_clipped": 0,
-            "abs_log10_error": abs(np.log10(0.9) - np.log10(1.0)),
-        },
-        {
-            "trial_number": 1,
-            "estimate": 1.1,
-            "squared_error": 0.01,
-            "variance_estimate": 0.01,
-            "exact_p": 1.0,
-            "wall_time_sec": 1.0,
-            "eval_excl_tuning": 10.0,
-            "selection_objective_p0": 0.02,
-            "tail_hits": 3,
-            "tail_share_raw": 0.15,
-            "acceptance_rate": 0.45,
-            "weight_cv": 1.5,
-            "ess": 12.0,
-            "beta": 0.5,
-            "sigma_t": 1.0,
-            "proposal_size": 1,
-            "n_swap_pairs": 1,
-            "log10_q_multiplier": -0.5,
-            "q_multiplier": 10 ** -0.5,
-            "q_target": 1e-3,
-            "q_trial": 3e-4,
-            "q_trial_raw": 3e-4,
-            "q_clipped": 0,
-            "abs_log10_error": abs(np.log10(1.1) - np.log10(1.0)),
-        },
-    ]
+    oracle_row = next(row for row in winners["objective_winners"] if row["objective_name"] == "oracle_rmse")
+    selobj_row = next(row for row in winners["objective_winners"] if row["objective_name"] == "selobj")
 
-    invalid_summary = summarize_mcmc_trial_repeats(invalid_rows)
-    valid_summary = summarize_mcmc_trial_repeats(valid_rows)
-
-    assert np.isinf(invalid_summary["objective_oracle_abs_log10"])
-    assert np.isinf(invalid_summary["objective_diag_selection_objective_p0"])
-    assert np.isinf(invalid_summary["objective_diag_variance_estimate"])
-    assert np.isinf(invalid_summary["objective_diag_repeat_stability"])
-
-    selected = select_best_mcmc_trial_by_objective([invalid_summary, valid_summary])
-    dedup = deduplicate_selected_trial_configs(selected)
-
-    assert len(dedup["configs"]) == 1
-    assert set(dedup["objective_to_config"]) == {
-        "oracle_rmse",
-        "oracle_abs_log10",
-        "diag_selection_objective_p0",
-        "diag_variance_estimate",
-        "diag_repeat_stability",
-    }
+    assert oracle_row["config_id"] == "q01_s2"
+    assert selobj_row["config_id"] == "q00_s1"
+    assert selobj_row["oracle_exact_match"] == 0
+    assert selobj_row["oracle_q_index_distance"] == 1
+    assert selobj_row["oracle_swap_distance"] == 1
+    assert selobj_row["oracle_fuzzy_similarity"] == pytest.approx(0.5)
 
 
-def test_optuna_offline_smoke_runs_fixed_config_followup():
-    pytest.importorskip("optuna")
+def test_objective_grid_smoke_runs_end_to_end():
     scenario = _small_right_tail_scenario()
     mcmc_cfg = _small_mcmc_cfg()
 
-    trial_table = run_mcmc_optuna_trial_table(
+    study = run_mcmc_objective_grid_study(
         scenario.problem,
         scenario.exact_p,
         mcmc_cfg=mcmc_cfg,
-        trials_per_scenario=2,
-        trial_repeats=1,
+        q_multipliers=(1e-5, 1.0),
+        n_swap_pairs_values=(1, 2),
+        trial_repeats=2,
         trial_budget=40,
         base_seed=123,
-        q_log10_bounds=(-1.0, 1.0),
         n_jobs=1,
     )
 
-    assert len(trial_table["trial_summary"]) == 2
-    assert len(trial_table["selected_configs"]) >= 1
-
-    final_study = run_named_mcmc_checkpoint_study(
-        scenario.problem,
-        scenario.exact_p,
-        config_specs=[trial_table["selected_configs"][0]],
-        sigma_t=float(trial_table["trial_context"]["sigma_t"]),
-        estimation_points=(20, 40),
-        repeats=1,
-        base_seed=999,
-        template_cfg=mcmc_cfg,
-        n_jobs=1,
-    )
-
-    assert sorted({row["checkpoint"] for row in final_study["records"]}) == [20, 40]
-    assert sorted({row["label"] for row in final_study["records"]}) == [trial_table["selected_configs"][0]["label"]]
+    assert len(study["repeat_records"]) == 8
+    assert len(study["config_summary"]) == 4
+    assert len(study["objective_seed_noise"]) == len(MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES)
+    assert any(row["status"] == "invalid_q_map" for row in study["repeat_records"])
+    assert any(row["status"] == "ok" for row in study["repeat_records"])
+    assert study["oracle_winner"]["objective_name"] == "oracle_rmse"
+    assert {row["objective_name"] for row in study["objective_winners"]} == set(("oracle_rmse", "oracle_abs_log10", *MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES))

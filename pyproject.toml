@@ -15,7 +15,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "optuna>=4.0",
   "pytest>=8.0",
 ]
 

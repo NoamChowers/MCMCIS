@@ -70,17 +70,19 @@ def _common_setup_code() -> str:
     from perm_pval.experiments.notebook_studies import (
         BetaSweepStudyConfig,
         CrossMethodStudyConfig,
+        DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS,
+        DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS,
         MCMCWorkflowConfig,
+        MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES,
         SAMCWorkflowConfig,
         build_beta_workflow,
         create_timestamped_run_dir,
         load_beta_sweep_saved_output,
         load_cross_method_saved_output,
-        load_mcmc_optuna_offline_saved_output,
+        load_mcmc_objective_grid_saved_output,
         load_selected_scenarios,
-        run_mcmc_optuna_trial_table,
-        run_named_mcmc_checkpoint_study,
-        save_mcmc_optuna_offline_outputs,
+        run_mcmc_objective_grid_study,
+        save_mcmc_objective_grid_outputs,
         regenerate_beta_sweep_plots_from_saved,
         regenerate_cross_method_plots_from_saved,
         run_beta_checkpoint_study,
@@ -487,16 +489,16 @@ def build_beta_notebook() -> dict:
     return notebook(cells)
 
 
-def build_mcmc_optuna_offline_notebook() -> dict:
+def build_mcmc_objective_grid_notebook() -> dict:
     cells = [
         markdown_cell(
             """
-            # Experiment: Offline Optuna Tuning For MCMC-IS
+            # Experiment: Offline MCMC-IS Objective Grid Study
 
             Objective:
-            - Tune MCMC-IS hyperparameters offline on the same scenarios used in the production notebooks.
-            - Compare several tuning objectives on a shared Optuna-managed trial table.
-            - Re-run the chosen fixed settings up to the production checkpoints and compare them with the saved production baseline.
+            - Evaluate a deterministic, production-like discrete hyperparameter grid for MCMC-IS.
+            - Compare realistic production objectives against oracle RMSE on the same scenarios used in the production notebooks.
+            - Quantify objective noise across repeat seeds without running the old long final-budget follow-up.
             """
         ),
         code_cell(_common_setup_code()),
@@ -504,14 +506,6 @@ def build_mcmc_optuna_offline_notebook() -> dict:
             """
             import matplotlib.pyplot as plt
             import numpy as np
-
-            try:
-                import optuna
-            except ImportError as exc:
-                raise ImportError(
-                    "optuna is required for this notebook. Install the project dev dependencies, "
-                    "for example with `uv pip install -e '.[dev]'`."
-                ) from exc
             """
         ),
         markdown_cell(
@@ -519,7 +513,7 @@ def build_mcmc_optuna_offline_notebook() -> dict:
             ## Configuration
 
             This notebook is intentionally heavy by default.  
-            It uses exact `p` values only for offline-oracle objective scoring and ignores tuning cost when it reruns the selected fixed settings.
+            It is an offline objective study, not a long-run estimator comparison.
             """
         ),
         code_cell(
@@ -528,8 +522,7 @@ def build_mcmc_optuna_offline_notebook() -> dict:
             SAVE_OUTPUTS = True
 
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
-            OUTPUT_ROOT = project_root / "results" / "mcmcis_optuna_offline"
-            PRODUCTION_BASELINE_ROOT = project_root / "results" / "cross_method_notebook" / "20260307_150041_cross_method"
+            OUTPUT_ROOT = project_root / "results" / "mcmcis_objective_grid"
 
             SCENARIO_KEYS_TO_RUN = [
                 "hypergeom_1e7",
@@ -538,13 +531,12 @@ def build_mcmc_optuna_offline_notebook() -> dict:
                 "bruteforce_welch_nonextreme_n22",
             ]
 
-            Q_LOG10_BOUNDS = (-3.0, 3.0)
-            TRIALS_PER_SCENARIO = 64 if not FAST_MODE else 8
-            TRIAL_REPEATS = 3 if not FAST_MODE else 1
+            Q_MULTIPLIERS = DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS
+            N_SWAP_PAIRS = DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS
+            TRIAL_REPEATS = 5 if not FAST_MODE else 2
             TRIAL_BUDGET = 200_000 if not FAST_MODE else 20_000
-            FINAL_REPEATS = 7 if not FAST_MODE else 2
-            FINAL_ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (20_000, 100_000, 200_000)
-            N_JOBS = min(os.cpu_count() or 1, FINAL_REPEATS)
+            Q_FLOOR = 1e-12
+            N_JOBS = min(os.cpu_count() or 1, len(Q_MULTIPLIERS) * len(N_SWAP_PAIRS) * TRIAL_REPEATS)
             MIN_TAIL_STATES = 2
             BASE_SEED = 31_415
 
@@ -564,15 +556,13 @@ def build_mcmc_optuna_offline_notebook() -> dict:
             NOTEBOOK_CONFIG = {
                 "FAST_MODE": FAST_MODE,
                 "SCENARIO_KEYS_TO_RUN": SCENARIO_KEYS_TO_RUN,
-                "Q_LOG10_BOUNDS": Q_LOG10_BOUNDS,
-                "TRIALS_PER_SCENARIO": TRIALS_PER_SCENARIO,
+                "Q_MULTIPLIERS": Q_MULTIPLIERS,
+                "N_SWAP_PAIRS": N_SWAP_PAIRS,
                 "TRIAL_REPEATS": TRIAL_REPEATS,
                 "TRIAL_BUDGET": TRIAL_BUDGET,
-                "FINAL_REPEATS": FINAL_REPEATS,
-                "FINAL_ESTIMATION_POINTS": FINAL_ESTIMATION_POINTS,
+                "Q_FLOOR": Q_FLOOR,
                 "N_JOBS": N_JOBS,
                 "BASE_SEED": BASE_SEED,
-                "PRODUCTION_BASELINE_ROOT": str(PRODUCTION_BASELINE_ROOT),
             }
 
             print(json.dumps(NOTEBOOK_CONFIG, indent=2))
@@ -581,54 +571,35 @@ def build_mcmc_optuna_offline_notebook() -> dict:
         markdown_cell("## Notebook Helpers"),
         code_cell(
             """
-            OBJECTIVE_COLUMNS = [
-                ("oracle_rmse", "objective_oracle_rmse"),
-                ("oracle_abs_log10", "objective_oracle_abs_log10"),
-                ("diag_selection_objective_p0", "objective_diag_selection_objective_p0"),
-                ("diag_variance_estimate", "objective_diag_variance_estimate"),
-                ("diag_repeat_stability", "objective_diag_repeat_stability"),
-            ]
+            REALISTIC_OBJECTIVES = list(MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES)
 
 
-            def build_comparison_records(final_study: dict, baseline_saved: dict) -> tuple[list[dict], list[dict]]:
-                baseline_records = []
-                for row in baseline_saved["records"]:
-                    if row["method"] not in {"iid", "mcmc_is", "samc"}:
-                        continue
-                    clean = dict(row)
-                    clean["label"] = f"production_{row['method']}"
-                    baseline_records.append(clean)
-                combined = [dict(row) for row in final_study["records"]] + baseline_records
-                combined_summary = summarize_records(combined, group_fields=("checkpoint", "label"))
-                return combined, combined_summary
+            def plot_oracle_rmse_heatmap(
+                config_summary: list[dict],
+                q_multipliers: tuple[float, ...],
+                n_swap_pairs_values: tuple[int, ...],
+                scenario_name: str,
+                *,
+                save_path: Path | None = None,
+            ) -> None:
+                df = pd.DataFrame(config_summary)
+                heat = np.full((len(n_swap_pairs_values), len(q_multipliers)), np.nan, dtype=float)
+                for _, row in df.iterrows():
+                    swap_idx = list(n_swap_pairs_values).index(int(row["n_swap_pairs"]))
+                    q_idx = int(row["q_index"])
+                    val = float(row["mean_oracle_rmse"])
+                    heat[swap_idx, q_idx] = np.log10(val) if np.isfinite(val) and val > 0.0 else np.nan
 
-
-            def plot_trial_objectives(trial_summary: list[dict], scenario_name: str, *, save_path: Path | None = None) -> None:
-                df = pd.DataFrame(trial_summary)
-                fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-                axes = axes.ravel()
-                for ax, (title, column) in zip(axes, OBJECTIVE_COLUMNS):
-                    values = np.asarray(df[column], dtype=float)
-                    mask = np.isfinite(values) & (values > 0.0)
-                    ax.set_title(title)
-                    ax.set_xlabel("log10(q_multiplier)")
-                    ax.set_ylabel("n_swap_pairs")
-                    if np.any(mask):
-                        colors = np.log10(values[mask])
-                        scatter = ax.scatter(
-                            df.loc[mask, "log10_q_multiplier"],
-                            df.loc[mask, "n_swap_pairs"],
-                            c=colors,
-                            cmap="viridis",
-                            s=55,
-                            alpha=0.9,
-                        )
-                        fig.colorbar(scatter, ax=ax, label=f"log10({title})")
-                    else:
-                        ax.text(0.5, 0.5, "no finite values", ha="center", va="center", transform=ax.transAxes)
-                if len(axes) > len(OBJECTIVE_COLUMNS):
-                    axes[-1].axis("off")
-                fig.suptitle(f"Optuna trial table diagnostics: {scenario_name}")
+                fig, ax = plt.subplots(figsize=(13, 4.5))
+                im = ax.imshow(heat, aspect="auto", cmap="viridis")
+                ax.set_title(f"Oracle RMSE grid: {scenario_name}")
+                ax.set_xlabel("q_multiplier")
+                ax.set_ylabel("n_swap_pairs")
+                ax.set_xticks(np.arange(len(q_multipliers)))
+                ax.set_xticklabels([f"{v:g}" for v in q_multipliers], rotation=45, ha="right")
+                ax.set_yticks(np.arange(len(n_swap_pairs_values)))
+                ax.set_yticklabels([str(v) for v in n_swap_pairs_values])
+                fig.colorbar(im, ax=ax, label="log10(mean oracle RMSE)")
                 plt.tight_layout()
                 if save_path is not None:
                     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,36 +607,23 @@ def build_mcmc_optuna_offline_notebook() -> dict:
                 plt.close(fig)
 
 
-            def plot_final_budget_comparison(
-                combined_records: list[dict],
+            def plot_objective_seed_noise_heatmap(
+                seed_noise_rows: list[dict],
                 scenario_name: str,
                 *,
-                exact_p: float,
-                max_budget: int,
                 save_path: Path | None = None,
             ) -> None:
-                sub = [dict(row) for row in combined_records if int(row["checkpoint"]) == int(max_budget)]
-                labels = sorted({str(row["label"]) for row in sub})
-                estimate_data = [np.asarray([float(row["estimate"]) for row in sub if str(row["label"]) == label], dtype=float) for label in labels]
-                summary = summarize_records(sub, group_fields=("label",))
-                rmse_map = {str(row["label"]): float(row["rmse"]) for row in summary}
-
-                fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-                axes[0].boxplot(estimate_data, tick_labels=labels, showfliers=False)
-                axes[0].axhline(float(exact_p), color="black", linestyle="--", linewidth=1.2, label="exact p")
-                axes[0].set_title(f"Max-budget estimates: {scenario_name}")
-                axes[0].set_ylabel("estimate")
-                axes[0].tick_params(axis="x", rotation=35)
-                axes[0].legend(loc="best")
-
-                rmse_vals = [rmse_map[label] for label in labels]
-                axes[1].bar(labels, rmse_vals, color="#4e79a7")
-                if any(val > 0.0 for val in rmse_vals):
-                    axes[1].set_yscale("log")
-                axes[1].set_title(f"RMSE at B={max_budget:,}")
-                axes[1].set_ylabel("rmse")
-                axes[1].tick_params(axis="x", rotation=35)
-
+                df = pd.DataFrame(seed_noise_rows)
+                metrics = ["exact_match_rate", "mean_fuzzy_similarity"]
+                heat = np.asarray([[float(df.loc[df["objective_name"] == obj, metric].iloc[0]) for metric in metrics] for obj in REALISTIC_OBJECTIVES], dtype=float)
+                fig, ax = plt.subplots(figsize=(8, max(4.5, 0.35 * len(REALISTIC_OBJECTIVES))))
+                im = ax.imshow(heat, aspect="auto", cmap="magma", vmin=0.0, vmax=1.0)
+                ax.set_title(f"Objective seed-noise summary: {scenario_name}")
+                ax.set_xticks(np.arange(len(metrics)))
+                ax.set_xticklabels(metrics, rotation=20, ha="right")
+                ax.set_yticks(np.arange(len(REALISTIC_OBJECTIVES)))
+                ax.set_yticklabels(REALISTIC_OBJECTIVES)
+                fig.colorbar(im, ax=ax, label="score")
                 plt.tight_layout()
                 if save_path is not None:
                     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -673,42 +631,46 @@ def build_mcmc_optuna_offline_notebook() -> dict:
                 plt.close(fig)
 
 
-            def plot_convergence_comparison(
-                comparison_summary: list[dict],
-                scenario_name: str,
-                *,
-                exact_p: float,
-                save_path: Path | None = None,
-            ) -> None:
-                fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-                labels = sorted({str(row["label"]) for row in comparison_summary})
-                for label in labels:
-                    sub = sorted(
-                        [row for row in comparison_summary if str(row["label"]) == label],
-                        key=lambda row: int(row["checkpoint"]),
+            def build_cross_scenario_leaderboard(objective_rows: list[dict]) -> pd.DataFrame:
+                df = pd.DataFrame([row for row in objective_rows if row["objective_kind"] == "realistic"])
+                leaderboard = (
+                    df.groupby("objective_name", as_index=False)
+                    .agg(
+                        exact_match_count=("oracle_exact_match", "sum"),
+                        mean_fuzzy_similarity=("oracle_fuzzy_similarity", "mean"),
+                        mean_q_index_distance=("oracle_q_index_distance", "mean"),
+                        mean_swap_distance=("oracle_swap_distance", "mean"),
                     )
-                    x = np.asarray([int(row["checkpoint"]) for row in sub], dtype=float)
-                    mean_est = np.asarray([float(row["mean_estimate"]) for row in sub], dtype=float)
-                    rmse = np.asarray([float(row["rmse"]) for row in sub], dtype=float)
-                    axes[0].plot(x, mean_est, marker="o", label=label)
-                    axes[1].plot(x, rmse, marker="o", label=label)
+                    .sort_values(
+                        ["exact_match_count", "mean_fuzzy_similarity", "mean_q_index_distance", "mean_swap_distance"],
+                        ascending=[False, False, True, True],
+                    )
+                    .reset_index(drop=True)
+                )
+                return leaderboard
 
-                axes[0].axhline(float(exact_p), color="black", linestyle="--", linewidth=1.2, label="exact p")
-                axes[0].set_xscale("log")
-                axes[0].set_yscale("log")
-                axes[0].set_title(f"Mean estimate: {scenario_name}")
-                axes[0].set_xlabel("budget")
-                axes[0].set_ylabel("mean estimate")
-                axes[0].legend(loc="best", fontsize=8)
 
-                axes[1].set_xscale("log")
-                if any(float(row["rmse"]) > 0.0 for row in comparison_summary):
-                    axes[1].set_yscale("log")
-                axes[1].set_title(f"RMSE convergence: {scenario_name}")
-                axes[1].set_xlabel("budget")
-                axes[1].set_ylabel("rmse")
-                axes[1].legend(loc="best", fontsize=8)
+            def plot_cross_scenario_fuzzy_similarity(
+                objective_rows: list[dict],
+                *,
+                save_path: Path | None = None,
+            ) -> None:
+                df = pd.DataFrame([row for row in objective_rows if row["objective_kind"] == "realistic"])
+                scenarios = list(dict.fromkeys(df["scenario_key"]))
+                heat = np.full((len(REALISTIC_OBJECTIVES), len(scenarios)), np.nan, dtype=float)
+                for _, row in df.iterrows():
+                    obj_idx = REALISTIC_OBJECTIVES.index(str(row["objective_name"]))
+                    scn_idx = scenarios.index(str(row["scenario_key"]))
+                    heat[obj_idx, scn_idx] = float(row["oracle_fuzzy_similarity"])
 
+                fig, ax = plt.subplots(figsize=(10, max(4.5, 0.35 * len(REALISTIC_OBJECTIVES))))
+                im = ax.imshow(heat, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+                ax.set_title("Cross-scenario fuzzy similarity to oracle RMSE")
+                ax.set_xticks(np.arange(len(scenarios)))
+                ax.set_xticklabels(scenarios, rotation=25, ha="right")
+                ax.set_yticks(np.arange(len(REALISTIC_OBJECTIVES)))
+                ax.set_yticklabels(REALISTIC_OBJECTIVES)
+                fig.colorbar(im, ax=ax, label="fuzzy similarity")
                 plt.tight_layout()
                 if save_path is not None:
                     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -725,7 +687,7 @@ def build_mcmc_optuna_offline_notebook() -> dict:
                 min_tail_states=MIN_TAIL_STATES,
             )
 
-            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "optuna_offline") if SAVE_OUTPUTS else None
+            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "objective_grid") if SAVE_OUTPUTS else None
 
             pd.DataFrame([
                 {
@@ -739,151 +701,124 @@ def build_mcmc_optuna_offline_notebook() -> dict:
             ])
             """
         ),
-        markdown_cell("## Run Offline Optuna Study"),
+        markdown_cell("## Run Offline Objective Grid Study"),
         code_cell(
             """
-            optuna_results = {}
+            grid_results = {}
+            cross_scenario_objective_rows = []
 
             for scenario_idx, scenario in enumerate(scenarios):
-                print(f"Running offline Optuna study for {scenario.key} | exact p={scenario.exact_p:.3e}")
-                baseline_dir = PRODUCTION_BASELINE_ROOT / scenario.key
-                if not baseline_dir.exists():
-                    raise FileNotFoundError(f"Missing production baseline directory: {baseline_dir}")
-                baseline_saved = load_cross_method_saved_output(baseline_dir)
-
-                trial_seed = BASE_SEED + 10_000 * (scenario_idx + 1)
-                trial_study = run_mcmc_optuna_trial_table(
+                print(f"Running offline objective grid for {scenario.key} | exact p={scenario.exact_p:.3e}")
+                study_seed = BASE_SEED + 10_000 * (scenario_idx + 1)
+                grid_study = run_mcmc_objective_grid_study(
                     scenario.problem,
                     scenario.exact_p,
                     mcmc_cfg=mcmc_cfg,
-                    trials_per_scenario=TRIALS_PER_SCENARIO,
                     trial_repeats=TRIAL_REPEATS,
                     trial_budget=TRIAL_BUDGET,
-                    base_seed=trial_seed,
-                    q_log10_bounds=Q_LOG10_BOUNDS,
+                    base_seed=study_seed,
+                    q_multipliers=Q_MULTIPLIERS,
+                    n_swap_pairs_values=N_SWAP_PAIRS,
+                    q_floor=Q_FLOOR,
                     n_jobs=N_JOBS,
                 )
 
-                objective_best_df = pd.DataFrame([
-                    {
-                        "objective": objective_name,
-                        "trial_number": row["trial_number"],
-                        "config_id": trial_study["objective_to_config"][objective_name],
-                        "beta": row["beta"],
-                        "n_swap_pairs": row["n_swap_pairs"],
-                        "log10_q_multiplier": row["log10_q_multiplier"],
-                        "q_trial": row["q_trial"],
-                        "selected_objective_value": row["selected_objective_value"],
-                    }
-                    for objective_name, row in trial_study["objective_best"].items()
-                ]).sort_values("objective")
-
-                selected_configs = [dict(cfg, source="optuna") for cfg in trial_study["selected_configs"]]
-                production_proposal_size = baseline_saved["metadata"]["mcmc_config"]["proposal_size"]
-                production_beta = float(baseline_saved["metadata"]["beta_workflow"]["beta_used"])
-                selected_configs.append(
-                    {
-                        "config_id": "production_fixed",
-                        "label": "production_fixed",
-                        "beta": production_beta,
-                        "proposal_size": production_proposal_size,
-                        "selected_by_objectives": ["saved_production_beta"],
-                        "source": "production_saved_metadata",
-                    }
-                )
-
-                final_study = run_named_mcmc_checkpoint_study(
-                    scenario.problem,
-                    scenario.exact_p,
-                    config_specs=selected_configs,
-                    sigma_t=float(trial_study["trial_context"]["sigma_t"]),
-                    estimation_points=FINAL_ESTIMATION_POINTS,
-                    repeats=FINAL_REPEATS,
-                    base_seed=BASE_SEED + 500_000 + 10_000 * scenario_idx,
-                    template_cfg=mcmc_cfg,
-                    n_jobs=N_JOBS,
-                )
-
-                combined_records, comparison_summary = build_comparison_records(final_study, baseline_saved)
+                objective_winners_df = pd.DataFrame(grid_study["objective_winners"]).sort_values(["objective_kind", "objective_name"])
+                objective_winners_df["scenario_key"] = scenario.key
+                cross_scenario_objective_rows.extend(objective_winners_df.to_dict(orient="records"))
 
                 scenario_dir = (run_dir / scenario.key) if (SAVE_OUTPUTS and run_dir is not None) else None
                 if scenario_dir is not None:
-                    plot_trial_objectives(
-                        trial_study["trial_summary"],
+                    plot_oracle_rmse_heatmap(
+                        grid_study["config_summary"],
+                        Q_MULTIPLIERS,
+                        N_SWAP_PAIRS,
                         scenario.description,
-                        save_path=scenario_dir / "trial_objectives.png",
+                        save_path=scenario_dir / "oracle_rmse_heatmap.png",
                     )
-                    plot_final_budget_comparison(
-                        combined_records,
+                    plot_objective_seed_noise_heatmap(
+                        grid_study["objective_seed_noise"],
                         scenario.description,
-                        exact_p=scenario.exact_p,
-                        max_budget=max(FINAL_ESTIMATION_POINTS),
-                        save_path=scenario_dir / "final_budget_compare.png",
+                        save_path=scenario_dir / "objective_seed_noise_heatmap.png",
                     )
-                    plot_convergence_comparison(
-                        comparison_summary,
-                        scenario.description,
-                        exact_p=scenario.exact_p,
-                        save_path=scenario_dir / "convergence_compare.png",
-                    )
-                    save_mcmc_optuna_offline_outputs(
-                        {
-                            "trial_records": trial_study["trial_records"],
-                            "trial_summary": trial_study["trial_summary"],
-                            "objective_best": trial_study["objective_best"],
-                            "selected_configs": trial_study["selected_configs"],
-                            "objective_to_config": trial_study["objective_to_config"],
-                            "trial_context": trial_study["trial_context"],
-                            "final_records": final_study["records"],
-                            "final_summary": final_study["summary"],
-                            "final_settings": final_study["settings"],
-                        },
+                    save_mcmc_objective_grid_outputs(
+                        grid_study,
                         output_dir=scenario_dir,
                         scenario_name=scenario.description,
                         exact_p=scenario.exact_p,
                         notebook_config=NOTEBOOK_CONFIG,
-                        production_baseline_dir=baseline_dir,
                     )
 
-                optuna_results[scenario.key] = {
-                    "trial_study": trial_study,
-                    "baseline_saved": baseline_saved,
-                    "final_study": final_study,
-                    "comparison_summary": comparison_summary,
-                    "combined_records": combined_records,
+                grid_results[scenario.key] = {
+                    "grid_study": grid_study,
                 }
 
                 print(json.dumps({
                     "scenario": scenario.key,
-                    "sigma_t": trial_study["trial_context"]["sigma_t"],
-                    "q_target": trial_study["trial_context"]["q_target"],
-                    "selected_configs": trial_study["selected_configs"],
+                    "sigma_t": grid_study["study_context"]["sigma_t"],
+                    "q_target": grid_study["study_context"]["q_target"],
+                    "oracle_winner": grid_study["oracle_winner"],
                 }, indent=2))
 
-                display(pd.DataFrame(trial_study["trial_summary"]).sort_values("objective_oracle_rmse").head(12)[[
-                    "trial_number",
+                display(pd.DataFrame(grid_study["config_summary"]).sort_values("mean_oracle_rmse").head(12)[[
+                    "config_id",
                     "beta",
                     "n_swap_pairs",
-                    "log10_q_multiplier",
+                    "q_multiplier",
                     "q_trial",
-                    "objective_oracle_rmse",
-                    "objective_oracle_abs_log10",
-                    "objective_diag_selection_objective_p0",
-                    "objective_diag_variance_estimate",
-                    "objective_diag_repeat_stability",
-                ]])
-                display(objective_best_df)
-                display(pd.DataFrame(trial_study["selected_configs"]).sort_values("config_id"))
-                display(pd.DataFrame(comparison_summary).sort_values(["checkpoint", "label"])[[
-                    "checkpoint",
-                    "label",
-                    "mean_estimate",
-                    "rmse",
-                    "mean_q_tilt_tail_share",
-                    "mean_ess",
+                    "mean_oracle_rmse",
+                    "mean_oracle_abs_log10",
+                    "mean_objective_selobj",
+                    "mean_objective_varhat",
+                    "mean_tail_hits",
                     "mean_acceptance_rate",
+                    "mean_ess",
                     "mean_weight_cv",
                 ]])
+                display(objective_winners_df[[
+                    "objective_name",
+                    "config_id",
+                    "q_multiplier",
+                    "n_swap_pairs",
+                    "beta",
+                    "selected_objective_value",
+                    "oracle_exact_match",
+                    "oracle_fuzzy_similarity",
+                    "oracle_q_index_distance",
+                    "oracle_swap_distance",
+                ]])
+                display(pd.DataFrame(grid_study["objective_seed_noise"]).sort_values("objective_name"))
+            """
+        ),
+        markdown_cell("## Cross-Scenario Objective Summary"),
+        code_cell(
+            """
+            cross_scenario_df = pd.DataFrame(cross_scenario_objective_rows)
+            realistic_cross_scenario_df = cross_scenario_df[cross_scenario_df["objective_kind"] == "realistic"].copy()
+            leaderboard_df = build_cross_scenario_leaderboard(cross_scenario_objective_rows)
+            display(leaderboard_df)
+            display(realistic_cross_scenario_df.sort_values(["objective_name", "scenario_key"])[[
+                "scenario_key",
+                "objective_name",
+                "config_id",
+                "q_multiplier",
+                "n_swap_pairs",
+                "beta",
+                "oracle_exact_match",
+                "oracle_fuzzy_similarity",
+                "oracle_q_index_distance",
+                "oracle_swap_distance",
+            ]])
+
+            if SAVE_OUTPUTS and run_dir is not None:
+                plot_cross_scenario_fuzzy_similarity(
+                    cross_scenario_objective_rows,
+                    save_path=run_dir / "cross_scenario_fuzzy_similarity_heatmap.png",
+                )
+                display(Image(filename=str(run_dir / "cross_scenario_fuzzy_similarity_heatmap.png")))
+            else:
+                plot_cross_scenario_fuzzy_similarity(cross_scenario_objective_rows)
+                print("SAVE_OUTPUTS=False, so the cross-scenario heatmap was not saved.")
             """
         ),
         markdown_cell("## Review Saved Figures"),
@@ -894,9 +829,8 @@ def build_mcmc_optuna_offline_notebook() -> dict:
                 for scenario in scenarios:
                     scenario_dir = run_dir / scenario.key
                     print(f"\\n{scenario.key}")
-                    display(Image(filename=str(scenario_dir / "trial_objectives.png")))
-                    display(Image(filename=str(scenario_dir / "final_budget_compare.png")))
-                    display(Image(filename=str(scenario_dir / "convergence_compare.png")))
+                    display(Image(filename=str(scenario_dir / "oracle_rmse_heatmap.png")))
+                    display(Image(filename=str(scenario_dir / "objective_seed_noise_heatmap.png")))
             else:
                 print("SAVE_OUTPUTS=False, so no saved figures to display.")
             """
@@ -904,21 +838,21 @@ def build_mcmc_optuna_offline_notebook() -> dict:
         markdown_cell("## Reload Saved Results Without Rerunning"),
         code_cell(
             """
-            # RELOAD_OPTUNA_DIR = None
+            # RELOAD_GRID_DIR = None
             # # Example:
-            # # RELOAD_OPTUNA_DIR = project_root / "results" / "mcmcis_optuna_offline" / "20260307_120000_optuna_offline" / "linear_stat_dp_n40"
+            # # RELOAD_GRID_DIR = project_root / "results" / "mcmcis_objective_grid" / "20260312_120000_objective_grid" / "linear_stat_dp_n40"
 
-            # if RELOAD_OPTUNA_DIR is not None:
-            #     saved = load_mcmc_optuna_offline_saved_output(RELOAD_OPTUNA_DIR)
+            # if RELOAD_GRID_DIR is not None:
+            #     saved = load_mcmc_objective_grid_saved_output(RELOAD_GRID_DIR)
             #     print(json.dumps({
-            #         "scenario_display": saved["metadata"]["scenario_display"],
-            #         "exact_p": saved["metadata"]["exact_p"],
-            #         "production_baseline_dir": saved["metadata"]["production_baseline_dir"],
+            #         "scenario_display": saved["config_summary_payload"]["scenario_display"],
+            #         "exact_p": saved["config_summary_payload"]["exact_p"],
             #     }, indent=2))
-            #     display(pd.DataFrame(saved["trial_summary"]).head())
-            #     display(pd.DataFrame(saved["final_summary"]).head())
+            #     display(pd.DataFrame(saved["config_summary_payload"]["config_summary"]).head())
+            #     display(pd.DataFrame(saved["objective_winners_payload"]["objective_winners"]).head())
+            #     display(pd.DataFrame(saved["objective_seed_noise_payload"]["objective_seed_noise"]).head())
             # else:
-            #     print("Set RELOAD_OPTUNA_DIR to a saved Optuna-offline scenario directory to inspect saved results.")
+            #     print("Set RELOAD_GRID_DIR to a saved objective-grid scenario directory to inspect saved results.")
             """
         ),
     ]
@@ -933,7 +867,7 @@ def main() -> None:
     outputs = {
         notebooks_dir / "cross_method_simulation.ipynb": build_cross_method_notebook(),
         notebooks_dir / "mcmcis_beta_diagnostics.ipynb": build_beta_notebook(),
-        notebooks_dir / "mcmcis_optuna_offline.ipynb": build_mcmc_optuna_offline_notebook(),
+        notebooks_dir / "mcmcis_offline_objective_grid.ipynb": build_mcmc_objective_grid_notebook(),
     }
     for path, data in outputs.items():
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
