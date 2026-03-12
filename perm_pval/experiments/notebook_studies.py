@@ -120,21 +120,18 @@ class BetaSweepStudyConfig:
 
 
 DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS: tuple[float, ...] = (
-    1e-5,
-    3e-5,
     1e-4,
-    3e-4,
+    5e-4,
     1e-3,
-    3e-3,
+    5e-3,
     1e-2,
-    3e-2,
+    5e-2,
     0.1,
     0.15,
-    0.2,
     0.25,
     0.33,
 )
-DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS: tuple[int, ...] = (1, 2, 3, 4)
+DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS: tuple[int, ...] = (1, 2, 3)
 MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES: tuple[str, ...] = (
     "selobj",
     "varhat",
