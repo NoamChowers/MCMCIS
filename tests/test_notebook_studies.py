@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.image as mpimg
+import pytest
 
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.exact.brute_force import BruteForceExactSolver
@@ -10,15 +11,22 @@ from perm_pval.experiments.notebook_studies import (
     MCMCWorkflowConfig,
     SAMCWorkflowConfig,
     build_beta_workflow,
+    deduplicate_selected_trial_configs,
     load_beta_sweep_saved_output,
     load_cross_method_saved_output,
+    map_log10_q_multiplier_to_mcmc_candidate,
     regenerate_beta_sweep_plots_from_saved,
     regenerate_cross_method_plots_from_saved,
     run_beta_checkpoint_study,
     run_cross_method_study,
+    run_mcmc_optuna_trial_table,
+    run_named_mcmc_checkpoint_study,
     save_beta_sweep_outputs,
     save_cross_method_outputs,
+    select_best_mcmc_trial_by_objective,
+    summarize_mcmc_trial_repeats,
 )
+from perm_pval.methods.beta_tuning import estimate_scale_T, iid_pilot_statistics
 from perm_pval.stats.two_sample import difference_in_means
 
 
@@ -295,3 +303,202 @@ def test_beta_study_parallel_matches_serial():
 
     assert _strip_runtime_fields(serial["records"]) == _strip_runtime_fields(parallel["records"])
     assert _strip_runtime_summary_fields(serial["summary"]) == _strip_runtime_summary_fields(parallel["summary"])
+
+
+def test_map_log10_q_multiplier_to_mcmc_candidate_clips_high_q_and_returns_finite_beta():
+    scenario = _small_right_tail_scenario()
+    pilot_t = iid_pilot_statistics(scenario.problem, n_samples=40, seed=123)
+    sigma_t = estimate_scale_T(pilot_t, method="sd")
+
+    candidate = map_log10_q_multiplier_to_mcmc_candidate(
+        scenario.problem,
+        pilot_t=pilot_t,
+        sigma_t=sigma_t,
+        p0_for_qtarget=scenario.exact_p,
+        q_target=0.1,
+        log10_q_multiplier=3.0,
+        beta_max=1e6,
+        q_clip_min=1e-6,
+        q_clip_max=0.95,
+    )
+
+    assert candidate["q_clipped"] == 1
+    assert candidate["q_trial"] == pytest.approx(0.95)
+    assert np.isfinite(candidate["beta_trial"])
+    assert candidate["beta_trial"] > 0.0
+
+
+def test_map_log10_q_multiplier_to_mcmc_candidate_raises_when_q_map_has_no_positive_beta():
+    scenario = _small_right_tail_scenario()
+    pilot_t = iid_pilot_statistics(scenario.problem, n_samples=40, seed=123)
+    sigma_t = estimate_scale_T(pilot_t, method="sd")
+
+    with pytest.raises(ValueError, match="non-finite or non-positive beta"):
+        map_log10_q_multiplier_to_mcmc_candidate(
+            scenario.problem,
+            pilot_t=pilot_t,
+            sigma_t=sigma_t,
+            p0_for_qtarget=scenario.exact_p,
+            q_target=1e-4,
+            log10_q_multiplier=-4.0,
+            beta_max=1e6,
+            q_clip_min=1e-6,
+            q_clip_max=0.95,
+        )
+
+
+def test_trial_objective_summary_and_deduplication_handle_invalid_rows():
+    invalid_rows = [
+        {
+            "trial_number": 0,
+            "estimate": 0.0,
+            "squared_error": 1.0,
+            "variance_estimate": np.nan,
+            "exact_p": 1.0,
+            "wall_time_sec": 1.0,
+            "eval_excl_tuning": 10.0,
+            "selection_objective_p0": np.nan,
+            "tail_hits": 0,
+            "beta": 1.0,
+            "sigma_t": 1.0,
+            "proposal_size": 1,
+            "n_swap_pairs": 1,
+            "log10_q_multiplier": -1.0,
+            "q_multiplier": 0.1,
+            "q_target": 1e-3,
+            "q_trial": 1e-4,
+            "q_trial_raw": 1e-4,
+            "q_clipped": 0,
+        },
+        {
+            "trial_number": 0,
+            "estimate": 0.0,
+            "squared_error": 1.0,
+            "variance_estimate": np.nan,
+            "exact_p": 1.0,
+            "wall_time_sec": 1.0,
+            "eval_excl_tuning": 10.0,
+            "selection_objective_p0": np.nan,
+            "tail_hits": 0,
+            "beta": 1.0,
+            "sigma_t": 1.0,
+            "proposal_size": 1,
+            "n_swap_pairs": 1,
+            "log10_q_multiplier": -1.0,
+            "q_multiplier": 0.1,
+            "q_target": 1e-3,
+            "q_trial": 1e-4,
+            "q_trial_raw": 1e-4,
+            "q_clipped": 0,
+        },
+    ]
+    valid_rows = [
+        {
+            "trial_number": 1,
+            "estimate": 0.9,
+            "squared_error": 0.01,
+            "variance_estimate": 0.02,
+            "exact_p": 1.0,
+            "wall_time_sec": 1.0,
+            "eval_excl_tuning": 10.0,
+            "selection_objective_p0": 0.03,
+            "tail_hits": 4,
+            "tail_share_raw": 0.2,
+            "acceptance_rate": 0.4,
+            "weight_cv": 2.0,
+            "ess": 10.0,
+            "beta": 0.5,
+            "sigma_t": 1.0,
+            "proposal_size": 1,
+            "n_swap_pairs": 1,
+            "log10_q_multiplier": -0.5,
+            "q_multiplier": 10 ** -0.5,
+            "q_target": 1e-3,
+            "q_trial": 3e-4,
+            "q_trial_raw": 3e-4,
+            "q_clipped": 0,
+            "abs_log10_error": abs(np.log10(0.9) - np.log10(1.0)),
+        },
+        {
+            "trial_number": 1,
+            "estimate": 1.1,
+            "squared_error": 0.01,
+            "variance_estimate": 0.01,
+            "exact_p": 1.0,
+            "wall_time_sec": 1.0,
+            "eval_excl_tuning": 10.0,
+            "selection_objective_p0": 0.02,
+            "tail_hits": 3,
+            "tail_share_raw": 0.15,
+            "acceptance_rate": 0.45,
+            "weight_cv": 1.5,
+            "ess": 12.0,
+            "beta": 0.5,
+            "sigma_t": 1.0,
+            "proposal_size": 1,
+            "n_swap_pairs": 1,
+            "log10_q_multiplier": -0.5,
+            "q_multiplier": 10 ** -0.5,
+            "q_target": 1e-3,
+            "q_trial": 3e-4,
+            "q_trial_raw": 3e-4,
+            "q_clipped": 0,
+            "abs_log10_error": abs(np.log10(1.1) - np.log10(1.0)),
+        },
+    ]
+
+    invalid_summary = summarize_mcmc_trial_repeats(invalid_rows)
+    valid_summary = summarize_mcmc_trial_repeats(valid_rows)
+
+    assert np.isinf(invalid_summary["objective_oracle_abs_log10"])
+    assert np.isinf(invalid_summary["objective_diag_selection_objective_p0"])
+    assert np.isinf(invalid_summary["objective_diag_variance_estimate"])
+    assert np.isinf(invalid_summary["objective_diag_repeat_stability"])
+
+    selected = select_best_mcmc_trial_by_objective([invalid_summary, valid_summary])
+    dedup = deduplicate_selected_trial_configs(selected)
+
+    assert len(dedup["configs"]) == 1
+    assert set(dedup["objective_to_config"]) == {
+        "oracle_rmse",
+        "oracle_abs_log10",
+        "diag_selection_objective_p0",
+        "diag_variance_estimate",
+        "diag_repeat_stability",
+    }
+
+
+def test_optuna_offline_smoke_runs_fixed_config_followup():
+    pytest.importorskip("optuna")
+    scenario = _small_right_tail_scenario()
+    mcmc_cfg = _small_mcmc_cfg()
+
+    trial_table = run_mcmc_optuna_trial_table(
+        scenario.problem,
+        scenario.exact_p,
+        mcmc_cfg=mcmc_cfg,
+        trials_per_scenario=2,
+        trial_repeats=1,
+        trial_budget=40,
+        base_seed=123,
+        q_log10_bounds=(-1.0, 1.0),
+        n_jobs=1,
+    )
+
+    assert len(trial_table["trial_summary"]) == 2
+    assert len(trial_table["selected_configs"]) >= 1
+
+    final_study = run_named_mcmc_checkpoint_study(
+        scenario.problem,
+        scenario.exact_p,
+        config_specs=[trial_table["selected_configs"][0]],
+        sigma_t=float(trial_table["trial_context"]["sigma_t"]),
+        estimation_points=(20, 40),
+        repeats=1,
+        base_seed=999,
+        template_cfg=mcmc_cfg,
+        n_jobs=1,
+    )
+
+    assert sorted({row["checkpoint"] for row in final_study["records"]}) == [20, 40]
+    assert sorted({row["label"] for row in final_study["records"]}) == [trial_table["selected_configs"][0]["label"]]

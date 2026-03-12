@@ -958,6 +958,581 @@ def build_beta_workflow(
     }
 
 
+def map_log10_q_multiplier_to_mcmc_candidate(
+    problem: PermutationTestProblem,
+    *,
+    pilot_t: np.ndarray,
+    sigma_t: float,
+    p0_for_qtarget: float,
+    q_target: float,
+    log10_q_multiplier: float,
+    beta_max: float,
+    q_clip_min: float = 1e-6,
+    q_clip_max: float = 0.95,
+) -> dict[str, Any]:
+    q_multiplier = float(10.0 ** float(log10_q_multiplier))
+    q_raw = float(q_target * q_multiplier)
+    q_trial = float(np.clip(q_raw, q_clip_min, q_clip_max))
+    beta_trial = float(
+        init_beta_from_iid_pilot(
+            pilot_T=pilot_t,
+            T_obs=problem.t_obs,
+            sigma_T=sigma_t,
+            p0=p0_for_qtarget,
+            q_target=q_trial,
+            beta_max=beta_max,
+        )
+    )
+    if not np.isfinite(beta_trial) or beta_trial <= 0.0:
+        raise ValueError(
+            "Pilot-based q-to-beta mapping produced a non-finite or non-positive beta. "
+            f"Received q_trial={q_trial}, beta_trial={beta_trial}."
+        )
+    return {
+        "log10_q_multiplier": float(log10_q_multiplier),
+        "q_multiplier": q_multiplier,
+        "q_target": float(q_target),
+        "q_trial_raw": q_raw,
+        "q_trial": q_trial,
+        "beta_trial": beta_trial,
+        "q_clipped": int(not np.isclose(q_trial, q_raw, rtol=1e-12, atol=1e-15)),
+    }
+
+
+def run_mcmc_trial_candidate(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    *,
+    beta: float,
+    sigma_t: float,
+    proposal_size: float | int,
+    p0_reference: float,
+    total_budget: int,
+    chains: int,
+    burn_in_fraction: float,
+    thin: int,
+    estimate_variance: bool,
+    obm_batch_size: int | None,
+    tilt_mode: str,
+    seed: int,
+) -> dict[str, Any]:
+    steps_per_chain = _steps_per_chain(total_budget, chains)
+    burn_in = _burn_in(steps_per_chain, burn_in_fraction)
+    kept_per_chain = _kept_samples_per_chain(steps_per_chain, burn_in, thin)
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=proposal_size,
+    )
+    t_start = time.perf_counter()
+    res = run_mcmc_is(
+        problem,
+        beta=float(beta),
+        sigma_t=float(sigma_t),
+        n_steps=steps_per_chain,
+        burn_in=burn_in,
+        thin=int(thin),
+        n_chains=int(chains),
+        seed=int(seed),
+        init="random",
+        tilt_mode=str(tilt_mode),
+        proposal_size=proposal_size,
+        estimate_variance=bool(estimate_variance),
+        obm_batch_size=obm_batch_size,
+    )
+    selection_objective_p0 = _snis_design_variance_objective(
+        log_weights=np.asarray(res.log_weights, dtype=float),
+        tail_indicators=np.asarray(res.tail_indicators, dtype=np.int8),
+        p_reference=float(p0_reference),
+        n_chains=int(chains),
+        chain_kept_samples=int(kept_per_chain),
+        obm_batch_size=obm_batch_size,
+    )
+    row = _annotate_error_fields(
+        {
+            "method": "mcmc_is",
+            "checkpoint": int(total_budget),
+            "estimate": float(res.estimate),
+            "variance_estimate": (
+                float(res.snis_variance_obm)
+                if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm)
+                else np.nan
+            ),
+            "snis_mcse_obm": (
+                float(res.snis_mcse_obm)
+                if res.snis_mcse_obm is not None and np.isfinite(res.snis_mcse_obm)
+                else np.nan
+            ),
+            "tail_hits": int(res.tail_hits_weighted_sample),
+            "tail_share_raw": float(res.tail_share_raw_sample),
+            "q_tilt_tail_share": float(res.tail_share_raw_sample),
+            "ess": float(res.ess),
+            "acceptance_rate": float(res.overall_acceptance_rate),
+            "weight_cv": float(res.weight_summary.cv),
+            "beta": float(beta),
+            "sigma_t": float(sigma_t),
+            "tilt_mode": str(tilt_mode),
+            "selection_objective_p0": float(selection_objective_p0),
+            "proposal_size": int(n_swap_pairs),
+            "n_swap_pairs": int(n_swap_pairs),
+            "wall_time_sec": float(time.perf_counter() - t_start),
+            "eval_excl_tuning": float(_mcmc_eval_count(steps_per_chain, chains)),
+            "eval_incl_tuning": float(_mcmc_eval_count(steps_per_chain, chains)),
+            "n_weighted_samples": int(res.n_weighted_samples),
+            "steps_per_chain": int(steps_per_chain),
+            "burn_in": int(burn_in),
+            "chains": int(chains),
+            "thin": int(thin),
+            "zero_hits": int(res.tail_hits_weighted_sample == 0),
+        },
+        exact_p,
+    )
+    return row
+
+
+def summarize_mcmc_trial_repeats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("rows must be non-empty.")
+    summary = summarize_records(list(rows), group_fields=("trial_number",))[0]
+    first = rows[0]
+    estimates = np.asarray([float(row["estimate"]) for row in rows], dtype=float)
+    abs_log = np.asarray([float(row.get("abs_log10_error", np.nan)) for row in rows], dtype=float)
+    var_hat = np.asarray([float(row.get("variance_estimate", np.nan)) for row in rows], dtype=float)
+    selection_objective = np.asarray([float(row.get("selection_objective_p0", np.nan)) for row in rows], dtype=float)
+    tail_hits = np.asarray([float(row.get("tail_hits", np.nan)) for row in rows], dtype=float)
+
+    oracle_rmse = float(np.sqrt(np.mean(np.asarray([float(row["squared_error"]) for row in rows], dtype=float))))
+    oracle_abs_log10 = float(np.mean(abs_log)) if abs_log.size and np.all(np.isfinite(abs_log)) else float("inf")
+    positive_selection = selection_objective[np.isfinite(selection_objective) & (selection_objective > 0.0)]
+    diag_selection_objective = float(np.mean(positive_selection)) if positive_selection.size == selection_objective.size else float("inf")
+    positive_var = var_hat[np.isfinite(var_hat) & (var_hat > 0.0)]
+    diag_variance = float(np.median(positive_var)) if positive_var.size else float("inf")
+    mean_tail_hits = float(np.mean(tail_hits)) if tail_hits.size else float("nan")
+    diag_repeat_stability = (
+        float(np.var(estimates, ddof=0))
+        if estimates.size and np.all(np.isfinite(estimates)) and np.isfinite(mean_tail_hits) and mean_tail_hits > 0.0
+        else float("inf")
+    )
+
+    summary.update(
+        {
+            "trial_number": int(first["trial_number"]),
+            "beta": float(first["beta"]),
+            "sigma_t": float(first["sigma_t"]),
+            "proposal_size": int(first["proposal_size"]),
+            "n_swap_pairs": int(first["n_swap_pairs"]),
+            "log10_q_multiplier": float(first["log10_q_multiplier"]),
+            "q_multiplier": float(first["q_multiplier"]),
+            "q_target": float(first["q_target"]),
+            "q_trial": float(first["q_trial"]),
+            "q_trial_raw": float(first["q_trial_raw"]),
+            "q_clipped": int(first["q_clipped"]),
+            "mean_tail_hits": mean_tail_hits,
+            "objective_oracle_rmse": float(oracle_rmse),
+            "objective_oracle_abs_log10": float(oracle_abs_log10),
+            "objective_diag_selection_objective_p0": float(diag_selection_objective),
+            "objective_diag_variance_estimate": float(diag_variance),
+            "objective_diag_repeat_stability": float(diag_repeat_stability),
+        }
+    )
+    return summary
+
+
+def select_best_mcmc_trial_by_objective(
+    trial_summaries: list[dict[str, Any]],
+    *,
+    objective_names: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    if objective_names is None:
+        objective_names = (
+            "oracle_rmse",
+            "oracle_abs_log10",
+            "diag_selection_objective_p0",
+            "diag_variance_estimate",
+            "diag_repeat_stability",
+        )
+    objective_names = tuple(str(name) for name in objective_names)
+    out: dict[str, dict[str, Any]] = {}
+    for objective_name in objective_names:
+        key = f"objective_{objective_name}"
+        if not trial_summaries:
+            raise ValueError("trial_summaries must be non-empty.")
+        best = min(
+            trial_summaries,
+            key=lambda row: (
+                float(row.get(key, float("inf"))),
+                float(row.get("beta", float("inf"))),
+                int(row.get("n_swap_pairs", 10**9)),
+                int(row.get("trial_number", 10**9)),
+            ),
+        )
+        selected = dict(best)
+        selected["selected_objective"] = str(objective_name)
+        selected["selected_objective_value"] = float(best.get(key, float("inf")))
+        out[str(objective_name)] = selected
+    return out
+
+
+def deduplicate_selected_trial_configs(
+    selected_by_objective: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[tuple[float, int], dict[str, Any]] = {}
+    objective_to_config: dict[str, str] = {}
+    for objective_name, row in sorted(selected_by_objective.items()):
+        key = (round(float(row["beta"]), 12), int(row["n_swap_pairs"]))
+        group = grouped.setdefault(
+            key,
+            {
+                "beta": float(row["beta"]),
+                "proposal_size": int(row["n_swap_pairs"]),
+                "n_swap_pairs": int(row["n_swap_pairs"]),
+                "sigma_t": float(row["sigma_t"]),
+                "log10_q_multiplier": float(row["log10_q_multiplier"]),
+                "q_multiplier": float(row["q_multiplier"]),
+                "q_target": float(row["q_target"]),
+                "q_trial": float(row["q_trial"]),
+                "q_trial_raw": float(row["q_trial_raw"]),
+                "q_clipped": int(row["q_clipped"]),
+                "trial_numbers": [],
+                "selected_by_objectives": [],
+            },
+        )
+        group["trial_numbers"].append(int(row["trial_number"]))
+        group["selected_by_objectives"].append(str(objective_name))
+    configs: list[dict[str, Any]] = []
+    for idx, (_key, group) in enumerate(sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))):
+        config_id = f"cfg_{idx:02d}"
+        config = dict(group)
+        config["config_id"] = config_id
+        config["label"] = config_id
+        config["trial_numbers"] = sorted(set(int(v) for v in config["trial_numbers"]))
+        config["selected_by_objectives"] = sorted(set(str(v) for v in config["selected_by_objectives"]))
+        configs.append(config)
+        for objective_name in config["selected_by_objectives"]:
+            objective_to_config[str(objective_name)] = config_id
+    return {
+        "configs": configs,
+        "objective_to_config": objective_to_config,
+    }
+
+
+def _mcmc_optuna_trial_worker(
+    *,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    sigma_t: float,
+    p0_reference: float,
+    trial_budget: int,
+    trial_repeats: int,
+    mcmc_cfg: MCMCWorkflowConfig,
+    candidate: dict[str, Any],
+    trial_number: int,
+    seed_base: int,
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for rep in range(int(trial_repeats)):
+        row = run_mcmc_trial_candidate(
+            problem,
+            exact_p,
+            beta=float(candidate["beta_trial"]),
+            sigma_t=float(sigma_t),
+            proposal_size=int(candidate["n_swap_pairs"]),
+            p0_reference=float(p0_reference),
+            total_budget=int(trial_budget),
+            chains=int(mcmc_cfg.chains),
+            burn_in_fraction=float(mcmc_cfg.burn_in_fraction),
+            thin=int(mcmc_cfg.thin),
+            estimate_variance=bool(mcmc_cfg.estimate_variance),
+            obm_batch_size=mcmc_cfg.obm_batch_size,
+            tilt_mode=str(mcmc_cfg.tilt_mode),
+            seed=int(seed_base + 1_000 * rep),
+        )
+        row.update(
+            {
+                "trial_number": int(trial_number),
+                "trial_repeat": int(rep),
+                "trial_budget": int(trial_budget),
+                "log10_q_multiplier": float(candidate["log10_q_multiplier"]),
+                "q_multiplier": float(candidate["q_multiplier"]),
+                "q_target": float(candidate["q_target"]),
+                "q_trial_raw": float(candidate["q_trial_raw"]),
+                "q_trial": float(candidate["q_trial"]),
+                "q_clipped": int(candidate["q_clipped"]),
+            }
+        )
+        records.append(row)
+    summary = summarize_mcmc_trial_repeats(records)
+    return {"trial_number": int(trial_number), "records": records, "summary": summary}
+
+
+def run_mcmc_optuna_trial_table(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    *,
+    mcmc_cfg: MCMCWorkflowConfig,
+    trials_per_scenario: int,
+    trial_repeats: int,
+    trial_budget: int,
+    base_seed: int,
+    q_log10_bounds: tuple[float, float] = (-3.0, 3.0),
+    q_clip_min: float = 1e-6,
+    q_clip_max: float = 0.95,
+    n_jobs: int = 1,
+) -> dict[str, Any]:
+    try:
+        import optuna
+    except ImportError as exc:
+        raise ImportError(
+            "optuna is required for the offline MCMC-IS hyperparameter notebook. "
+            "Install the project dev dependencies (for example, `uv pip install -e '.[dev]'`)."
+        ) from exc
+
+    p0_for_qtarget = float(exact_p) if mcmc_cfg.use_true_p0_for_q_target else float(mcmc_cfg.p0_guess)
+    pilot_t = iid_pilot_statistics(problem, n_samples=mcmc_cfg.pilot_samples, seed=base_seed)
+    sigma_t = estimate_scale_T(pilot_t, method=mcmc_cfg.scale_method)
+    q_target = float(p0_for_qtarget ** float(mcmc_cfg.d_alpha))
+
+    n_swap_pairs_max = max(1, min(int(problem.n_treated), int(problem.n_control)) // 2)
+    lower, upper = float(q_log10_bounds[0]), float(q_log10_bounds[1])
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.RandomSampler(seed=int(base_seed)),
+    )
+
+    asked_trials: list[tuple[Any, dict[str, Any], int]] = []
+    for trial_idx in range(int(trials_per_scenario)):
+        trial = study.ask()
+        log10_q_multiplier = float(trial.suggest_float("log10_q_multiplier", lower, upper))
+        n_swap_pairs = int(trial.suggest_int("n_swap_pairs", 1, n_swap_pairs_max))
+        candidate = map_log10_q_multiplier_to_mcmc_candidate(
+            problem,
+            pilot_t=pilot_t,
+            sigma_t=float(sigma_t),
+            p0_for_qtarget=p0_for_qtarget,
+            q_target=q_target,
+            log10_q_multiplier=log10_q_multiplier,
+            beta_max=float(mcmc_cfg.beta_max_init),
+            q_clip_min=float(q_clip_min),
+            q_clip_max=float(q_clip_max),
+        )
+        candidate["n_swap_pairs"] = int(n_swap_pairs)
+        candidate["proposal_size"] = int(n_swap_pairs)
+        asked_trials.append((trial, candidate, int(base_seed + 100_000 * trial_idx)))
+
+    trial_records: list[dict[str, Any]] = []
+    trial_summary: list[dict[str, Any]] = []
+    n_workers = _effective_n_jobs(n_jobs, len(asked_trials))
+    executor = _try_make_process_pool(n_workers) if n_workers > 1 else None
+
+    def _finalize_trial(optuna_trial: Any, result: dict[str, Any]) -> None:
+        summary = dict(result["summary"])
+        trial_records.extend(result["records"])
+        trial_summary.append(summary)
+        for key, value in summary.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                optuna_trial.set_user_attr(str(key), value)
+        anchor_value = float(summary["objective_oracle_rmse"])
+        if not np.isfinite(anchor_value):
+            anchor_value = 1e300
+        study.tell(optuna_trial, anchor_value)
+
+    if executor is None:
+        for optuna_trial, candidate, seed_base in asked_trials:
+            result = _mcmc_optuna_trial_worker(
+                problem=problem,
+                exact_p=exact_p,
+                sigma_t=float(sigma_t),
+                p0_reference=p0_for_qtarget,
+                trial_budget=int(trial_budget),
+                trial_repeats=int(trial_repeats),
+                mcmc_cfg=mcmc_cfg,
+                candidate=candidate,
+                trial_number=int(optuna_trial.number),
+                seed_base=int(seed_base),
+            )
+            _finalize_trial(optuna_trial, result)
+    else:
+        with executor:
+            futures = {
+                executor.submit(
+                    _mcmc_optuna_trial_worker,
+                    problem=problem,
+                    exact_p=exact_p,
+                    sigma_t=float(sigma_t),
+                    p0_reference=p0_for_qtarget,
+                    trial_budget=int(trial_budget),
+                    trial_repeats=int(trial_repeats),
+                    mcmc_cfg=mcmc_cfg,
+                    candidate=candidate,
+                    trial_number=int(optuna_trial.number),
+                    seed_base=int(seed_base),
+                ): optuna_trial
+                for optuna_trial, candidate, seed_base in asked_trials
+            }
+            for future in cf.as_completed(futures):
+                _finalize_trial(futures[future], future.result())
+
+    trial_records = sorted(
+        trial_records,
+        key=lambda row: (int(row["trial_number"]), int(row["trial_repeat"])),
+    )
+    trial_summary = sorted(trial_summary, key=lambda row: int(row["trial_number"]))
+    selected_by_objective = select_best_mcmc_trial_by_objective(trial_summary)
+    dedup = deduplicate_selected_trial_configs(selected_by_objective)
+
+    return {
+        "trial_records": trial_records,
+        "trial_summary": trial_summary,
+        "objective_best": selected_by_objective,
+        "selected_configs": dedup["configs"],
+        "objective_to_config": dedup["objective_to_config"],
+        "trial_context": {
+            "exact_p": float(exact_p),
+            "p0_for_qtarget": p0_for_qtarget,
+            "q_target": q_target,
+            "sigma_t": float(sigma_t),
+            "pilot_samples": int(mcmc_cfg.pilot_samples),
+            "q_log10_bounds": [lower, upper],
+            "q_clip_min": float(q_clip_min),
+            "q_clip_max": float(q_clip_max),
+            "trials_per_scenario": int(trials_per_scenario),
+            "trial_repeats": int(trial_repeats),
+            "trial_budget": int(trial_budget),
+            "n_swap_pairs_min": 1,
+            "n_swap_pairs_max": int(n_swap_pairs_max),
+            "sampler": "RandomSampler",
+            "study_direction": "minimize",
+            "study_anchor_objective": "objective_oracle_rmse",
+            "study_name": str(study.study_name),
+        },
+    }
+
+
+def _named_mcmc_replicate_worker(
+    *,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    sigma_t: float,
+    template_cfg: MCMCWorkflowConfig | BetaSweepStudyConfig,
+    config_spec: dict[str, Any],
+    rep: int,
+    rep_seed: int,
+) -> list[dict[str, Any]]:
+    resolved_swaps = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=config_spec["proposal_size"],
+    )
+    worker_cfg = BetaSweepStudyConfig(
+        estimation_points=tuple(int(v) for v in checkpoints),
+        repeats=1,
+        beta_multipliers=(1.0,),
+        chains=int(template_cfg.chains),
+        burn_in_fraction=float(template_cfg.burn_in_fraction),
+        thin=int(template_cfg.thin),
+        estimate_variance=bool(template_cfg.estimate_variance),
+        obm_batch_size=template_cfg.obm_batch_size,
+        tilt_mode=str(template_cfg.tilt_mode),
+        proposal_size=config_spec["proposal_size"],
+        base_seed=int(rep_seed),
+        n_jobs=1,
+    )
+    rows = _run_mcmc_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=tuple(int(v) for v in checkpoints),
+        beta=float(config_spec["beta"]),
+        sigma_t=float(sigma_t),
+        cfg=worker_cfg,
+        seed=int(rep_seed),
+    )
+    for row in rows:
+        row["label"] = str(config_spec["label"])
+        row["config_id"] = str(config_spec.get("config_id", config_spec["label"]))
+        row["replicate"] = int(rep)
+        row["seed"] = int(rep_seed)
+        row["proposal_size"] = config_spec["proposal_size"]
+        row["n_swap_pairs"] = int(resolved_swaps)
+        row["source"] = str(config_spec.get("source", "optuna"))
+        row["selected_by_objectives"] = list(config_spec.get("selected_by_objectives", []))
+    return rows
+
+
+def run_named_mcmc_checkpoint_study(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    *,
+    config_specs: list[dict[str, Any]],
+    sigma_t: float,
+    estimation_points: tuple[int, ...],
+    repeats: int,
+    base_seed: int,
+    template_cfg: MCMCWorkflowConfig | BetaSweepStudyConfig,
+    n_jobs: int = 1,
+) -> dict[str, Any]:
+    checkpoints = _sorted_unique_points(estimation_points)
+    rows: list[dict[str, Any]] = []
+    jobs = [
+        (
+            dict(spec),
+            int(rep),
+            int(base_seed + 100_000 * cfg_idx + 1_000 * rep),
+        )
+        for cfg_idx, spec in enumerate(config_specs)
+        for rep in range(int(repeats))
+    ]
+    n_workers = _effective_n_jobs(n_jobs, len(jobs))
+    executor = _try_make_process_pool(n_workers) if n_workers > 1 else None
+
+    if executor is None:
+        for spec, rep, rep_seed in jobs:
+            rows.extend(
+                _named_mcmc_replicate_worker(
+                    problem=problem,
+                    exact_p=exact_p,
+                    checkpoints=checkpoints,
+                    sigma_t=float(sigma_t),
+                    template_cfg=template_cfg,
+                    config_spec=spec,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+            )
+    else:
+        with executor:
+            futures = [
+                executor.submit(
+                    _named_mcmc_replicate_worker,
+                    problem=problem,
+                    exact_p=exact_p,
+                    checkpoints=checkpoints,
+                    sigma_t=float(sigma_t),
+                    template_cfg=template_cfg,
+                    config_spec=spec,
+                    rep=rep,
+                    rep_seed=rep_seed,
+                )
+                for spec, rep, rep_seed in jobs
+            ]
+            for future in cf.as_completed(futures):
+                rows.extend(future.result())
+
+    rows = sorted(rows, key=lambda row: (str(row["label"]), int(row["replicate"]), int(row["checkpoint"])))
+    summary = summarize_records(rows, group_fields=("checkpoint", "label"))
+    return {
+        "records": rows,
+        "summary": summary,
+        "settings": {
+            "estimation_points": list(checkpoints),
+            "repeats": int(repeats),
+            "base_seed": int(base_seed),
+            "sigma_t": float(sigma_t),
+            "configs": list(config_specs),
+        },
+    }
+
+
 def tune_samc_setup(problem: PermutationTestProblem, cfg: SAMCWorkflowConfig, *, seed: int) -> dict[str, Any]:
     pilot_t = iid_pilot_statistics(problem, n_samples=cfg.lambda_min_pilot, seed=seed)
     lambda_min = float(np.min(pilot_t))
@@ -2264,6 +2839,37 @@ def save_beta_sweep_outputs(
     )
 
 
+def save_mcmc_optuna_offline_outputs(
+    study: dict[str, Any],
+    *,
+    output_dir: Path,
+    scenario_name: str,
+    exact_p: float,
+    notebook_config: dict[str, Any],
+    production_baseline_dir: Path | None = None,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_dir / "trial_records.jsonl", study["trial_records"])
+    write_json(output_dir / "trial_summary.json", study["trial_summary"])
+    write_jsonl(output_dir / "final_records.jsonl", study["final_records"])
+    write_json(output_dir / "final_summary.json", study["final_summary"])
+    write_json(
+        output_dir / "metadata.json",
+        {
+            "scenario_display": scenario_name,
+            "exact_p": float(exact_p),
+            "notebook_config": notebook_config,
+            "trial_context": study["trial_context"],
+            "objective_best": study["objective_best"],
+            "selected_configs": study["selected_configs"],
+            "objective_to_config": study["objective_to_config"],
+            "final_settings": study["final_settings"],
+            "production_baseline_dir": str(production_baseline_dir) if production_baseline_dir is not None else None,
+        },
+    )
+
+
 def load_cross_method_saved_output(output_dir: Path) -> dict[str, Any]:
     output_dir = Path(output_dir)
     metadata = read_json(output_dir / "metadata.json")
@@ -2287,6 +2893,23 @@ def load_beta_sweep_saved_output(output_dir: Path) -> dict[str, Any]:
         "metadata": metadata,
         "summary": summary,
         "records": records,
+    }
+
+
+def load_mcmc_optuna_offline_saved_output(output_dir: Path) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    metadata = read_json(output_dir / "metadata.json")
+    trial_summary = read_json(output_dir / "trial_summary.json")
+    trial_records = read_jsonl(output_dir / "trial_records.jsonl")
+    final_summary = read_json(output_dir / "final_summary.json")
+    final_records = read_jsonl(output_dir / "final_records.jsonl")
+    return {
+        "output_dir": output_dir,
+        "metadata": metadata,
+        "trial_summary": trial_summary,
+        "trial_records": trial_records,
+        "final_summary": final_summary,
+        "final_records": final_records,
     }
 
 
