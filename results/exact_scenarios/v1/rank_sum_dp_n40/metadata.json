@@ -13,5 +13,19 @@
   "tail_hits": 11642,
   "n_permutations": 137846528820,
   "notes": "DP over rank-sum counts with no ties in X.",
-  "extra": {}
+  "extra": {},
+  "portfolio": {
+    "family": "rank_sum_dp",
+    "statistic_family": "rank_based",
+    "data_family": "continuous_ordered",
+    "rarity_band": "extreme",
+    "expected_difficulty": "moderate",
+    "sample_size_band": "medium",
+    "has_ties": false,
+    "is_discrete": false,
+    "groups": [
+      "core_claim",
+      "exploratory_exact"
+    ]
+  }
 }

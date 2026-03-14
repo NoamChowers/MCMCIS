@@ -24,5 +24,20 @@
     "n_nonzero": 12,
     "observed_treated_sum": 50.0,
     "extreme_treated_sum": 51.0
+  },
+  "portfolio": {
+    "family": "zero_inflated_count",
+    "statistic_family": "linear_statistic",
+    "data_family": "zero_inflated_count",
+    "rarity_band": "very_rare",
+    "expected_difficulty": "hard",
+    "sample_size_band": "medium",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact",
+      "core_claim",
+      "stress_test"
+    ]
   }
 }

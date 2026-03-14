@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import comb
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ class ExactScenario:
     n_permutations: int
     notes: str
     extra: dict[str, Any]
+    portfolio: dict[str, Any] = field(default_factory=dict)
 
 
 def treated_successes(x: np.ndarray, y: np.ndarray) -> float:
@@ -75,6 +76,74 @@ def near_tail_labels_tiny_p_case() -> tuple[np.ndarray, np.ndarray]:
     treated_values = set([1, 16] + list(range(23, 41)))
     y = np.array([1 if int(v) in treated_values else 0 for v in x], dtype=np.int8)
     return x, y
+
+
+def _rarity_band(exact_p_value: float) -> str:
+    p = float(exact_p_value)
+    if p <= 1e-8:
+        return "ultra_rare"
+    if p <= 1e-6:
+        return "extreme"
+    if p <= 1e-4:
+        return "very_rare"
+    return "rare"
+
+
+def _sample_size_band(n: int) -> str:
+    n_int = int(n)
+    if n_int <= 24:
+        return "small"
+    if n_int <= 40:
+        return "medium"
+    return "large"
+
+
+def _portfolio_metadata(
+    *,
+    scenario: ExactScenario,
+    family: str,
+    statistic_family: str,
+    data_family: str,
+    difficulty: str,
+    groups: tuple[str, ...],
+    has_ties: bool,
+    is_discrete: bool,
+) -> dict[str, Any]:
+    return {
+        "family": str(family),
+        "statistic_family": str(statistic_family),
+        "data_family": str(data_family),
+        "rarity_band": _rarity_band(float(scenario.exact_p_value)),
+        "expected_difficulty": str(difficulty),
+        "sample_size_band": _sample_size_band(int(scenario.problem.n)),
+        "has_ties": bool(has_ties),
+        "is_discrete": bool(is_discrete),
+        "groups": [str(group) for group in groups],
+    }
+
+
+def _apply_portfolio_metadata(
+    scenario: ExactScenario,
+    *,
+    family: str,
+    statistic_family: str,
+    data_family: str,
+    difficulty: str,
+    groups: tuple[str, ...],
+    has_ties: bool,
+    is_discrete: bool,
+) -> ExactScenario:
+    scenario.portfolio = _portfolio_metadata(
+        scenario=scenario,
+        family=family,
+        statistic_family=statistic_family,
+        data_family=data_family,
+        difficulty=difficulty,
+        groups=groups,
+        has_ties=has_ties,
+        is_discrete=is_discrete,
+    )
+    return scenario
 
 
 def _near_extreme_linear_labels(x: np.ndarray, n_treated: int, *, downgrade_swaps: int = 1) -> np.ndarray:
@@ -191,7 +260,7 @@ def _make_hypergeom_scenario(
             f"{p_hg} vs {p_dp.p_value}"
         )
 
-    return ExactScenario(
+    scenario = ExactScenario(
         key=key,
         description=description,
         problem=problem,
@@ -212,13 +281,23 @@ def _make_hypergeom_scenario(
             "dp_cross_check_p": float(p_dp.p_value),
         },
     )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="hypergeometric_tail",
+        statistic_family="binary_count",
+        data_family="binary",
+        difficulty="moderate" if k_obs < m_success else "hard",
+        groups=("exploratory_exact",) + (("core_claim",) if key in {"hypergeom_1e5", "hypergeom_1e7"} else tuple()) + (("stress_test",) if key == "hypergeom_1e7" else tuple()),
+        has_ties=True,
+        is_discrete=True,
+    )
 
 
 def _make_rank_sum_dp_scenario() -> ExactScenario:
     x, y = near_tail_labels_tiny_p_case()
     problem = PermutationTestProblem(X=x, y_obs=y, statistic=mann_whitney_u, tail="right")
     exact = RankSumDPSolver(problem, statistic_type="u").compute()
-    return ExactScenario(
+    scenario = ExactScenario(
         key="rank_sum_dp_n40",
         description="Rank-sum (Mann-Whitney U) with deterministic near-tail labels, n=40.",
         problem=problem,
@@ -229,6 +308,16 @@ def _make_rank_sum_dp_scenario() -> ExactScenario:
         n_permutations=int(exact.n_permutations),
         notes="DP over rank-sum counts with no ties in X.",
         extra={},
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="rank_sum_dp",
+        statistic_family="rank_based",
+        data_family="continuous_ordered",
+        difficulty="moderate",
+        groups=("core_claim", "exploratory_exact"),
+        has_ties=False,
+        is_discrete=False,
     )
 
 
@@ -242,7 +331,7 @@ def _make_linear_dp_scenario() -> ExactScenario:
         tail="right",
     )
     exact = LinearStatisticDPSolver.from_difference_in_means(problem, score_scale=1).compute()
-    return ExactScenario(
+    scenario = ExactScenario(
         key="linear_stat_dp_n40",
         description="Difference in means on nonlinear numeric X=i^2, n=40.",
         problem=problem,
@@ -253,6 +342,103 @@ def _make_linear_dp_scenario() -> ExactScenario:
         n_permutations=int(exact.n_permutations),
         notes="DP over treated weighted sums mapped exactly to difference in means.",
         extra={},
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="linear_stat_dp",
+        statistic_family="linear_statistic",
+        data_family="nonlinear_numeric",
+        difficulty="hard",
+        groups=("core_claim", "stress_test", "exploratory_exact"),
+        has_ties=False,
+        is_discrete=False,
+    )
+
+
+def _make_rank_sum_family_scenario(
+    *,
+    key: str,
+    description: str,
+    n: int,
+    n_treated: int,
+    downgrade_swaps: int,
+) -> ExactScenario:
+    x = np.arange(1, n + 1, dtype=float)
+    y = _near_extreme_linear_labels(x, n_treated, downgrade_swaps=downgrade_swaps)
+    problem = PermutationTestProblem(X=x, y_obs=y, statistic=mann_whitney_u, tail="right")
+    exact = RankSumDPSolver(problem, statistic_type="u").compute()
+    scenario = ExactScenario(
+        key=key,
+        description=description,
+        problem=problem,
+        statistic_name="mann_whitney_u",
+        exact_method="RankSumDPSolver",
+        exact_p_value=float(exact.p_value),
+        tail_hits=int(exact.tail_hits),
+        n_permutations=int(exact.n_permutations),
+        notes="Parametric rank-sum family member generated from near-extreme label downgrades.",
+        extra={
+            "n": int(n),
+            "n_treated": int(n_treated),
+            "downgrade_swaps": int(downgrade_swaps),
+        },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="rank_sum_dp",
+        statistic_family="rank_based",
+        data_family="continuous_ordered",
+        difficulty="hard" if downgrade_swaps == 1 else "moderate",
+        groups=("exploratory_exact",) + (("stress_test",) if downgrade_swaps == 1 else tuple()),
+        has_ties=False,
+        is_discrete=False,
+    )
+
+
+def _make_linear_family_scenario(
+    *,
+    key: str,
+    description: str,
+    n: int,
+    n_treated: int,
+    power: int,
+    downgrade_swaps: int,
+) -> ExactScenario:
+    x = np.arange(1, n + 1, dtype=float) ** int(power)
+    y = _near_extreme_linear_labels(x, n_treated, downgrade_swaps=downgrade_swaps)
+    problem = PermutationTestProblem(
+        X=x,
+        y_obs=y,
+        statistic=difference_in_means,
+        tail="right",
+    )
+    exact = LinearStatisticDPSolver.from_difference_in_means(problem, score_scale=1).compute()
+    scenario = ExactScenario(
+        key=key,
+        description=description,
+        problem=problem,
+        statistic_name="difference_in_means",
+        exact_method="LinearStatisticDPSolver",
+        exact_p_value=float(exact.p_value),
+        tail_hits=int(exact.tail_hits),
+        n_permutations=int(exact.n_permutations),
+        notes="Linear-stat DP family member generated from powered scores and near-extreme label downgrades.",
+        extra={
+            "n": int(n),
+            "n_treated": int(n_treated),
+            "power": int(power),
+            "downgrade_swaps": int(downgrade_swaps),
+        },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="linear_stat_dp",
+        statistic_family="linear_statistic",
+        data_family="nonlinear_numeric",
+        difficulty="hard" if downgrade_swaps == 1 else "moderate",
+        groups=("exploratory_exact",) + (("stress_test",) if downgrade_swaps == 1 else tuple()),
+        has_ties=False,
+        is_discrete=False,
     )
 
 
@@ -289,7 +475,7 @@ def _make_gwas_additive_score_scenario(
             f"and extreme score={extreme_score}."
         )
 
-    return ExactScenario(
+    scenario = ExactScenario(
         key=key,
         description=description,
         problem=problem,
@@ -314,6 +500,18 @@ def _make_gwas_additive_score_scenario(
             "n_homozygous_alt": int(np.sum(x == 2.0)),
             "total_dosage_sum": int(np.sum(x)),
         },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="gwas_additive_score",
+        statistic_family="linear_statistic",
+        data_family="discrete_score",
+        difficulty="hard" if downgrade_swaps == 1 else "moderate",
+        groups=("exploratory_exact",)
+        + (("core_claim",) if key == "gwas_additive_score_n40" else tuple())
+        + (("stress_test",) if downgrade_swaps == 1 else tuple()),
+        has_ties=True,
+        is_discrete=True,
     )
 
 
@@ -351,7 +549,7 @@ def _make_zero_inflated_poisson_diffmeans_scenario(
             f"and extreme treated sum={extreme_treated_sum}."
         )
 
-    return ExactScenario(
+    scenario = ExactScenario(
         key=key,
         description=description,
         problem=problem,
@@ -376,6 +574,18 @@ def _make_zero_inflated_poisson_diffmeans_scenario(
             "observed_treated_sum": observed_treated_sum,
             "extreme_treated_sum": extreme_treated_sum,
         },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="zero_inflated_count",
+        statistic_family="linear_statistic",
+        data_family="zero_inflated_count",
+        difficulty="hard" if zero_prob >= 0.8 else "moderate",
+        groups=("exploratory_exact",)
+        + (("core_claim",) if key == "zip_diffmeans_righttail_n40" else tuple())
+        + (("stress_test",) if zero_prob >= 0.8 else tuple()),
+        has_ties=True,
+        is_discrete=True,
     )
 
 
@@ -407,7 +617,7 @@ def _make_poisson_diffmeans_righttail_scenario(
         tail="right",
     )
     exact = LinearStatisticDPSolver.from_difference_in_means(problem, score_scale=1).compute()
-    return ExactScenario(
+    scenario = ExactScenario(
         key=key,
         description=description,
         problem=problem,
@@ -430,6 +640,16 @@ def _make_poisson_diffmeans_righttail_scenario(
             "mean_pois2": float(np.mean(x_low)),
             "mean_pois3": float(np.mean(x_high)),
         },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="poisson_count",
+        statistic_family="linear_statistic",
+        data_family="count",
+        difficulty="moderate",
+        groups=("exploratory_exact",),
+        has_ties=True,
+        is_discrete=True,
     )
 
 
@@ -467,7 +687,7 @@ def _make_bruteforce_welch_scenario(
             f"Scenario '{key}' has tail_hits={exact.tail_hits}. "
             "Increase swap_from_extreme to avoid single-tail edge case."
         )
-    return ExactScenario(
+    scenario = ExactScenario(
         key=key,
         description=description,
         problem=problem,
@@ -486,10 +706,30 @@ def _make_bruteforce_welch_scenario(
             "n_treated": int(n_treated),
         },
     )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="welch_bruteforce",
+        statistic_family="nonlinear_statistic",
+        data_family="ordered_numeric",
+        difficulty="hard" if swap_from_extreme <= 2 else "moderate",
+        groups=("exploratory_exact",)
+        + (("core_claim",) if key == "bruteforce_welch_nonextreme_n22" else tuple())
+        + (("stress_test",) if swap_from_extreme <= 2 else tuple()),
+        has_ties=False,
+        is_discrete=False,
+    )
 
 
 def build_exact_scenarios() -> list[ExactScenario]:
     scenarios: list[ExactScenario] = [
+        _make_hypergeom_scenario(
+            key="hypergeom_3e4",
+            description="Binary treated-successes with exact p around 3e-4.",
+            n=40,
+            n_treated=20,
+            m_success=15,
+            k_obs=13,
+        ),
         _make_hypergeom_scenario(
             key="hypergeom_1e5",
             description="Binary treated-successes with exact p around 1e-5.",
@@ -507,11 +747,83 @@ def build_exact_scenarios() -> list[ExactScenario]:
             k_obs=15,
         ),
         _make_gwas_additive_score_scenario(),
+        _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_swap2_n40",
+            description=(
+                "GWAS-like additive score with a two-swap downgrade from the maximal dosage sum, n=40."
+            ),
+            downgrade_swaps=2,
+        ),
+        _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_maf010_n40",
+            description=(
+                "GWAS-like additive score with Binomial(2, maf=0.10) dosages, n=40."
+            ),
+            maf=0.10,
+            seed=21,
+            downgrade_swaps=1,
+        ),
         _make_rank_sum_dp_scenario(),
+        _make_rank_sum_family_scenario(
+            key="rank_sum_dp_swap2_n40",
+            description="Rank-sum family member with a two-swap downgrade, n=40.",
+            n=40,
+            n_treated=20,
+            downgrade_swaps=2,
+        ),
+        _make_rank_sum_family_scenario(
+            key="rank_sum_dp_n32",
+            description="Rank-sum family member with n=32 and a one-swap downgrade.",
+            n=32,
+            n_treated=16,
+            downgrade_swaps=1,
+        ),
         _make_linear_dp_scenario(),
+        _make_linear_family_scenario(
+            key="linear_stat_dp_cube_n40",
+            description="Difference in means on cubic numeric scores X=i^3, n=40.",
+            n=40,
+            n_treated=20,
+            power=3,
+            downgrade_swaps=1,
+        ),
+        _make_linear_family_scenario(
+            key="linear_stat_dp_swap2_n40",
+            description="Difference in means on quadratic scores X=i^2 with a two-swap downgrade, n=40.",
+            n=40,
+            n_treated=20,
+            power=2,
+            downgrade_swaps=2,
+        ),
         _make_zero_inflated_poisson_diffmeans_scenario(),
+        _make_zero_inflated_poisson_diffmeans_scenario(
+            key="zip_diffmeans_lesszero_n40",
+            description=(
+                "Zero-inflated Poisson benchmark with 65% zeros and near-extreme treated set, n=40."
+            ),
+            zero_prob=0.65,
+            seed=14,
+        ),
+        _make_zero_inflated_poisson_diffmeans_scenario(
+            key="zip_diffmeans_morezero_n40",
+            description=(
+                "Zero-inflated Poisson benchmark with 90% zeros and near-extreme treated set, n=40."
+            ),
+            zero_prob=0.90,
+            seed=24,
+        ),
         _make_poisson_diffmeans_righttail_scenario(),
         _make_bruteforce_welch_scenario(),
+        _make_bruteforce_welch_scenario(
+            key="bruteforce_welch_swap1_n22",
+            description="Brute-force Welch t-statistic with a one-swap downgrade, n=22.",
+            swap_from_extreme=1,
+        ),
+        _make_bruteforce_welch_scenario(
+            key="bruteforce_welch_swap3_n22",
+            description="Brute-force Welch t-statistic with a three-swap downgrade, n=22.",
+            swap_from_extreme=3,
+        ),
     ]
     return scenarios
 
@@ -535,6 +847,7 @@ def _scenario_metadata(s: ExactScenario) -> dict[str, Any]:
         "n_permutations": int(s.n_permutations),
         "notes": s.notes,
         "extra": s.extra,
+        "portfolio": s.portfolio,
     }
 
 
@@ -628,6 +941,7 @@ def load_saved_exact_scenarios(catalog_path: Path) -> list[ExactScenario]:
                 n_permutations=int(rec["n_permutations"]),
                 notes=str(rec.get("notes", "")),
                 extra=dict(rec.get("extra", {})),
+                portfolio=dict(rec.get("portfolio", {})),
             )
         )
     return scenarios

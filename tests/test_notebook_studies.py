@@ -4,6 +4,10 @@ import pytest
 
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.exact.brute_force import BruteForceExactSolver
+from perm_pval.experiments.exact_scenarios import (
+    _make_gwas_additive_score_scenario,
+    _make_zero_inflated_poisson_diffmeans_scenario,
+)
 from perm_pval.experiments.notebook_studies import (
     BetaSweepStudyConfig,
     CrossMethodStudyConfig,
@@ -25,6 +29,7 @@ from perm_pval.experiments.notebook_studies import (
     score_mcmc_objective_grid_repeat_row,
     select_mcmc_objective_grid_winners,
     summarize_mcmc_objective_grid_configs,
+    load_selected_scenarios,
 )
 from perm_pval.methods.beta_tuning import estimate_scale_T, iid_pilot_statistics
 from perm_pval.stats.two_sample import difference_in_means
@@ -56,12 +61,10 @@ def _small_right_tail_scenario() -> LoadedScenario:
 def _small_mcmc_cfg() -> MCMCWorkflowConfig:
     return MCMCWorkflowConfig(
         pilot_samples=40,
-        tune_steps=30,
-        tune_burn_in_fraction=0.2,
-        tune_thin=1,
-        tune_max_bracket=4,
-        tune_max_bisect=4,
+        local_scan_q_multipliers=(0.01, 0.1),
+        local_scan_swap_counts=(1, 2),
         local_scan_screen_total_steps=10,
+        local_scan_screen_chains=1,
         local_scan_total_steps=20,
         local_scan_chains=1,
         local_scan_thin=1,
@@ -125,6 +128,9 @@ def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     mcmc_rows = [row for row in study["records"] if row["method"] == "mcmc_is"]
     assert all(int(row["mcmc_chain_budget"]) < int(row["checkpoint"]) for row in mcmc_rows)
     assert all(int(row["beta_selection_budget"]) == int(study["mcmc_beta_selection_budget"]) for row in mcmc_rows)
+    if study["beta_workflow"].get("production_init_states") is not None:
+        assert all(int(row["state_reused_init"]) == 1 for row in mcmc_rows)
+        assert all(int(row["burn_in"]) == 0 for row in mcmc_rows)
 
 
 def test_run_beta_checkpoint_study_emits_rows_for_each_checkpoint():
@@ -332,36 +338,24 @@ def test_build_mcmc_objective_grid_candidates_retains_invalid_q_map_rows():
 def test_score_mcmc_objective_grid_repeat_row_uses_exact_penalties():
     row = score_mcmc_objective_grid_repeat_row(
         {
-            "selection_objective_p0": 2.0,
             "variance_estimate": 3.0,
-            "tail_hits": 5,
-            "acceptance_rate": 0.025,
             "q_tilt_tail_share": 0.001,
             "q_trial": 0.01,
             "n_weighted_samples": 100,
+            "weight_cv": 9.0,
             "abs_log10_error": 0.3,
         }
     )
 
-    p_hits = 5.0
-    p_acc = 2.0
     p_q = 1.0 + abs(np.log((0.001 + 0.01) / (0.01 + 0.01)))
+    p_deg = 1.0 + 0.25 * np.log1p(9.0)
 
-    assert row["P_hits"] == pytest.approx(p_hits)
-    assert row["P_acc"] == pytest.approx(p_acc)
     assert row["P_q"] == pytest.approx(p_q)
-    assert row["objective_selobj"] == pytest.approx(2.0)
+    assert row["P_deg"] == pytest.approx(p_deg)
     assert row["objective_varhat"] == pytest.approx(3.0)
-    assert row["objective_selobj_hits_soft"] == pytest.approx(2.0 * p_hits)
-    assert row["objective_selobj_acc_soft"] == pytest.approx(2.0 * p_acc)
-    assert row["objective_selobj_qmatch_soft"] == pytest.approx(2.0 * p_q)
-    assert row["objective_selobj_hits_acc_soft"] == pytest.approx(2.0 * p_hits * p_acc)
-    assert row["objective_varhat_hits_soft"] == pytest.approx(3.0 * p_hits)
-    assert row["objective_varhat_acc_soft"] == pytest.approx(3.0 * p_acc)
     assert row["objective_varhat_qmatch_soft"] == pytest.approx(3.0 * p_q)
-    assert row["objective_varhat_hits_acc_soft"] == pytest.approx(3.0 * p_hits * p_acc)
-    assert np.isinf(row["objective_selobj_guardrailed"])
-    assert np.isinf(row["objective_varhat_guardrailed"])
+    assert row["objective_varhat_degeneracy_soft"] == pytest.approx(3.0 * p_deg)
+    assert row["objective_varhat_qmatch_degeneracy_soft"] == pytest.approx(3.0 * p_q * p_deg)
 
 
 def test_objective_grid_aggregation_and_winner_tie_breaks_are_deterministic():
@@ -411,7 +405,7 @@ def test_objective_grid_aggregation_and_winner_tie_breaks_are_deterministic():
                     "squared_error": 0.09,
                     "abs_log10_error": 0.1,
                     "variance_estimate": 1.0,
-                    "selection_objective_p0": 1.0,
+                    "weight_cv": 2.0,
                 }
             )
         )
@@ -430,7 +424,7 @@ def test_objective_grid_aggregation_and_winner_tie_breaks_are_deterministic():
                     "squared_error": 0.01,
                     "abs_log10_error": 0.05,
                     "variance_estimate": 1.0,
-                    "selection_objective_p0": 1.0,
+                    "weight_cv": 2.0,
                 }
             )
         )
@@ -443,14 +437,14 @@ def test_objective_grid_aggregation_and_winner_tie_breaks_are_deterministic():
     )
 
     oracle_row = next(row for row in winners["objective_winners"] if row["objective_name"] == "oracle_rmse")
-    selobj_row = next(row for row in winners["objective_winners"] if row["objective_name"] == "selobj")
+    varhat_row = next(row for row in winners["objective_winners"] if row["objective_name"] == "varhat")
 
     assert oracle_row["config_id"] == "q01_s2"
-    assert selobj_row["config_id"] == "q00_s1"
-    assert selobj_row["oracle_exact_match"] == 0
-    assert selobj_row["oracle_q_index_distance"] == 1
-    assert selobj_row["oracle_swap_distance"] == 1
-    assert selobj_row["oracle_fuzzy_similarity"] == pytest.approx(0.5)
+    assert varhat_row["config_id"] == "q00_s1"
+    assert varhat_row["oracle_exact_match"] == 0
+    assert varhat_row["oracle_q_index_distance"] == 1
+    assert varhat_row["oracle_swap_distance"] == 1
+    assert varhat_row["oracle_fuzzy_similarity"] == pytest.approx(0.5)
 
 
 def test_objective_grid_smoke_runs_end_to_end():
@@ -476,3 +470,16 @@ def test_objective_grid_smoke_runs_end_to_end():
     assert any(row["status"] == "ok" for row in study["repeat_records"])
     assert study["oracle_winner"]["objective_name"] == "oracle_rmse"
     assert {row["objective_name"] for row in study["objective_winners"]} == set(("oracle_rmse", "oracle_abs_log10", *MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES))
+
+
+def test_load_selected_scenarios_supports_portfolio_group(tmp_path):
+    from perm_pval.experiments.exact_scenarios import save_exact_scenarios
+
+    scenarios = [_make_gwas_additive_score_scenario(), _make_zero_inflated_poisson_diffmeans_scenario()]
+    save_exact_scenarios(scenarios, tmp_path)
+    loaded = load_selected_scenarios(
+        catalog_path=tmp_path / "catalog.json",
+        portfolio_group="core_claim",
+    )
+
+    assert [scenario.key for scenario in loaded] == ["gwas_additive_score_n40", "zip_diffmeans_righttail_n40"]

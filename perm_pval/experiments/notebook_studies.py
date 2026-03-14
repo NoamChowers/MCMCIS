@@ -5,7 +5,7 @@ import json
 import multiprocessing as mp
 import time
 import warnings
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -24,8 +24,6 @@ from perm_pval.methods.beta_tuning import (
     estimate_scale_T,
     iid_pilot_statistics,
     init_beta_from_iid_pilot,
-    make_short_chain_q_runner,
-    tune_beta_to_target_q,
 )
 from perm_pval.methods.mcmc_is import (
     right_tail_deficit_scaled,
@@ -68,17 +66,18 @@ class MCMCWorkflowConfig:
     tilt_mode: str = "smooth_hinge"
     proposal_size: float | int = 0.075
     local_scan_enabled: bool = True
-    local_scan_q_multipliers: tuple[float, ...] = (0.05, 0.25, 0.50, 1.00, 1.50)
-    local_scan_screen_total_steps: int = 12_000
+    local_scan_q_multipliers: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.10, 0.15, 0.25, 0.33)
+    local_scan_swap_counts: tuple[int, ...] = (1, 2, 3)
+    local_scan_objective: str = "varhat_qmatch_soft"
+    local_scan_screen_total_steps: int = 6_000
+    local_scan_screen_chains: int = 1
     local_scan_finalist_count: int = 3
-    local_scan_total_steps: int = 64_000
+    local_scan_total_steps: int = 32_000
     local_scan_chains: int = 2
     local_scan_burn_in_fraction: float = 0.20
     local_scan_thin: int = 1
-    local_scan_min_ess: float = 5.0
-    local_scan_q_lower_factor: float = 0.25
-    local_scan_q_upper_factor: float = 4.0
     local_scan_variance_near_min_ratio: float = 1.20
+    local_scan_weight_cv_penalty_scale: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -120,31 +119,29 @@ class BetaSweepStudyConfig:
 
 
 DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS: tuple[float, ...] = (
+    1e-5,
+    3e-5,
     1e-4,
+    3e-4,
     5e-4,
     1e-3,
+    3e-3,
     5e-3,
     1e-2,
+    3e-2,
     5e-2,
     0.1,
     0.15,
+    0.2,
     0.25,
     0.33,
 )
-DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS: tuple[int, ...] = (1, 2, 3)
+DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS: tuple[int, ...] = (1, 2, 3, 4)
 MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES: tuple[str, ...] = (
-    "selobj",
     "varhat",
-    "selobj_hits_soft",
-    "selobj_acc_soft",
-    "selobj_qmatch_soft",
-    "selobj_hits_acc_soft",
-    "varhat_hits_soft",
-    "varhat_acc_soft",
     "varhat_qmatch_soft",
-    "varhat_hits_acc_soft",
-    "selobj_guardrailed",
-    "varhat_guardrailed",
+    "varhat_degeneracy_soft",
+    "varhat_qmatch_degeneracy_soft",
 )
 MCMC_OBJECTIVE_GRID_ALL_OBJECTIVES: tuple[str, ...] = (
     "oracle_rmse",
@@ -164,6 +161,7 @@ class LoadedScenario:
     exact_method: str
     notes: str
     extra: dict[str, Any]
+    portfolio: dict[str, Any] = field(default_factory=dict)
 
 
 def _sorted_unique_points(points: Iterable[int]) -> tuple[int, ...]:
@@ -184,6 +182,7 @@ def _to_loaded_scenario(s: ExactScenario) -> LoadedScenario:
         exact_method=str(s.exact_method),
         notes=str(s.notes),
         extra=dict(s.extra),
+        portfolio=dict(getattr(s, "portfolio", {})),
     )
 
 
@@ -191,13 +190,26 @@ def load_selected_scenarios(
     *,
     catalog_path: Path,
     scenario_keys: Iterable[str] | None = None,
+    portfolio_group: str | None = None,
     min_tail_states: int = 1,
 ) -> list[LoadedScenario]:
     all_scenarios = [_to_loaded_scenario(s) for s in load_saved_exact_scenarios(catalog_path)]
     by_key = {s.key: s for s in all_scenarios}
 
     if scenario_keys is None:
-        selected_keys = [s.key for s in all_scenarios]
+        if portfolio_group is None:
+            selected_keys = [s.key for s in all_scenarios]
+        else:
+            selected_keys = [
+                s.key
+                for s in all_scenarios
+                if str(portfolio_group) in set(str(v) for v in s.portfolio.get("groups", []))
+            ]
+            if not selected_keys:
+                raise KeyError(
+                    f"No scenarios found for portfolio_group='{portfolio_group}'. "
+                    f"Available groups: {sorted({group for s in all_scenarios for group in s.portfolio.get('groups', [])})}"
+                )
     else:
         selected_keys = [str(k) for k in scenario_keys]
 
@@ -351,40 +363,78 @@ def _snis_design_variance_objective(
     return float(var_mean_h / (mean_w * mean_w))
 
 
-def _local_scan_pool_indices(rows: list[dict[str, Any]]) -> tuple[list[int], bool]:
-    eligible_indices = [idx for idx, row in enumerate(rows) if bool(row["guardrail_passed"])]
-    if eligible_indices:
-        return eligible_indices, True
-    fallback_indices = [
-        idx for idx, row in enumerate(rows)
-        if np.isfinite(row["selection_objective_p0"]) and float(row["selection_objective_p0"]) > 0.0
-    ]
-    return fallback_indices, False
+def _q_match_penalty(q_real: float, q_target: float, n_weighted_samples: int) -> float:
+    if n_weighted_samples > 0:
+        q_eps = float(max(1.0 / float(n_weighted_samples), 1e-12))
+    else:
+        q_eps = 1e-12
+    if not np.isfinite(q_real) or not np.isfinite(q_target) or q_target <= 0.0:
+        return float("inf")
+    return float(1.0 + abs(np.log((q_real + q_eps) / (q_target + q_eps))))
+
+
+def _weight_cv_penalty(weight_cv: float, scale: float) -> float:
+    if not np.isfinite(weight_cv) or weight_cv < 0.0:
+        return float("inf")
+    return float(1.0 + float(scale) * np.log1p(weight_cv))
+
+
+def _compute_varhat_objectives(
+    *,
+    variance_estimate: float,
+    q_tilt_tail_share: float,
+    q_target: float,
+    n_weighted_samples: int,
+    weight_cv: float,
+    weight_cv_penalty_scale: float,
+) -> dict[str, float]:
+    base_varhat = float(variance_estimate) if _positive_finite(variance_estimate) else float("inf")
+    p_q = _q_match_penalty(q_tilt_tail_share, q_target, n_weighted_samples)
+    p_deg = _weight_cv_penalty(weight_cv, weight_cv_penalty_scale)
+    return {
+        "objective_varhat": base_varhat,
+        "objective_varhat_qmatch_soft": (
+            float(base_varhat * p_q) if np.isfinite(base_varhat) and np.isfinite(p_q) else float("inf")
+        ),
+        "objective_varhat_degeneracy_soft": (
+            float(base_varhat * p_deg) if np.isfinite(base_varhat) and np.isfinite(p_deg) else float("inf")
+        ),
+        "objective_varhat_qmatch_degeneracy_soft": (
+            float(base_varhat * p_q * p_deg)
+            if np.isfinite(base_varhat) and np.isfinite(p_q) and np.isfinite(p_deg)
+            else float("inf")
+        ),
+        "P_q": p_q,
+        "P_deg": p_deg,
+    }
+
+
+def _scan_metric_key(objective_name: str) -> str:
+    return f"objective_{str(objective_name)}"
 
 
 def _build_q_scan_candidates(
     *,
     problem: PermutationTestProblem,
     cfg: MCMCWorkflowConfig,
-    beta_center: float,
     pilot_t: np.ndarray,
     p0_for_qtarget: float,
     sigma_t: float,
     q_target: float,
     q_multipliers: Iterable[float],
-    existing_betas: Iterable[float] = (),
-) -> list[dict[str, float]]:
-    candidates: list[dict[str, float]] = []
-    seen_betas = [float(beta) for beta in existing_betas]
-    for mult in q_multipliers:
-        q_multiplier = float(mult)
+    swap_counts: Iterable[int],
+    q_floor: float = 1e-12,
+) -> list[dict[str, Any]]:
+    q_grid = tuple(float(mult) for mult in q_multipliers)
+    swap_grid = tuple(int(v) for v in swap_counts)
+    max_swaps = min(int(problem.n_treated), int(problem.n_control))
+    candidates: list[dict[str, Any]] = []
+    for q_index, q_multiplier in enumerate(q_grid):
         if q_multiplier <= 0.0 or not np.isfinite(q_multiplier):
-            continue
-        q_candidate = float(min(q_target * q_multiplier, 1.0 - 1e-12))
-        beta_candidate = (
-            float(beta_center)
-            if np.isclose(q_candidate, q_target, rtol=1e-12, atol=1e-15)
-            else float(
+            raise ValueError("local_scan_q_multipliers must all be positive finite values.")
+        q_candidate = float(max(q_target * q_multiplier, q_floor))
+        try:
+            beta_candidate = float(
                 init_beta_from_iid_pilot(
                     pilot_T=pilot_t,
                     T_obs=problem.t_obs,
@@ -394,74 +444,125 @@ def _build_q_scan_candidates(
                     beta_max=cfg.beta_max_init,
                 )
             )
-        )
-        if beta_candidate <= 0.0 or not np.isfinite(beta_candidate):
-            continue
-        if any(np.isclose(beta_candidate, beta_prev, rtol=1e-10, atol=1e-12) for beta_prev in seen_betas):
-            continue
-        seen_betas.append(beta_candidate)
-        candidates.append(
-            {
-                "beta": beta_candidate,
-                "q_scan_target": q_candidate,
-                "q_multiplier": q_multiplier,
-            }
-        )
+        except Exception:
+            beta_candidate = float("nan")
+        for n_swap_pairs in swap_grid:
+            if n_swap_pairs < 1 or n_swap_pairs > max_swaps:
+                raise ValueError(
+                    f"local_scan_swap_counts must lie in [1, {max_swaps}], received {n_swap_pairs}."
+                )
+            candidates.append(
+                {
+                    "config_id": f"q{q_index:02d}_s{n_swap_pairs}",
+                    "label": f"q{q_index:02d}_s{n_swap_pairs}",
+                    "q_index": int(q_index),
+                    "q_multiplier": float(q_multiplier),
+                    "q_scan_target": float(q_candidate),
+                    "beta": float(beta_candidate),
+                    "proposal_size": int(n_swap_pairs),
+                    "n_swap_pairs": int(n_swap_pairs),
+                    "status": (
+                        "ok"
+                        if np.isfinite(beta_candidate) and beta_candidate > 0.0
+                        else "invalid_q_map"
+                    ),
+                }
+            )
     return candidates
 
 
-def _refinement_q_multipliers(ladder: list[float], best_idx: int) -> tuple[float, float]:
-    if len(ladder) < 2:
-        return tuple()
-    if best_idx <= 0:
-        left = float((ladder[0] * ladder[0]) / ladder[1])
-        right = float(np.sqrt(ladder[0] * ladder[1]))
-        return (left, right)
-    if best_idx >= len(ladder) - 1:
-        left = float(np.sqrt(ladder[-2] * ladder[-1]))
-        right = float((ladder[-1] * ladder[-1]) / ladder[-2])
-        return (left, right)
-    left = float(np.sqrt(ladder[best_idx - 1] * ladder[best_idx]))
-    right = float(np.sqrt(ladder[best_idx] * ladder[best_idx + 1]))
-    return (left, right)
+def _rank_scan_rows(rows: list[dict[str, Any]], *, objective_name: str) -> list[int]:
+    metric_key = _scan_metric_key(objective_name)
+    finite_indices = [
+        idx
+        for idx, row in enumerate(rows)
+        if np.isfinite(row.get(metric_key, np.inf))
+    ]
+    if finite_indices:
+        return sorted(
+            finite_indices,
+            key=lambda idx: (
+                float(rows[idx][metric_key]),
+                int(rows[idx]["q_index"]),
+                int(rows[idx]["n_swap_pairs"]),
+                float(rows[idx]["beta"]),
+            ),
+        )
+    return sorted(
+        range(len(rows)),
+        key=lambda idx: (
+            int(rows[idx]["q_index"]),
+            int(rows[idx]["n_swap_pairs"]),
+            float(rows[idx]["beta"]) if np.isfinite(rows[idx].get("beta", np.nan)) else float("inf"),
+        ),
+    )
 
 
 def _run_local_scan_stage(
     problem: PermutationTestProblem,
     cfg: MCMCWorkflowConfig,
     *,
-    candidates: list[dict[str, float]],
-    p0_reference: float,
+    candidates: list[dict[str, Any]],
     sigma_t: float,
-    q_target: float,
     total_steps: int,
+    n_chains: int,
     seed: int,
     stage: str,
 ) -> dict[str, Any]:
     steps_per_chain, burn_in = _local_scan_steps(
         total_steps,
-        cfg.local_scan_chains,
+        n_chains,
         cfg.local_scan_burn_in_fraction,
     )
     rows: list[dict[str, Any]] = []
-    chain_kept_samples = _kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin)
+    final_states: dict[str, list[np.ndarray]] = {}
     t_start = time.perf_counter()
     for idx, candidate in enumerate(candidates):
-        beta = float(candidate["beta"])
-        q_scan_target = float(candidate["q_scan_target"])
-        q_multiplier = float(candidate.get("q_multiplier", float("nan")))
+        if str(candidate["status"]) != "ok":
+            rows.append(
+                {
+                    **candidate,
+                    "stage": stage,
+                    "estimate": np.nan,
+                    "variance_estimate": np.nan,
+                    "selection_objective_p0": np.nan,
+                    "q_hat": np.nan,
+                    "q_tilt_tail_share": np.nan,
+                    "ess": np.nan,
+                    "n_weighted_samples": 0,
+                    "tail_hits_weighted_sample": 0,
+                    "acceptance_rate": np.nan,
+                    "weight_cv": np.nan,
+                    "objective_selected": float("inf"),
+                    "screen_rank": None,
+                    "advanced_to_final": None,
+                    "advanced_reason": None,
+                    "objective_ratio_to_best": None,
+                    "within_objective_tolerance": None,
+                    **_compute_varhat_objectives(
+                        variance_estimate=float("nan"),
+                        q_tilt_tail_share=float("nan"),
+                        q_target=float(candidate["q_scan_target"]),
+                        n_weighted_samples=0,
+                        weight_cv=float("nan"),
+                        weight_cv_penalty_scale=cfg.local_scan_weight_cv_penalty_scale,
+                    ),
+                }
+            )
+            continue
+
         res = run_mcmc_is(
             problem,
-            beta=beta,
+            beta=float(candidate["beta"]),
             sigma_t=sigma_t,
             n_steps=steps_per_chain,
             burn_in=burn_in,
             thin=cfg.local_scan_thin,
-            n_chains=cfg.local_scan_chains,
+            n_chains=int(n_chains),
             seed=seed + 10_000 * idx,
-            init="random",
+            init="observed",
             tilt_mode=str(cfg.tilt_mode),
-            proposal_size=cfg.proposal_size,
+            proposal_size=int(candidate["n_swap_pairs"]),
             estimate_variance=True,
             obm_batch_size=cfg.obm_batch_size,
         )
@@ -470,76 +571,55 @@ def _run_local_scan_stage(
             if res.snis_variance_obm is not None and np.isfinite(res.snis_variance_obm) and res.snis_variance_obm > 0.0
             else np.nan
         )
-        q_hat = float(res.tail_share_raw_sample)
-        q_log_ratio_abs = (
-            float(abs(np.log(q_hat / q_target)))
-            if q_hat > 0.0 and np.isfinite(q_hat) and q_target > 0.0 and np.isfinite(q_target)
-            else float("inf")
-        )
-        ess = float(res.ess)
-        weight_cv = float(res.weight_summary.cv)
-        n_weighted_samples = int(res.n_weighted_samples)
-        tail_hits_weighted_sample = int(res.tail_hits_weighted_sample)
         selection_objective_p0 = _snis_design_variance_objective(
             log_weights=np.asarray(res.log_weights, dtype=float),
             tail_indicators=np.asarray(res.tail_indicators, dtype=np.int8),
-            p_reference=float(p0_reference),
-            n_chains=int(cfg.local_scan_chains),
-            chain_kept_samples=int(chain_kept_samples),
+            p_reference=float(candidate["q_scan_target"]),
+            n_chains=int(n_chains),
+            chain_kept_samples=int(_kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin)),
             obm_batch_size=cfg.obm_batch_size,
         )
-        ess_guardrail_min = float(cfg.local_scan_min_ess)
-        guardrail_fail_reasons: list[str] = []
-        if not np.isfinite(selection_objective_p0) or selection_objective_p0 <= 0.0:
-            guardrail_fail_reasons.append("selection_objective_p0_nonpositive")
-        if not np.isfinite(ess) or ess < ess_guardrail_min:
-            guardrail_fail_reasons.append("ess_below_guardrail")
+        objective_values = _compute_varhat_objectives(
+            variance_estimate=var_hat,
+            q_tilt_tail_share=float(res.tail_share_raw_sample),
+            q_target=float(candidate["q_scan_target"]),
+            n_weighted_samples=int(res.n_weighted_samples),
+            weight_cv=float(res.weight_summary.cv),
+            weight_cv_penalty_scale=cfg.local_scan_weight_cv_penalty_scale,
+        )
         rows.append(
             {
+                **candidate,
                 "stage": stage,
-                "beta": float(beta),
-                "q_scan_target": q_scan_target,
-                "q_scan_target_ratio": float(q_scan_target / q_target) if q_target > 0.0 else float("nan"),
-                "q_multiplier": q_multiplier,
                 "estimate": float(res.estimate),
                 "variance_estimate": var_hat,
-                "selection_objective_p0": selection_objective_p0,
-                "q_hat": q_hat,
-                "q_log_ratio_abs": q_log_ratio_abs,
-                "ess": ess,
-                "n_weighted_samples": n_weighted_samples,
-                "tail_hits_weighted_sample": tail_hits_weighted_sample,
-                "ess_guardrail_min": ess_guardrail_min,
+                "selection_objective_p0": float(selection_objective_p0),
+                "q_hat": float(res.tail_share_raw_sample),
+                "q_tilt_tail_share": float(res.tail_share_raw_sample),
+                "ess": float(res.ess),
+                "n_weighted_samples": int(res.n_weighted_samples),
+                "tail_hits_weighted_sample": int(res.tail_hits_weighted_sample),
                 "acceptance_rate": float(res.overall_acceptance_rate),
-                "weight_cv": weight_cv,
-                "guardrail_passed": int(not guardrail_fail_reasons),
-                "guardrail_fail_reasons": guardrail_fail_reasons,
+                "weight_cv": float(res.weight_summary.cv),
+                "objective_selected": float(objective_values.get(_scan_metric_key(cfg.local_scan_objective), np.inf)),
                 "screen_rank": None,
                 "advanced_to_final": None,
                 "advanced_reason": None,
                 "objective_ratio_to_best": None,
                 "within_objective_tolerance": None,
-                "variance_ratio_to_best": None,
-                "within_variance_tolerance": None,
+                **objective_values,
             }
         )
+        final_states[str(candidate["config_id"])] = [np.asarray(state, dtype=np.int8).copy() for state in res.final_states]
 
     return {
         "rows": rows,
         "steps_per_chain": int(steps_per_chain),
         "burn_in": int(burn_in),
-        "eval_total": int(len(candidates) * _mcmc_eval_count(steps_per_chain, cfg.local_scan_chains)),
+        "eval_total": int(len(candidates) * _mcmc_eval_count(steps_per_chain, n_chains)),
         "wall_time_sec": float(time.perf_counter() - t_start),
+        "final_states": final_states,
     }
-
-
-def _count_short_chain_calls_from_history(history: list[dict[str, Any]]) -> int:
-    n = 0
-    for record in history:
-        stage = str(record.get("stage", ""))
-        if stage == "init" or stage.startswith("bracket_") or ":rep" in stage:
-            n += 1
-    return n
 
 
 def _mcmc_eval_count(n_steps: int, n_chains: int) -> int:
@@ -607,7 +687,6 @@ def local_beta_scan(
     problem: PermutationTestProblem,
     cfg: MCMCWorkflowConfig,
     *,
-    beta_center: float,
     pilot_t: np.ndarray,
     p0_for_qtarget: float,
     sigma_t: float,
@@ -623,186 +702,75 @@ def local_beta_scan(
     if not cfg.local_scan_enabled:
         return {
             "enabled": False,
-            "selected_beta": float(beta_center),
+            "selected_beta": float("nan"),
+            "selected_proposal_size": cfg.proposal_size,
             "rows": [],
             "scan_eval_total": 0,
             "scan_wall_time_sec": 0.0,
         }
-    if beta_center <= 0.0:
-        return {
-            "enabled": True,
-            "selected_beta": float(beta_center),
-            "rows": [],
-            "scan_eval_total": 0,
-            "scan_wall_time_sec": 0.0,
-            "selected_reason": "beta_center_nonpositive",
-        }
-
-    initial_q_multipliers = tuple(
-        float(mult)
-        for mult in cfg.local_scan_q_multipliers
-        if float(mult) > 0.0 and np.isfinite(float(mult))
-    )
-    initial_candidates = _build_q_scan_candidates(
+    t_start = time.perf_counter()
+    candidates = _build_q_scan_candidates(
         problem=problem,
         cfg=cfg,
-        beta_center=float(beta_center),
         pilot_t=pilot_t,
         p0_for_qtarget=float(p0_for_qtarget),
         sigma_t=float(sigma_t),
         q_target=float(q_target),
-        q_multipliers=initial_q_multipliers,
+        q_multipliers=cfg.local_scan_q_multipliers,
+        swap_counts=cfg.local_scan_swap_counts,
     )
-    if not initial_candidates:
+    if not candidates:
         return {
             "enabled": True,
-            "selected_beta": float(beta_center),
+            "selected_beta": float("nan"),
+            "selected_proposal_size": cfg.proposal_size,
             "rows": [],
             "screen_rows": [],
             "scan_eval_total": 0,
             "scan_wall_time_sec": 0.0,
             "selected_reason": "no_local_scan_candidates",
         }
-    t_start = time.perf_counter()
-
-    initial_screen = _run_local_scan_stage(
+    screen = _run_local_scan_stage(
         problem,
         cfg,
-        candidates=initial_candidates,
-        p0_reference=float(p0_for_qtarget),
+        candidates=candidates,
         sigma_t=sigma_t,
-        q_target=q_target,
         total_steps=int(cfg.local_scan_screen_total_steps),
+        n_chains=int(cfg.local_scan_screen_chains),
         seed=seed,
-        stage="screen_initial",
+        stage="screen",
     )
-    initial_rows = initial_screen["rows"]
-    initial_pool_indices, initial_used_guardrails = _local_scan_pool_indices(initial_rows)
-    ranked_initial_indices = sorted(
-        initial_pool_indices,
-        key=lambda idx: (
-            float(initial_rows[idx]["selection_objective_p0"]),
-            float(initial_rows[idx]["beta"]),
-        ),
-    )
-    if not ranked_initial_indices:
-        ranked_initial_indices = list(range(len(initial_rows)))
-    best_initial_idx = int(ranked_initial_indices[0]) if ranked_initial_indices else None
-    best_initial_q_multiplier = (
-        float(initial_rows[best_initial_idx]["q_multiplier"])
-        if best_initial_idx is not None
-        else None
-    )
-
-    refinement_q_multipliers: tuple[float, ...] = tuple()
-    refinement_candidates: list[dict[str, float]] = []
-    refinement_rows: list[dict[str, Any]] = []
-    refinement_eval_total = 0
-    refinement_wall_time_sec = 0.0
-    if best_initial_idx is not None and len(initial_candidates) >= 2:
-        refinement_q_multipliers = _refinement_q_multipliers(
-            [float(candidate["q_multiplier"]) for candidate in initial_candidates],
-            best_initial_idx,
-        )
-        refinement_candidates = _build_q_scan_candidates(
-            problem=problem,
-            cfg=cfg,
-            beta_center=float(beta_center),
-            pilot_t=pilot_t,
-            p0_for_qtarget=float(p0_for_qtarget),
-            sigma_t=float(sigma_t),
-            q_target=float(q_target),
-            q_multipliers=refinement_q_multipliers,
-            existing_betas=[float(candidate["beta"]) for candidate in initial_candidates],
-        )
-    if refinement_candidates:
-        refinement_screen = _run_local_scan_stage(
-            problem,
-            cfg,
-            candidates=refinement_candidates,
-            p0_reference=float(p0_for_qtarget),
-            sigma_t=sigma_t,
-            q_target=q_target,
-            total_steps=int(cfg.local_scan_screen_total_steps),
-            seed=seed + 500_000,
-            stage="screen_refine",
-        )
-        refinement_rows = refinement_screen["rows"]
-        refinement_eval_total = int(refinement_screen["eval_total"])
-        refinement_wall_time_sec = float(refinement_screen["wall_time_sec"])
-
-    screen_rows = list(initial_rows) + list(refinement_rows)
-    screen_pool_indices, screen_used_guardrails = _local_scan_pool_indices(screen_rows)
-    ranked_screen_indices = sorted(
-        screen_pool_indices,
-        key=lambda idx: (
-            float(screen_rows[idx]["selection_objective_p0"]),
-            float(screen_rows[idx]["beta"]),
-        ),
-    )
+    screen_rows = screen["rows"]
+    ranked_screen_indices = _rank_scan_rows(screen_rows, objective_name=cfg.local_scan_objective)
     target_finalist_count = min(int(cfg.local_scan_finalist_count), len(screen_rows))
-    if len(ranked_screen_indices) < target_finalist_count:
-        supplemental_indices = [
-            idx
-            for idx, row in enumerate(screen_rows)
-            if idx not in ranked_screen_indices
-            and np.isfinite(row["selection_objective_p0"])
-            and float(row["selection_objective_p0"]) > 0.0
-        ]
-        supplemental_indices = sorted(
-            supplemental_indices,
-            key=lambda idx: (
-                float(screen_rows[idx]["selection_objective_p0"]),
-                float(screen_rows[idx]["beta"]),
-            ),
-        )
-        ranked_screen_indices.extend(supplemental_indices)
-    if not ranked_screen_indices:
-        ranked_screen_indices = list(range(len(screen_rows)))
-
     finalist_indices = [int(idx) for idx in ranked_screen_indices[:target_finalist_count]]
-    if len(finalist_indices) < target_finalist_count:
-        for idx in range(len(screen_rows)):
-            if idx in finalist_indices:
-                continue
-            finalist_indices.append(int(idx))
-            if len(finalist_indices) >= target_finalist_count:
-                break
-
-    finalist_candidates = [
-        {
-            "beta": float(screen_rows[idx]["beta"]),
-            "q_scan_target": float(screen_rows[idx]["q_scan_target"]),
-            "q_multiplier": float(screen_rows[idx]["q_multiplier"]),
-        }
-        for idx in finalist_indices
-    ]
+    finalist_candidates = [dict(screen_rows[idx]) for idx in finalist_indices]
     for rank, idx in enumerate(ranked_screen_indices):
         screen_rows[idx]["screen_rank"] = int(rank)
-    for idx, row in enumerate(screen_rows):
-        row["advanced_to_final"] = int(idx in finalist_indices)
-        if idx in ranked_screen_indices[:target_finalist_count]:
-            row["advanced_reason"] = "screen_objective_rank"
+        screen_rows[idx]["advanced_to_final"] = int(idx in finalist_indices)
+        if idx in finalist_indices:
+            screen_rows[idx]["advanced_reason"] = "screen_objective_rank"
 
     final = _run_local_scan_stage(
         problem,
         cfg,
         candidates=finalist_candidates,
-        p0_reference=float(p0_for_qtarget),
         sigma_t=sigma_t,
-        q_target=q_target,
         total_steps=int(cfg.local_scan_total_steps),
+        n_chains=int(cfg.local_scan_chains),
         seed=seed + 1_000_000,
         stage="final",
     )
     rows = final["rows"]
-    candidate_indices, final_used_guardrails = _local_scan_pool_indices(rows)
-    if candidate_indices:
-        best_objective = float(min(float(rows[idx]["selection_objective_p0"]) for idx in candidate_indices))
+    ranked_final_indices = _rank_scan_rows(rows, objective_name=cfg.local_scan_objective)
+    metric_key = _scan_metric_key(cfg.local_scan_objective)
+    finite_final_indices = [idx for idx in ranked_final_indices if np.isfinite(rows[idx].get(metric_key, np.inf))]
+    if finite_final_indices:
+        best_objective = float(min(float(rows[idx][metric_key]) for idx in finite_final_indices))
         objective_limit = float(best_objective * cfg.local_scan_variance_near_min_ratio)
         near_min_indices: list[int] = []
-        for idx in candidate_indices:
-            objective = float(rows[idx]["selection_objective_p0"])
+        for idx in finite_final_indices:
+            objective = float(rows[idx][metric_key])
             ratio = float(objective / best_objective) if best_objective > 0.0 else float("inf")
             within_tol = bool(objective <= objective_limit)
             rows[idx]["objective_ratio_to_best"] = ratio
@@ -812,69 +780,69 @@ def local_beta_scan(
         best_idx = min(
             near_min_indices,
             key=lambda idx: (
+                int(rows[idx]["q_index"]),
+                int(rows[idx]["n_swap_pairs"]),
                 float(rows[idx]["beta"]),
-                float(rows[idx]["selection_objective_p0"]),
+                float(rows[idx][metric_key]),
             ),
         )
         selected_beta = float(rows[best_idx]["beta"])
-        selected_reason = (
-            "two_stage_smallest_beta_within_objective_tolerance"
-            if final_used_guardrails
-            else "two_stage_smallest_beta_within_objective_tolerance_no_guardrail_survivors"
-        )
+        selected_proposal_size = int(rows[best_idx]["n_swap_pairs"])
+        selected_q_multiplier = float(rows[best_idx]["q_multiplier"])
+        production_init_states = final["final_states"].get(str(rows[best_idx]["config_id"]))
+        selected_reason = "two_stage_smallest_stable_configuration"
     else:
-        selected_beta = float(beta_center)
-        selected_reason = "fallback_beta_center"
+        fallback_candidate = screen_rows[ranked_screen_indices[0]]
+        selected_beta = float(fallback_candidate["beta"]) if np.isfinite(fallback_candidate.get("beta", np.nan)) else float("nan")
+        selected_proposal_size = int(fallback_candidate["n_swap_pairs"])
+        selected_q_multiplier = float(fallback_candidate["q_multiplier"])
+        production_init_states = final["final_states"].get(str(fallback_candidate["config_id"]))
+        selected_reason = "fallback_smallest_screen_configuration"
 
     return {
         "enabled": True,
         "selected_beta": selected_beta,
+        "selected_proposal_size": int(selected_proposal_size),
+        "selected_n_swap_pairs": int(selected_proposal_size),
+        "selected_q_multiplier": float(selected_q_multiplier),
         "selected_reason": selected_reason,
         "steps_per_chain": int(final["steps_per_chain"]),
         "burn_in": int(final["burn_in"]),
-        "screen_steps_per_chain": int(initial_screen["steps_per_chain"]),
-        "screen_burn_in": int(initial_screen["burn_in"]),
-        "screen_eval_total": int(initial_screen["eval_total"] + refinement_eval_total),
+        "screen_steps_per_chain": int(screen["steps_per_chain"]),
+        "screen_burn_in": int(screen["burn_in"]),
+        "screen_eval_total": int(screen["eval_total"]),
         "final_eval_total": int(final["eval_total"]),
-        "scan_eval_total": int(initial_screen["eval_total"] + refinement_eval_total + final["eval_total"]),
+        "scan_eval_total": int(screen["eval_total"] + final["eval_total"]),
         "scan_wall_time_sec": float(time.perf_counter() - t_start),
-        "screen_wall_time_sec": float(initial_screen["wall_time_sec"] + refinement_wall_time_sec),
+        "screen_wall_time_sec": float(screen["wall_time_sec"]),
         "final_wall_time_sec": float(final["wall_time_sec"]),
         "selection_metrics": {
             "selection_rule": {
-                "type": "two_stage_smallest_beta_within_objective_tolerance",
-                "objective": "design_point_obm_p0",
+                "type": "two_stage_smallest_stable_configuration",
+                "objective": str(cfg.local_scan_objective),
                 "objective_near_min_ratio": float(cfg.local_scan_variance_near_min_ratio),
-                "preference_within_tolerance": "smaller_beta",
+                "preference_within_tolerance": "smaller_q_then_smaller_swap_then_smaller_beta",
             },
             "screening_rule": {
-                "type": "adaptive_q_ladder_single_refinement",
+                "type": "discrete_q_swap_grid",
                 "screen_total_steps": int(cfg.local_scan_screen_total_steps),
+                "screen_chains": int(cfg.local_scan_screen_chains),
                 "final_total_steps": int(cfg.local_scan_total_steps),
+                "final_chains": int(cfg.local_scan_chains),
                 "finalist_count": int(cfg.local_scan_finalist_count),
-                "screen_ranking": "smallest_design_point_obm_objective",
-                "initial_screen_used_guardrails": bool(initial_used_guardrails),
-                "screen_tail_hits_used_for_ranking": False,
-                "screen_used_guardrails": bool(screen_used_guardrails),
-                "final_used_guardrails": bool(final_used_guardrails),
+                "screen_ranking": str(cfg.local_scan_objective),
+                "reuse_finalist_state_for_production": True,
             },
             "q_ladder": {
-                "type": "adaptive_single_refinement",
+                "type": "fixed_discrete_grid",
                 "q_target_center": float(q_target),
-                "initial_q_multipliers": [float(mult) for mult in initial_q_multipliers],
-                "best_initial_q_multiplier": best_initial_q_multiplier,
-                "refinement_q_multipliers": [float(mult) for mult in refinement_q_multipliers],
-                "initial_q_candidates": [float(row["q_scan_target"]) for row in initial_candidates],
-                "refinement_q_candidates": [float(row["q_scan_target"]) for row in refinement_candidates],
-                "all_screen_q_candidates": [float(row["q_scan_target"]) for row in screen_rows],
-            },
-            "guardrails": {
-                "selection_objective_p0_positive": True,
-                "min_ess": float(cfg.local_scan_min_ess),
+                "q_multipliers": [float(mult) for mult in cfg.local_scan_q_multipliers],
+                "swap_counts": [int(v) for v in cfg.local_scan_swap_counts],
             },
         },
         "screen_rows": screen_rows,
         "rows": rows,
+        "production_init_states": production_init_states,
     }
 
 
@@ -900,51 +868,28 @@ def build_beta_workflow(
         q_target=q_target,
         beta_max=cfg.beta_max_init,
     )
-
-    tune_burn_in = _burn_in(cfg.tune_steps, cfg.tune_burn_in_fraction)
-    runner = make_short_chain_q_runner(
-        problem,
-        sigma_T=sigma_t,
-        thin=cfg.tune_thin,
-        proposal_size=cfg.proposal_size,
-        seed=seed + 1,
-    )
-    tuning = tune_beta_to_target_q(
-        run_short_chain_fn=runner,
-        init_state=problem.y_obs,
-        beta0=beta0_laplace,
-        q_target=q_target,
-        n_steps=cfg.tune_steps,
-        burn_in=tune_burn_in,
-        bracket_factor=cfg.tune_bracket_factor,
-        tol_rel=cfg.tune_tol_rel,
-        max_bracket_iter=cfg.tune_max_bracket,
-        max_bisect_iter=cfg.tune_max_bisect,
-        replicate=cfg.tune_replicate,
-        reuse_state=cfg.tune_reuse_state,
-    )
-    tuning_wall_time_sec = float(time.perf_counter() - t_start)
-    n_short_calls = _count_short_chain_calls_from_history(tuning["history"])
     pilot_eval_total = int(cfg.pilot_samples)
-    tuning_chain_eval_total = int(n_short_calls * (cfg.tune_steps + 1))
+    tuning_chain_eval_total = 0
     tuning_eval_total = int(pilot_eval_total + tuning_chain_eval_total)
-    beta_tuned = float(tuning["beta_hat"])
+    tuning_wall_time_sec = float(time.perf_counter() - t_start)
+    beta_tuned = float(beta0_laplace)
 
     if cfg.beta_override is not None:
         beta_used = float(cfg.beta_override)
         scan = {
             "enabled": False,
             "selected_beta": beta_used,
+            "selected_proposal_size": cfg.proposal_size,
             "rows": [],
             "scan_eval_total": 0,
             "scan_wall_time_sec": 0.0,
             "selected_reason": "beta_override",
+            "production_init_states": None,
         }
     else:
         scan = local_beta_scan(
             problem,
             cfg,
-            beta_center=beta_tuned,
             pilot_t=pilot_t,
             p0_for_qtarget=p0_for_qtarget,
             sigma_t=float(sigma_t),
@@ -956,18 +901,20 @@ def build_beta_workflow(
     scan_eval_total = int(scan.get("scan_eval_total", 0))
     beta_selection_eval_total = int(tuning_eval_total + scan_eval_total)
     beta_selection_wall_time_sec = float(tuning_wall_time_sec + float(scan.get("scan_wall_time_sec", 0.0)))
+    proposal_size_used = scan.get("selected_proposal_size", cfg.proposal_size)
 
     return {
         "beta0_formula": beta0_formula,
         "beta0_laplace": float(beta0_laplace),
         "beta_hat_tuned": beta_tuned,
         "beta_used": beta_used,
+        "proposal_size_used": proposal_size_used,
         "sigma_t": float(sigma_t),
         "p0_for_qtarget": p0_for_qtarget,
         "q_target": q_target,
-        "q_hat_beta_hat": float(tuning["q_hat"]),
-        "bracket_succeeded": bool(tuning["bracket_succeeded"]),
-        "n_short_chain_calls": int(n_short_calls),
+        "q_hat_beta_hat": float("nan"),
+        "bracket_succeeded": True,
+        "n_short_chain_calls": 0,
         "pilot_eval_total": pilot_eval_total,
         "tuning_chain_eval_total": tuning_chain_eval_total,
         "tuning_eval_total": int(tuning_eval_total),
@@ -985,10 +932,12 @@ def build_beta_workflow(
         },
         "beta_selection_wall_time_sec": beta_selection_wall_time_sec,
         "local_scan": scan,
-        "history_tail": tuning["history"][-5:],
-        "tune_steps": int(cfg.tune_steps),
-        "tune_burn_in": int(tune_burn_in),
+        "history_tail": [],
+        "tune_steps": 0,
+        "tune_burn_in": 0,
         "tune_thin": int(cfg.tune_thin),
+        "production_init_states": scan.get("production_init_states"),
+        "beta_selection_strategy": "pilot_only_discrete_q_swap_grid",
     }
 
 
@@ -1163,86 +1112,34 @@ def _positive_finite(value: Any) -> bool:
 
 
 def _objective_grid_penalties(row: dict[str, Any]) -> dict[str, float]:
-    tail_hits = int(row.get("tail_hits", 0))
-    acceptance_rate = float(row.get("acceptance_rate", np.nan))
     q_real = float(row.get("q_tilt_tail_share", np.nan))
     q_trial = float(row.get("q_trial", np.nan))
     n_weighted_samples = int(row.get("n_weighted_samples", 0))
-
-    p_hits = float(max(1.0, 25.0 / max(tail_hits, 1)))
-    if not np.isfinite(acceptance_rate) or acceptance_rate <= 0.0:
-        p_acc = float("inf")
-    else:
-        p_acc = float(max(1.0, 0.05 / acceptance_rate))
-    if n_weighted_samples > 0:
-        q_eps = float(max(1.0 / float(n_weighted_samples), 1e-12))
-    else:
-        q_eps = 1e-12
-    if not np.isfinite(q_real) or not np.isfinite(q_trial) or q_trial <= 0.0:
-        p_q = float("inf")
-    else:
-        p_q = float(1.0 + abs(np.log((q_real + q_eps) / (q_trial + q_eps))))
+    weight_cv = float(row.get("weight_cv", np.nan))
     return {
-        "P_hits": p_hits,
-        "P_acc": p_acc,
-        "P_q": p_q,
-        "q_eps": q_eps,
+        "P_q": _q_match_penalty(q_real, q_trial, n_weighted_samples),
+        "P_deg": _weight_cv_penalty(weight_cv, 0.25),
     }
 
 
 def score_mcmc_objective_grid_repeat_row(row: dict[str, Any]) -> dict[str, Any]:
     penalties = _objective_grid_penalties(row)
-    selobj = float(row.get("selection_objective_p0", np.nan))
     varhat = float(row.get("variance_estimate", np.nan))
-    tail_hits = int(row.get("tail_hits", 0))
-    acceptance_rate = float(row.get("acceptance_rate", np.nan))
-
-    selobj_valid = _positive_finite(selobj)
-    varhat_valid = _positive_finite(varhat)
-    base_selobj = float(selobj) if selobj_valid else float("inf")
-    base_varhat = float(varhat) if varhat_valid else float("inf")
+    base_varhat = float(varhat) if _positive_finite(varhat) else float("inf")
 
     scored = dict(row)
     scored.update(penalties)
     scored["objective_oracle_abs_log10"] = float(row.get("abs_log10_error", float("inf")))
-    scored["objective_selobj"] = base_selobj
     scored["objective_varhat"] = base_varhat
-    scored["objective_selobj_hits_soft"] = (
-        float(base_selobj * penalties["P_hits"]) if np.isfinite(base_selobj) else float("inf")
-    )
-    scored["objective_selobj_acc_soft"] = (
-        float(base_selobj * penalties["P_acc"]) if np.isfinite(base_selobj) else float("inf")
-    )
-    scored["objective_selobj_qmatch_soft"] = (
-        float(base_selobj * penalties["P_q"]) if np.isfinite(base_selobj) else float("inf")
-    )
-    scored["objective_selobj_hits_acc_soft"] = (
-        float(base_selobj * penalties["P_hits"] * penalties["P_acc"])
-        if np.isfinite(base_selobj)
-        else float("inf")
-    )
-    scored["objective_varhat_hits_soft"] = (
-        float(base_varhat * penalties["P_hits"]) if np.isfinite(base_varhat) else float("inf")
-    )
-    scored["objective_varhat_acc_soft"] = (
-        float(base_varhat * penalties["P_acc"]) if np.isfinite(base_varhat) else float("inf")
-    )
     scored["objective_varhat_qmatch_soft"] = (
         float(base_varhat * penalties["P_q"]) if np.isfinite(base_varhat) else float("inf")
     )
-    scored["objective_varhat_hits_acc_soft"] = (
-        float(base_varhat * penalties["P_hits"] * penalties["P_acc"])
+    scored["objective_varhat_degeneracy_soft"] = (
+        float(base_varhat * penalties["P_deg"]) if np.isfinite(base_varhat) else float("inf")
+    )
+    scored["objective_varhat_qmatch_degeneracy_soft"] = (
+        float(base_varhat * penalties["P_q"] * penalties["P_deg"])
         if np.isfinite(base_varhat)
-        else float("inf")
-    )
-    scored["objective_selobj_guardrailed"] = (
-        base_selobj
-        if np.isfinite(base_selobj) and tail_hits >= 25 and np.isfinite(acceptance_rate) and acceptance_rate >= 0.05
-        else float("inf")
-    )
-    scored["objective_varhat_guardrailed"] = (
-        base_varhat
-        if np.isfinite(base_varhat) and tail_hits >= 25 and np.isfinite(acceptance_rate) and acceptance_rate >= 0.05
         else float("inf")
     )
     return scored
@@ -2092,11 +1989,14 @@ def _run_single_chain_full_trace(
     sigma_t: float,
     n_steps: int,
     init: str,
+    init_state: np.ndarray | None = None,
     tilt_mode: str,
     n_swap_pairs: int,
     checkpoint_steps: tuple[int, ...],
 ) -> dict[str, Any]:
-    if init == "observed":
+    if init_state is not None:
+        y = problem.validate_labels(np.asarray(init_state, dtype=np.int8)).copy()
+    elif init == "observed":
         y = problem.y_obs.copy()
     elif init == "random":
         y = problem.sample_uniform_labels(rng)
@@ -2148,6 +2048,7 @@ def _run_single_chain_full_trace(
         "accepted_trace": accepted_trace,
         "accepted_total": int(accepted),
         "elapsed_by_step": elapsed_by_step,
+        "final_state": y.copy(),
     }
 
 
@@ -2253,6 +2154,8 @@ def _run_mcmc_cumulative_checkpoints(
     sigma_t: float,
     cfg: MCMCWorkflowConfig | BetaSweepStudyConfig,
     seed: int,
+    init_states: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
+    reuse_init_state: bool = False,
 ) -> list[dict[str, Any]]:
     checkpoints = _sorted_unique_points(checkpoints)
     if reported_checkpoints is None:
@@ -2273,7 +2176,15 @@ def _run_mcmc_cumulative_checkpoints(
 
     seed_seq = np.random.SeedSequence(seed)
     traces: list[dict[str, Any]] = []
-    for ss in seed_seq.spawn(cfg.chains):
+    spawned = seed_seq.spawn(cfg.chains)
+    normalized_init_states: list[np.ndarray | None]
+    if init_states is None:
+        normalized_init_states = [None] * int(cfg.chains)
+    else:
+        if len(init_states) != int(cfg.chains):
+            raise ValueError("init_states length must match cfg.chains.")
+        normalized_init_states = [np.asarray(state, dtype=np.int8).copy() for state in init_states]
+    for chain_idx, ss in enumerate(spawned):
         rng = np.random.default_rng(ss)
         traces.append(
             _run_single_chain_full_trace(
@@ -2282,7 +2193,8 @@ def _run_mcmc_cumulative_checkpoints(
                 beta=beta,
                 sigma_t=sigma_t,
                 n_steps=max_steps_per_chain,
-                init="random",
+                init="random" if normalized_init_states[chain_idx] is None else "observed",
+                init_state=normalized_init_states[chain_idx],
                 tilt_mode=str(cfg.tilt_mode),
                 n_swap_pairs=n_swap_pairs,
                 checkpoint_steps=unique_step_checkpoints,
@@ -2292,7 +2204,7 @@ def _run_mcmc_cumulative_checkpoints(
     rows: list[dict[str, Any]] = []
     for checkpoint, report_checkpoint in zip(checkpoints, reported_checkpoints):
         steps_per_chain = steps_per_checkpoint[int(checkpoint)]
-        burn_in = _burn_in(steps_per_chain, cfg.burn_in_fraction)
+        burn_in = 0 if reuse_init_state else _burn_in(steps_per_chain, cfg.burn_in_fraction)
         row = _mcmc_prefix_row(
                 exact_p=exact_p,
                 checkpoint=int(report_checkpoint),
@@ -2309,6 +2221,8 @@ def _run_mcmc_cumulative_checkpoints(
             )
         row["mcmc_chain_budget"] = int(checkpoint)
         row["mcmc_reported_budget"] = int(report_checkpoint)
+        row["state_reused_init"] = int(reuse_init_state)
+        row["burn_in"] = int(burn_in)
         rows.append(row)
     return rows
 
@@ -2449,6 +2363,10 @@ def _mcmc_cross_replicate_worker(
     rep: int,
     rep_seed: int,
 ) -> list[dict[str, Any]]:
+    worker_cfg = replace(
+        mcmc_cfg,
+        proposal_size=beta_workflow.get("proposal_size_used", mcmc_cfg.proposal_size),
+    )
     rows = _run_mcmc_cumulative_checkpoints(
         problem,
         exact_p,
@@ -2456,8 +2374,10 @@ def _mcmc_cross_replicate_worker(
         reported_checkpoints=checkpoints,
         beta=float(beta_workflow["beta_used"]),
         sigma_t=float(beta_workflow["sigma_t"]),
-        cfg=mcmc_cfg,
+        cfg=worker_cfg,
         seed=rep_seed + 1,
+        init_states=beta_workflow.get("production_init_states"),
+        reuse_init_state=beta_workflow.get("production_init_states") is not None,
     )
     for row in rows:
         row["scenario"] = scenario_key
@@ -2465,6 +2385,14 @@ def _mcmc_cross_replicate_worker(
         row["replicate"] = int(rep)
         row["beta_selection_budget"] = int(beta_selection_budget)
         row["eval_incl_tuning"] = float(int(row["mcmc_chain_budget"]) + beta_selection_budget)
+        row["proposal_size"] = worker_cfg.proposal_size
+        row["n_swap_pairs"] = int(
+            resolve_n_swap_pairs(
+                problem.n_treated,
+                problem.n_control,
+                proposal_size=worker_cfg.proposal_size,
+            )
+        )
     return rows
 
 
@@ -2752,6 +2680,7 @@ def run_cross_method_study(
     return {
         "scenario": scenario.key,
         "scenario_display": scenario.description,
+        "scenario_portfolio": dict(scenario.portfolio),
         "exact_p": float(scenario.exact_p),
         "exact_method": scenario.exact_method,
         "exact_tail_hits": int(scenario.exact_tail_hits),
@@ -3187,6 +3116,8 @@ def save_cross_method_outputs(
         seed=int(cross_cfg.base_seed + 30_000),
         save_path=output_dir / "iid_density.png",
     )
+    beta_workflow_payload = dict(study["beta_workflow"])
+    beta_workflow_payload.pop("production_init_states", None)
     write_jsonl(output_dir / "run_records.jsonl", study["records"])
     write_json(output_dir / "summary.json", study["summary"])
     write_json(
@@ -3194,6 +3125,7 @@ def save_cross_method_outputs(
         {
             "scenario": study["scenario"],
             "scenario_display": study["scenario_display"],
+            "scenario_portfolio": study.get("scenario_portfolio", {}),
             "exact_p": study["exact_p"],
             "exact_method": study["exact_method"],
             "exact_tail_hits": study["exact_tail_hits"],
@@ -3202,7 +3134,7 @@ def save_cross_method_outputs(
             "cross_config": cross_cfg,
             "mcmc_config": mcmc_cfg,
             "samc_config": samc_cfg,
-            "beta_workflow": study["beta_workflow"],
+            "beta_workflow": beta_workflow_payload,
             "samc_setup": study["samc_setup"],
             "iid_density_summary": study["iid_density_summary"],
         },

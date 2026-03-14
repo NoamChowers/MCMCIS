@@ -13,5 +13,20 @@
   "tail_hits": 1120,
   "n_permutations": 137846528820,
   "notes": "DP over treated weighted sums mapped exactly to difference in means.",
-  "extra": {}
+  "extra": {},
+  "portfolio": {
+    "family": "linear_stat_dp",
+    "statistic_family": "linear_statistic",
+    "data_family": "nonlinear_numeric",
+    "rarity_band": "ultra_rare",
+    "expected_difficulty": "hard",
+    "sample_size_band": "medium",
+    "has_ties": false,
+    "is_discrete": false,
+    "groups": [
+      "core_claim",
+      "stress_test",
+      "exploratory_exact"
+    ]
+  }
 }

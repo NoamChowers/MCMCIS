@@ -17,5 +17,20 @@
     "swap_from_extreme": 2,
     "n": 22,
     "n_treated": 11
+  },
+  "portfolio": {
+    "family": "welch_bruteforce",
+    "statistic_family": "nonlinear_statistic",
+    "data_family": "ordered_numeric",
+    "rarity_band": "very_rare",
+    "expected_difficulty": "hard",
+    "sample_size_band": "small",
+    "has_ties": false,
+    "is_discrete": false,
+    "groups": [
+      "exploratory_exact",
+      "core_claim",
+      "stress_test"
+    ]
   }
 }

@@ -126,12 +126,8 @@ def build_cross_method_notebook() -> dict:
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
             OUTPUT_ROOT = project_root / "results" / "cross_method_notebook"
 
-            SCENARIO_KEYS_TO_RUN = [
-                "hypergeom_1e7",
-                "gwas_additive_score_n40",
-                "linear_stat_dp_n40",
-                "bruteforce_welch_nonextreme_n22",
-            ]
+            SCENARIO_GROUP = "core_claim"
+            SCENARIO_KEYS_OVERRIDE = None
 
             ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
             N_REPEATS = 7 if not FAST_MODE else 2
@@ -151,11 +147,11 @@ def build_cross_method_notebook() -> dict:
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
                 tune_steps=2_000 if not FAST_MODE else 1_000,
                 local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=64_000 if not FAST_MODE else 6_000,
+                local_scan_total_steps=32_000 if not FAST_MODE else 6_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_size=0.1,
+                proposal_size=0.075,
             )
             samc_cfg = SAMCWorkflowConfig(
                 n_bins=50,
@@ -167,7 +163,8 @@ def build_cross_method_notebook() -> dict:
 
             print(json.dumps({
                 "FAST_MODE": FAST_MODE,
-                "SCENARIO_KEYS_TO_RUN": SCENARIO_KEYS_TO_RUN,
+                "SCENARIO_GROUP": SCENARIO_GROUP,
+                "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
                 "ESTIMATION_POINTS": ESTIMATION_POINTS,
                 "N_REPEATS": N_REPEATS,
                 "N_JOBS": N_JOBS,
@@ -180,7 +177,8 @@ def build_cross_method_notebook() -> dict:
             """
             scenarios = load_selected_scenarios(
                 catalog_path=CATALOG_PATH,
-                scenario_keys=SCENARIO_KEYS_TO_RUN,
+                scenario_keys=SCENARIO_KEYS_OVERRIDE,
+                portfolio_group=None if SCENARIO_KEYS_OVERRIDE is not None else SCENARIO_GROUP,
                 min_tail_states=MIN_TAIL_STATES,
             )
 
@@ -193,6 +191,10 @@ def build_cross_method_notebook() -> dict:
                     "tail_hits": s.exact_tail_hits,
                     "n_perm": s.exact_n_perm,
                     "exact_method": s.exact_method,
+                    "family": s.portfolio.get("family"),
+                    "rarity_band": s.portfolio.get("rarity_band"),
+                    "difficulty": s.portfolio.get("expected_difficulty"),
+                    "groups": ",".join(s.portfolio.get("groups", [])),
                 }
                 for s in scenarios
             ])
@@ -250,6 +252,30 @@ def build_cross_method_notebook() -> dict:
                     "mean_zero_rate",
                     "mean_samc_max_rel_freq_error",
                 ]])
+
+            family_rows = []
+            for scenario in scenarios:
+                meta = scenario.portfolio
+                for row in cross_results[scenario.key]["summary"]:
+                    family_rows.append({
+                        "scenario": scenario.key,
+                        "family": meta.get("family"),
+                        "rarity_band": meta.get("rarity_band"),
+                        "difficulty": meta.get("expected_difficulty"),
+                        **row,
+                    })
+
+            family_df = pd.DataFrame(family_rows)
+            display(
+                family_df.groupby(["family", "rarity_band", "method", "checkpoint"], as_index=False)
+                .agg(
+                    mean_rmse=("rmse", "mean"),
+                    mean_estimate=("mean_estimate", "mean"),
+                    mean_q_tilt_tail_share=("mean_q_tilt_tail_share", "mean"),
+                    mean_ess=("mean_ess", "mean"),
+                )
+                .sort_values(["family", "rarity_band", "checkpoint", "method"])
+            )
             """
         ),
         markdown_cell("## Review Saved Figures"),
@@ -323,12 +349,8 @@ def build_beta_notebook() -> dict:
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
             OUTPUT_ROOT = project_root / "results" / "mcmcis_beta_notebook"
 
-            SCENARIO_KEYS_TO_RUN = [
-                "hypergeom_1e7",
-                "gwas_additive_score_n40",
-                "linear_stat_dp_n40",
-                "bruteforce_welch_nonextreme_n22",
-            ]
+            SCENARIO_GROUP = "stress_test"
+            SCENARIO_KEYS_OVERRIDE = None
             ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (2_000, 10_000, 20_000)
             BETA_MULTIPLIERS = (0.5, 0.75, 1.00, 1.25, 1.5)
             BETA_REPEATS = 5 if not FAST_MODE else 2
@@ -340,11 +362,11 @@ def build_beta_notebook() -> dict:
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
                 tune_steps=2_000 if not FAST_MODE else 1_000,
                 local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=64_000 if not FAST_MODE else 6_000,
+                local_scan_total_steps=32_000 if not FAST_MODE else 6_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_size=0.1,
+                proposal_size=0.075,
             )
             beta_cfg = BetaSweepStudyConfig(
                 estimation_points=ESTIMATION_POINTS,
@@ -360,7 +382,8 @@ def build_beta_notebook() -> dict:
 
             print(json.dumps({
                 "FAST_MODE": FAST_MODE,
-                "SCENARIO_KEYS_TO_RUN": SCENARIO_KEYS_TO_RUN,
+                "SCENARIO_GROUP": SCENARIO_GROUP,
+                "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
                 "ESTIMATION_POINTS": ESTIMATION_POINTS,
                 "BETA_MULTIPLIERS": BETA_MULTIPLIERS,
                 "BETA_REPEATS": BETA_REPEATS,
@@ -374,7 +397,8 @@ def build_beta_notebook() -> dict:
             """
             scenarios = load_selected_scenarios(
                 catalog_path=CATALOG_PATH,
-                scenario_keys=SCENARIO_KEYS_TO_RUN,
+                scenario_keys=SCENARIO_KEYS_OVERRIDE,
+                portfolio_group=None if SCENARIO_KEYS_OVERRIDE is not None else SCENARIO_GROUP,
                 min_tail_states=MIN_TAIL_STATES,
             )
 
@@ -387,6 +411,9 @@ def build_beta_notebook() -> dict:
                     "tail_hits": s.exact_tail_hits,
                     "n_perm": s.exact_n_perm,
                     "exact_method": s.exact_method,
+                    "family": s.portfolio.get("family"),
+                    "rarity_band": s.portfolio.get("rarity_band"),
+                    "difficulty": s.portfolio.get("expected_difficulty"),
                 }
                 for s in scenarios
             ])
@@ -524,17 +551,14 @@ def build_mcmc_objective_grid_notebook() -> dict:
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
             OUTPUT_ROOT = project_root / "results" / "mcmcis_objective_grid"
 
-            SCENARIO_KEYS_TO_RUN = [
-                "hypergeom_1e7",
-                "gwas_additive_score_n40",
-                "linear_stat_dp_n40",
-                "bruteforce_welch_nonextreme_n22",
-            ]
+            SCENARIO_GROUP = "exploratory_exact"
+            SCENARIO_KEYS_OVERRIDE = None
 
             Q_MULTIPLIERS = DEFAULT_MCMC_OBJECTIVE_GRID_Q_MULTIPLIERS
             N_SWAP_PAIRS = DEFAULT_MCMC_OBJECTIVE_GRID_SWAP_COUNTS
             TRIAL_REPEATS = 5 if not FAST_MODE else 2
             TRIAL_BUDGET = 200_000 if not FAST_MODE else 20_000
+            EXTRA_TRIAL_BUDGETS = tuple()
             Q_FLOOR = 1e-12
             N_JOBS = min(os.cpu_count() or 1, len(Q_MULTIPLIERS) * len(N_SWAP_PAIRS) * TRIAL_REPEATS)
             MIN_TAIL_STATES = 2
@@ -550,16 +574,18 @@ def build_mcmc_objective_grid_notebook() -> dict:
                 estimate_variance=True,
                 obm_batch_size=None,
                 tilt_mode="smooth_hinge",
-                proposal_size=0.1,
+                proposal_size=0.075,
             )
 
             NOTEBOOK_CONFIG = {
                 "FAST_MODE": FAST_MODE,
-                "SCENARIO_KEYS_TO_RUN": SCENARIO_KEYS_TO_RUN,
+                "SCENARIO_GROUP": SCENARIO_GROUP,
+                "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
                 "Q_MULTIPLIERS": Q_MULTIPLIERS,
                 "N_SWAP_PAIRS": N_SWAP_PAIRS,
                 "TRIAL_REPEATS": TRIAL_REPEATS,
                 "TRIAL_BUDGET": TRIAL_BUDGET,
+                "EXTRA_TRIAL_BUDGETS": EXTRA_TRIAL_BUDGETS,
                 "Q_FLOOR": Q_FLOOR,
                 "N_JOBS": N_JOBS,
                 "BASE_SEED": BASE_SEED,
@@ -683,7 +709,8 @@ def build_mcmc_objective_grid_notebook() -> dict:
             """
             scenarios = load_selected_scenarios(
                 catalog_path=CATALOG_PATH,
-                scenario_keys=SCENARIO_KEYS_TO_RUN,
+                scenario_keys=SCENARIO_KEYS_OVERRIDE,
+                portfolio_group=None if SCENARIO_KEYS_OVERRIDE is not None else SCENARIO_GROUP,
                 min_tail_states=MIN_TAIL_STATES,
             )
 
@@ -696,6 +723,10 @@ def build_mcmc_objective_grid_notebook() -> dict:
                     "tail_hits": s.exact_tail_hits,
                     "n_perm": s.exact_n_perm,
                     "exact_method": s.exact_method,
+                    "family": s.portfolio.get("family"),
+                    "rarity_band": s.portfolio.get("rarity_band"),
+                    "difficulty": s.portfolio.get("expected_difficulty"),
+                    "groups": ",".join(s.portfolio.get("groups", [])),
                 }
                 for s in scenarios
             ])
@@ -725,6 +756,8 @@ def build_mcmc_objective_grid_notebook() -> dict:
 
                 objective_winners_df = pd.DataFrame(grid_study["objective_winners"]).sort_values(["objective_kind", "objective_name"])
                 objective_winners_df["scenario_key"] = scenario.key
+                objective_winners_df["family"] = scenario.portfolio.get("family")
+                objective_winners_df["rarity_band"] = scenario.portfolio.get("rarity_band")
                 cross_scenario_objective_rows.extend(objective_winners_df.to_dict(orient="records"))
 
                 scenario_dir = (run_dir / scenario.key) if (SAVE_OUTPUTS and run_dir is not None) else None
@@ -768,8 +801,10 @@ def build_mcmc_objective_grid_notebook() -> dict:
                     "q_trial",
                     "mean_oracle_rmse",
                     "mean_oracle_abs_log10",
-                    "mean_objective_selobj",
                     "mean_objective_varhat",
+                    "mean_objective_varhat_qmatch_soft",
+                    "mean_objective_varhat_degeneracy_soft",
+                    "mean_objective_varhat_qmatch_degeneracy_soft",
                     "mean_tail_hits",
                     "mean_acceptance_rate",
                     "mean_ess",
@@ -797,8 +832,18 @@ def build_mcmc_objective_grid_notebook() -> dict:
             realistic_cross_scenario_df = cross_scenario_df[cross_scenario_df["objective_kind"] == "realistic"].copy()
             leaderboard_df = build_cross_scenario_leaderboard(cross_scenario_objective_rows)
             display(leaderboard_df)
+            display(
+                realistic_cross_scenario_df.groupby(["family", "rarity_band", "objective_name"], as_index=False)
+                .agg(
+                    mean_fuzzy_similarity=("oracle_fuzzy_similarity", "mean"),
+                    exact_match_count=("oracle_exact_match", "sum"),
+                )
+                .sort_values(["family", "rarity_band", "objective_name"])
+            )
             display(realistic_cross_scenario_df.sort_values(["objective_name", "scenario_key"])[[
                 "scenario_key",
+                "family",
+                "rarity_band",
                 "objective_name",
                 "config_id",
                 "q_multiplier",
@@ -853,6 +898,42 @@ def build_mcmc_objective_grid_notebook() -> dict:
             #     display(pd.DataFrame(saved["objective_seed_noise_payload"]["objective_seed_noise"]).head())
             # else:
             #     print("Set RELOAD_GRID_DIR to a saved objective-grid scenario directory to inspect saved results.")
+            """
+        ),
+        markdown_cell("## Optional Lower-Budget Selector Stress Test"),
+        code_cell(
+            """
+            # Set EXTRA_TRIAL_BUDGETS above to something like (100_000, 50_000) to rerun the
+            # same objective grid at smaller scan budgets and compare whether the realistic
+            # objective ranking remains stable.
+            if EXTRA_TRIAL_BUDGETS:
+                budget_leaderboards = {}
+                for extra_budget in EXTRA_TRIAL_BUDGETS:
+                    rows = []
+                    for scenario_idx, scenario in enumerate(scenarios):
+                        study_seed = BASE_SEED + 200_000 + 10_000 * (scenario_idx + 1) + int(extra_budget)
+                        rerun = run_mcmc_objective_grid_study(
+                            scenario.problem,
+                            scenario.exact_p,
+                            mcmc_cfg=mcmc_cfg,
+                            trial_repeats=TRIAL_REPEATS,
+                            trial_budget=int(extra_budget),
+                            base_seed=study_seed,
+                            q_multipliers=Q_MULTIPLIERS,
+                            n_swap_pairs_values=N_SWAP_PAIRS,
+                            q_floor=Q_FLOOR,
+                            n_jobs=N_JOBS,
+                        )
+                        df = pd.DataFrame(rerun["objective_winners"])
+                        df["scenario_key"] = scenario.key
+                        rows.extend(df.to_dict(orient="records"))
+                    budget_leaderboards[int(extra_budget)] = build_cross_scenario_leaderboard(rows)
+
+                for budget, leaderboard in budget_leaderboards.items():
+                    print(f"\\nTrial budget = {budget:,}")
+                    display(leaderboard)
+            else:
+                print("Set EXTRA_TRIAL_BUDGETS to rerun the objective grid at smaller scan budgets.")
             """
         ),
     ]

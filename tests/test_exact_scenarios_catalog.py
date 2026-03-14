@@ -3,6 +3,7 @@ import numpy as np
 from perm_pval.experiments.exact_scenarios import (
     _make_gwas_additive_score_scenario,
     _make_zero_inflated_poisson_diffmeans_scenario,
+    build_exact_scenarios,
     load_saved_exact_scenarios,
     save_exact_scenarios,
 )
@@ -40,3 +41,16 @@ def test_catalog_roundtrip_supports_new_linear_dp_scenarios(tmp_path):
     assert sorted(by_key) == ["gwas_additive_score_n40", "zip_diffmeans_righttail_n40"]
     assert by_key["gwas_additive_score_n40"].statistic_name == "treated_sum"
     assert by_key["zip_diffmeans_righttail_n40"].statistic_name == "difference_in_means"
+    assert by_key["gwas_additive_score_n40"].portfolio["family"] == "gwas_additive_score"
+    assert "exploratory_exact" in by_key["zip_diffmeans_righttail_n40"].portfolio["groups"]
+
+
+def test_build_exact_scenarios_emits_portfolio_groups():
+    scenarios = build_exact_scenarios()
+    by_key = {scenario.key: scenario for scenario in scenarios}
+
+    assert "hypergeom_1e7" in by_key
+    assert "linear_stat_dp_cube_n40" in by_key
+    assert "exploratory_exact" in by_key["hypergeom_1e7"].portfolio["groups"]
+    assert "core_claim" in by_key["linear_stat_dp_n40"].portfolio["groups"]
+    assert by_key["bruteforce_welch_nonextreme_n22"].portfolio["family"] == "welch_bruteforce"

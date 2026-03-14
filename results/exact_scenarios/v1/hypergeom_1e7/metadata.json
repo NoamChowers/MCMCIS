@@ -19,5 +19,20 @@
     "m_success": 15,
     "k_obs": 15,
     "dp_cross_check_p": 3.8542863904376695e-07
+  },
+  "portfolio": {
+    "family": "hypergeometric_tail",
+    "statistic_family": "binary_count",
+    "data_family": "binary",
+    "rarity_band": "extreme",
+    "expected_difficulty": "hard",
+    "sample_size_band": "medium",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact",
+      "core_claim",
+      "stress_test"
+    ]
   }
 }

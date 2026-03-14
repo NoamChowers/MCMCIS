@@ -22,5 +22,18 @@
     "seed": 20260228,
     "mean_pois2": 2.03,
     "mean_pois3": 3.25
+  },
+  "portfolio": {
+    "family": "poisson_count",
+    "statistic_family": "linear_statistic",
+    "data_family": "count",
+    "rarity_band": "extreme",
+    "expected_difficulty": "moderate",
+    "sample_size_band": "large",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact"
+    ]
   }
 }

@@ -49,6 +49,7 @@ class MCMCISResult:
     t_samples: np.ndarray
     log_weights: np.ndarray
     tail_indicators: np.ndarray
+    final_states: list[np.ndarray]
 
 
 def right_tail_deficit(t: float, t_obs: float) -> float:
@@ -105,13 +106,16 @@ def _run_single_chain(
     n_steps: int,
     burn_in: int,
     thin: int,
-    init: str,
+    init_mode: str,
+    init_state: np.ndarray | None,
     tilt_mode: Literal["smooth_hinge", "step"],
     n_swap_pairs: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    if init == "observed":
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, np.ndarray]:
+    if init_state is not None:
+        y = problem.validate_labels(np.asarray(init_state, dtype=np.int8)).copy()
+    elif init_mode == "observed":
         y = problem.y_obs.copy()
-    elif init == "random":
+    elif init_mode == "random":
         y = problem.sample_uniform_labels(rng)
     else:
         raise ValueError("init must be either 'observed' or 'random'.")
@@ -156,6 +160,7 @@ def _run_single_chain(
         np.asarray(tail_indicators, dtype=np.int8),
         accepted,
         proposals,
+        y.copy(),
     )
 
 
@@ -169,7 +174,7 @@ def run_mcmc_is(
     thin: int = 1,
     n_chains: int = 1,
     seed: Optional[int] = None,
-    init: str = "random",
+    init: str | np.ndarray | list[np.ndarray] | tuple[np.ndarray, ...] = "random",
     tilt_mode: Literal["smooth_hinge", "step"] = "smooth_hinge",
     proposal_size: float | int = 0.075,
     estimate_variance: bool = True,
@@ -225,6 +230,24 @@ def run_mcmc_is(
         proposal_size=proposal_size,
     )
 
+    init_mode = "random"
+    init_states: list[np.ndarray | None]
+    if isinstance(init, str):
+        if init not in {"observed", "random"}:
+            raise ValueError("init must be 'observed', 'random', or explicit chain state(s).")
+        init_mode = init
+        init_states = [None] * int(n_chains)
+    elif isinstance(init, (list, tuple)):
+        if len(init) != int(n_chains):
+            raise ValueError("Explicit init state list must match n_chains.")
+        init_states = [problem.validate_labels(np.asarray(state, dtype=np.int8)).copy() for state in init]
+        init_mode = "random"
+    else:
+        if int(n_chains) != 1:
+            raise ValueError("A single explicit init state can only be used when n_chains == 1.")
+        init_states = [problem.validate_labels(np.asarray(init, dtype=np.int8)).copy()]
+        init_mode = "random"
+
     seed_seq = np.random.SeedSequence(seed)
     child_seqs = seed_seq.spawn(n_chains)
 
@@ -234,15 +257,16 @@ def run_mcmc_is(
     chain_diagnostics: list[MCMCChainDiagnostics] = []
     acceptance_rates: list[float] = []
     chain_seeds: list[int] = []
+    final_states: list[np.ndarray] = []
 
     total_accepted = 0
     total_proposals = 0
 
-    for ss in child_seqs:
+    for chain_idx, ss in enumerate(child_seqs):
         chain_seed = int(ss.generate_state(1)[0])
         chain_seeds.append(chain_seed)
         rng = np.random.default_rng(ss)
-        t_chain, q_chain, tail_chain, n_accepted, n_prop = _run_single_chain(
+        t_chain, q_chain, tail_chain, n_accepted, n_prop, y_final = _run_single_chain(
             problem=problem,
             rng=rng,
             beta=beta,
@@ -250,13 +274,15 @@ def run_mcmc_is(
             n_steps=n_steps,
             burn_in=burn_in,
             thin=thin,
-            init=init,
+            init_mode=init_mode,
+            init_state=init_states[chain_idx],
             tilt_mode=tilt_mode,
             n_swap_pairs=n_swap_pairs,
         )
         all_t_samples.append(t_chain)
         all_q_samples.append(q_chain)
         all_tail.append(tail_chain)
+        final_states.append(y_final)
 
         acceptance = n_accepted / n_prop
         acceptance_rates.append(float(acceptance))
@@ -347,4 +373,5 @@ def run_mcmc_is(
         t_samples=t_samples,
         log_weights=log_weights,
         tail_indicators=tail_indicators,
+        final_states=final_states,
     )
