@@ -269,6 +269,11 @@ res = run_mcmc_is(
 
 Important: production estimator uses only frozen-beta production samples.
 
+TODO:
+- Investigate reusing fixed-beta local-scan samples in the final p-value estimator by carrying forward per-sample (or aggregated numerator/denominator) importance weights for the beta that generated each sample.
+- This is different from reusing a state across beta values as if it were already stationary for a new beta. Reweighting can make past samples usable for estimating `p`, but does not by itself justify zero-burn-in continuation under a different production beta.
+- Current implementation does not do this; non-selected beta/configuration runs are used for selection only, and only the selected configuration's terminal states are reused for production initialization.
+
 ### 7.2 Non-tuning mode (beta passed explicitly)
 
 Use this for controlled diagnostics/ablation (e.g., beta sweep).
