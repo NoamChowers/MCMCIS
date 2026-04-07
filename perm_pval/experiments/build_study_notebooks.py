@@ -147,6 +147,7 @@ def build_cross_method_notebook() -> dict:
                 "medium": 1,
                 "large": 2,
             }
+            MCMC_LOCAL_SCAN_Q_MULTIPLIERS = (0.001, 0.005, 0.01, 0.05, 0.10, 0.15, 0.25, 0.33, 1.0)
 
             cross_cfg = CrossMethodStudyConfig(
                 estimation_points=ESTIMATION_POINTS,
@@ -166,6 +167,7 @@ def build_cross_method_notebook() -> dict:
                 estimate_variance=True,
                 proposal_size=1,
                 local_scan_objective=MCMC_LOCAL_SCAN_OBJECTIVE,
+                local_scan_q_multipliers=MCMC_LOCAL_SCAN_Q_MULTIPLIERS,
             )
             samc_cfg = SAMCWorkflowConfig(
                 n_bins=100,
@@ -197,6 +199,7 @@ def build_cross_method_notebook() -> dict:
                 "N_JOBS": N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
                 "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+                "MCMC_LOCAL_SCAN_Q_MULTIPLIERS": MCMC_LOCAL_SCAN_Q_MULTIPLIERS,
                 "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
             }, indent=2))
             """
