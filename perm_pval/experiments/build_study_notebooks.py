@@ -46,6 +46,7 @@ def _common_setup_code() -> str:
     return """
     from __future__ import annotations
 
+    from dataclasses import replace
     import json
     import os
     import sys
@@ -127,39 +128,65 @@ def build_cross_method_notebook() -> dict:
             OUTPUT_ROOT = project_root / "results" / "cross_method_notebook"
 
             SCENARIO_GROUP = "core_claim"
-            SCENARIO_KEYS_OVERRIDE = None
+            SCENARIO_KEYS_OVERRIDE = [
+                "hypergeom_1e7",
+                "gwas_additive_score_n40",
+                "rank_sum_dp_n40",
+                "linear_stat_dp_n40",
+                "bruteforce_welch_nonextreme_n22",
+            ]
 
-            ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
-            N_REPEATS = 7 if not FAST_MODE else 2
+            ESTIMATION_POINTS = (750_000, 1_000_000, 2_500_000, 5_000_000, 7_500_000, 10_000_000, 15_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
+            N_REPEATS = 10 if not FAST_MODE else 2
             N_JOBS = min(N_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
             BASE_SEED = 12_345
+            MCMC_LOCAL_SCAN_OBJECTIVE = "varhat_qmatch_soft"
+            MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND = {
+                "small": 1,
+                "medium": 1,
+                "large": 2,
+            }
 
             cross_cfg = CrossMethodStudyConfig(
                 estimation_points=ESTIMATION_POINTS,
                 repeats=N_REPEATS,
                 base_seed=BASE_SEED,
-                iid_density_samples=120_000 if not FAST_MODE else 10_000,
+                iid_density_samples=150_000 if not FAST_MODE else 10_000,
                 min_tail_states=MIN_TAIL_STATES,
                 n_jobs=N_JOBS,
             )
-            mcmc_cfg = MCMCWorkflowConfig(
-                pilot_samples=20_000 if not FAST_MODE else 1_000,
-                tune_steps=2_000 if not FAST_MODE else 1_000,
-                local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
+            base_mcmc_cfg = MCMCWorkflowConfig(
+                pilot_samples=25_000 if not FAST_MODE else 1_000,
+                tune_steps=3_000 if not FAST_MODE else 1_000,
+                local_scan_screen_total_steps=14_000 if not FAST_MODE else 1_000,
                 local_scan_total_steps=32_000 if not FAST_MODE else 6_000,
                 chains=2,
                 thin=1,
                 estimate_variance=True,
-                proposal_size=0.075,
+                proposal_size=1,
+                local_scan_objective=MCMC_LOCAL_SCAN_OBJECTIVE,
             )
             samc_cfg = SAMCWorkflowConfig(
-                n_bins=50,
+                n_bins=100,
                 t0=1_000.0,
                 trace_every=200 if not FAST_MODE else 50,
                 lambda_min_pilot=10_000 if not FAST_MODE else 500,
                 proposal_size=0.1,
             )
+
+            def mcmc_proposal_size_for_scenario(scenario):
+                band = str(scenario.portfolio.get("sample_size_band", "medium"))
+                return int(MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
+
+
+            def mcmc_cfg_for_scenario(scenario):
+                proposal_size = int(mcmc_proposal_size_for_scenario(scenario))
+                return replace(
+                    base_mcmc_cfg,
+                    proposal_size=proposal_size,
+                    local_scan_swap_counts=(proposal_size,),
+                )
 
             print(json.dumps({
                 "FAST_MODE": FAST_MODE,
@@ -169,6 +196,8 @@ def build_cross_method_notebook() -> dict:
                 "N_REPEATS": N_REPEATS,
                 "N_JOBS": N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
+                "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+                "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
             }, indent=2))
             """
         ),
@@ -215,11 +244,19 @@ def build_cross_method_notebook() -> dict:
             cross_results = {}
 
             for scenario in scenarios:
+                scenario_mcmc_cfg = mcmc_cfg_for_scenario(scenario)
                 print(f"Running {scenario.key} | exact p={scenario.exact_p:.3e}")
+                print(json.dumps({
+                    "scenario": scenario.key,
+                    "sample_size_band": scenario.portfolio.get("sample_size_band"),
+                    "mcmc_proposal_size": scenario_mcmc_cfg.proposal_size,
+                    "mcmc_local_scan_swap_counts": scenario_mcmc_cfg.local_scan_swap_counts,
+                    "mcmc_local_scan_objective": scenario_mcmc_cfg.local_scan_objective,
+                }, indent=2))
                 study = run_cross_method_study(
                     scenario,
                     cross_cfg=cross_cfg,
-                    mcmc_cfg=mcmc_cfg,
+                    mcmc_cfg=scenario_mcmc_cfg,
                     samc_cfg=samc_cfg,
                 )
                 cross_results[scenario.key] = study
@@ -230,7 +267,7 @@ def build_cross_method_notebook() -> dict:
                         study,
                         output_dir=run_dir / scenario.key,
                         cross_cfg=cross_cfg,
-                        mcmc_cfg=mcmc_cfg,
+                        mcmc_cfg=scenario_mcmc_cfg,
                         samc_cfg=samc_cfg,
                     )
 
