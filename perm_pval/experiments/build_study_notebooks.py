@@ -132,11 +132,11 @@ def build_cross_method_notebook() -> dict:
 
             SCENARIO_GROUP = "core_claim"
             SCENARIO_KEYS_OVERRIDE = [
-                "hypergeom_1e7",
-                "gwas_additive_score_n40",
-                "rank_sum_dp_n40",
                 "linear_stat_dp_n40",
+                "gwas_additive_score_n40",
+                "hypergeom_1e7",
                 "bruteforce_welch_nonextreme_n22",
+                "rank_sum_dp_n40",
             ]
 
             ESTIMATION_POINTS = (750_000, 1_000_000, 2_500_000, 5_000_000, 7_500_000, 10_000_000, 15_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
