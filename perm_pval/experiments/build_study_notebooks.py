@@ -67,6 +67,7 @@ def _common_setup_code() -> str:
     project_root = find_project_root()
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
+    os.environ.setdefault("MPLCONFIGDIR", str(project_root / ".matplotlib"))
 
     from perm_pval.experiments.notebook_studies import (
         BetaSweepStudyConfig,
@@ -980,6 +981,979 @@ def build_mcmc_objective_grid_notebook() -> dict:
     return notebook(cells)
 
 
+def build_mcmc_scan_budget_policy_notebook() -> dict:
+    cells = [
+        markdown_cell(
+            """
+            # Experiment: MCMC-IS Scan-Budget Policy Calibration
+
+            Objective:
+            - Learn a simple rule for allocating MCMC-IS beta-scan budget as a function of an oracle/guessed \\(p_0\\).
+            - Compare policies at a fixed total budget, so each method pays for beta selection before production.
+            - Avoid duplicate production work by grouping identical selected betas and evaluating all required production checkpoints from one cumulative run.
+
+            The notebook is an offline calibration tool: it uses exact \\(p_0\\) by default so we can learn a practical policy, but the same policy form can later be driven by a guessed \\(p_0\\).
+            """
+        ),
+        code_cell(_common_setup_code()),
+        code_cell(
+            """
+            import concurrent.futures as cf
+            import math
+            import time
+
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            from perm_pval.core.proposals import resolve_n_swap_pairs
+            from perm_pval.diagnostics.is_weights import effective_sample_size, summarize_weights
+            from perm_pval.experiments.notebook_studies import (
+                _annotate_error_fields,
+                _burn_in,
+                _effective_n_jobs,
+                _kept_samples_per_chain,
+                _mcmc_eval_count,
+                _mcmc_prefix_row,
+                _run_single_chain_full_trace,
+                _steps_per_chain,
+                _try_make_process_pool,
+                local_beta_scan,
+                run_scan_budget_repeat_job,
+            )
+            from perm_pval.methods.beta_tuning import estimate_scale_T, iid_pilot_statistics
+            """
+        ),
+        markdown_cell(
+            """
+            ## Configuration
+
+            `TOTAL_BUDGET` is the total evaluation budget for MCMC-IS: pilot + scan + production.
+            The p0-dependent policies below choose the scan budget, and the production budget is the leftover.
+
+            The `tail_hit_cap` policies use
+            \\[
+            q_{\\mathrm{ref}} = p_0^{1/4} m_{\\mathrm{ref}},
+            \\]
+            then choose a per-candidate screen length that would deliver a target number of expected tilted-tail hits at \\(q_{\\mathrm{ref}}\\), capped by a fixed fraction of the total budget.
+            """
+        ),
+        code_cell(
+            """
+            FAST_MODE = False
+            SAVE_OUTPUTS = True
+
+            CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
+            OUTPUT_ROOT = project_root / "results" / "mcmcis_scan_budget_policy"
+
+            SCENARIO_KEYS_OVERRIDE = [
+                "bruteforce_welch_nonextreme_n22",
+                "gwas_additive_score_n40",
+                "hypergeom_1e7",
+                "linear_stat_dp_n40",
+                "rank_sum_dp_n40",
+            ]
+            MIN_TAIL_STATES = 2
+
+            TOTAL_BUDGET = 2_500_000 if not FAST_MODE else 150_000
+            N_REPEATS = 5 if not FAST_MODE else 1
+            N_JOBS = min(6, os.cpu_count() or 1) if not FAST_MODE else 1
+            BASE_SEED = 71_071
+
+            Q_MULTIPLIERS = (0.001, 0.005, 0.01, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.25, 0.33, 1.0)
+            MCMC_LOCAL_SCAN_OBJECTIVE = "varhat_qmatch_soft"
+            PRODUCTION_ESTIMATE_VARIANCE = False
+            MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND = {
+                "small": 1,
+                "medium": 1,
+                "large": 2,
+            }
+
+            # These are deliberately simple policy classes.  The one-standard-error
+            # style choice should happen after looking at the resulting leaderboard.
+            BUDGET_RULE_SPECS = [
+                {
+                    "name": "fixed_current",
+                    "kind": "fixed",
+                    "screen_total_steps": 14_000,
+                    "final_total_steps": 32_000,
+                    "finalist_count": 3,
+                },
+                {
+                    "name": "hits10_cap05",
+                    "kind": "tail_hit_cap",
+                    "min_tail_hits": 10,
+                    "reference_q_multiplier": 0.05,
+                    "max_scan_fraction": 0.05,
+                    "finalist_count": 5,
+                    "final_to_screen_ratio": 2.0,
+                },
+                {
+                    "name": "hits25_cap10",
+                    "kind": "tail_hit_cap",
+                    "min_tail_hits": 25,
+                    "reference_q_multiplier": 0.05,
+                    "max_scan_fraction": 0.10,
+                    "finalist_count": 5,
+                    "final_to_screen_ratio": 2.0,
+                },
+                {
+                    "name": "hits50_cap15",
+                    "kind": "tail_hit_cap",
+                    "min_tail_hits": 50,
+                    "reference_q_multiplier": 0.05,
+                    "max_scan_fraction": 0.15,
+                    "finalist_count": 5,
+                    "final_to_screen_ratio": 2.0,
+                },
+            ]
+
+            base_mcmc_cfg = MCMCWorkflowConfig(
+                pilot_samples=25_000 if not FAST_MODE else 1_000,
+                chains=2,
+                thin=1,
+                estimate_variance=True,
+                proposal_size=1,
+                local_scan_objective=MCMC_LOCAL_SCAN_OBJECTIVE,
+                local_scan_q_multipliers=Q_MULTIPLIERS,
+                local_scan_screen_chains=1,
+                local_scan_chains=2,
+                local_scan_burn_in_fraction=0.20,
+                local_scan_thin=1,
+            )
+
+            print(json.dumps({
+                "FAST_MODE": FAST_MODE,
+                "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
+                "TOTAL_BUDGET": TOTAL_BUDGET,
+                "N_REPEATS": N_REPEATS,
+                "N_JOBS": N_JOBS,
+                "Q_MULTIPLIERS": Q_MULTIPLIERS,
+                "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+                "PRODUCTION_ESTIMATE_VARIANCE": PRODUCTION_ESTIMATE_VARIANCE,
+                "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+                "BUDGET_RULE_SPECS": BUDGET_RULE_SPECS,
+            }, indent=2))
+            """
+        ),
+        markdown_cell("## Helpers"),
+        code_cell(
+            """
+            def mcmc_proposal_size_for_scenario(scenario) -> int:
+                band = str(scenario.portfolio.get("sample_size_band", "medium"))
+                return int(MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
+
+
+            def q_target_from_p0(p0: float, cfg: MCMCWorkflowConfig) -> float:
+                return float(float(p0) ** float(cfg.d_alpha))
+
+
+            def kept_samples_total(total_steps: int, *, n_chains: int, burn_in_fraction: float, thin: int) -> int:
+                steps_per_chain = _steps_per_chain(int(total_steps), int(n_chains))
+                burn_in = _burn_in(steps_per_chain, float(burn_in_fraction))
+                return int(n_chains) * _kept_samples_per_chain(steps_per_chain, burn_in, int(thin))
+
+
+            def total_steps_for_expected_tail_hits(
+                *,
+                q_ref: float,
+                min_tail_hits: int,
+                n_chains: int,
+                burn_in_fraction: float,
+                thin: int,
+            ) -> int:
+                if not np.isfinite(q_ref) or q_ref <= 0.0:
+                    return 1
+                target_kept = max(int(math.ceil(float(min_tail_hits) / float(q_ref))), 1)
+                lo = 1
+                hi = max(10, int(math.ceil(target_kept * int(thin) / max(int(n_chains), 1) / max(1.0 - float(burn_in_fraction), 1e-6))))
+                while kept_samples_total(hi, n_chains=n_chains, burn_in_fraction=burn_in_fraction, thin=thin) < target_kept:
+                    hi *= 2
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if kept_samples_total(mid, n_chains=n_chains, burn_in_fraction=burn_in_fraction, thin=thin) >= target_kept:
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                return int(lo)
+
+
+            def stage_eval_total(total_steps: int, *, n_candidates: int, n_chains: int) -> int:
+                steps_per_chain = _steps_per_chain(int(total_steps), int(n_chains))
+                return int(n_candidates) * _mcmc_eval_count(steps_per_chain, int(n_chains))
+
+
+            def resolve_budget_rule(rule: dict, scenario, cfg: MCMCWorkflowConfig) -> dict:
+                proposal_size = int(mcmc_proposal_size_for_scenario(scenario))
+                n_candidates = len(tuple(cfg.local_scan_q_multipliers))
+                finalist_count = min(int(rule.get("finalist_count", cfg.local_scan_finalist_count)), n_candidates)
+                q_target = q_target_from_p0(scenario.exact_p, cfg)
+
+                if rule["kind"] == "fixed":
+                    screen_total_steps = int(rule["screen_total_steps"])
+                    final_total_steps = int(rule["final_total_steps"])
+                    q_ref = np.nan
+                    tail_hit_steps = np.nan
+                    screen_cap_steps = np.nan
+                elif rule["kind"] == "tail_hit_cap":
+                    reference_multiplier = float(rule.get("reference_q_multiplier", 0.05))
+                    q_ref = max(float(q_target) * reference_multiplier, 1e-12)
+                    tail_hit_steps = total_steps_for_expected_tail_hits(
+                        q_ref=q_ref,
+                        min_tail_hits=int(rule["min_tail_hits"]),
+                        n_chains=int(cfg.local_scan_screen_chains),
+                        burn_in_fraction=float(cfg.local_scan_burn_in_fraction),
+                        thin=int(cfg.local_scan_thin),
+                    )
+                    total_scan_cap_ex_pilot = max(
+                        int(float(rule["max_scan_fraction"]) * int(TOTAL_BUDGET)) - int(cfg.pilot_samples),
+                        1,
+                    )
+                    final_to_screen_ratio = float(rule.get("final_to_screen_ratio", 2.0))
+                    budget_units = float(n_candidates) + float(finalist_count) * final_to_screen_ratio
+                    screen_cap_steps = max(int(total_scan_cap_ex_pilot / max(budget_units, 1.0)), 1)
+                    screen_total_steps = int(min(tail_hit_steps, screen_cap_steps))
+                    final_total_steps = int(max(1, round(final_to_screen_ratio * screen_total_steps)))
+                else:
+                    raise ValueError(f"Unknown budget rule kind: {rule['kind']}")
+
+                screen_eval_total = stage_eval_total(
+                    screen_total_steps,
+                    n_candidates=n_candidates,
+                    n_chains=int(cfg.local_scan_screen_chains),
+                )
+                final_eval_total_upper = stage_eval_total(
+                    final_total_steps,
+                    n_candidates=finalist_count,
+                    n_chains=int(cfg.local_scan_chains),
+                )
+                expected_beta_selection_budget = int(cfg.pilot_samples) + int(screen_eval_total) + int(final_eval_total_upper)
+                return {
+                    "rule_name": str(rule["name"]),
+                    "rule_kind": str(rule["kind"]),
+                    "proposal_size": proposal_size,
+                    "n_candidates": int(n_candidates),
+                    "finalist_count": int(finalist_count),
+                    "q_target": float(q_target),
+                    "q_ref": float(q_ref) if np.isfinite(q_ref) else np.nan,
+                    "tail_hit_steps": float(tail_hit_steps) if np.isfinite(tail_hit_steps) else np.nan,
+                    "screen_cap_steps": float(screen_cap_steps) if np.isfinite(screen_cap_steps) else np.nan,
+                    "screen_total_steps": int(screen_total_steps),
+                    "final_total_steps": int(final_total_steps),
+                    "expected_screen_eval_total": int(screen_eval_total),
+                    "expected_final_eval_total_upper": int(final_eval_total_upper),
+                    "expected_beta_selection_budget_upper": int(expected_beta_selection_budget),
+                }
+
+
+            def mcmc_cfg_for_budget_rule(rule_budget: dict, cfg: MCMCWorkflowConfig) -> MCMCWorkflowConfig:
+                return replace(
+                    cfg,
+                    proposal_size=int(rule_budget["proposal_size"]),
+                    local_scan_swap_counts=(int(rule_budget["proposal_size"]),),
+                    local_scan_finalist_count=int(rule_budget["finalist_count"]),
+                    local_scan_screen_total_steps=int(rule_budget["screen_total_steps"]),
+                    local_scan_total_steps=int(rule_budget["final_total_steps"]),
+                )
+
+
+            def selected_scan_row(scan: dict) -> dict:
+                rows = list(scan.get("rows", []))
+                if not rows:
+                    return {}
+                beta = float(scan.get("selected_beta", np.nan))
+                prop = int(scan.get("selected_proposal_size", -1))
+                matches = [
+                    row
+                    for row in rows
+                    if int(row.get("n_swap_pairs", -999)) == prop
+                    and np.isfinite(row.get("beta", np.nan))
+                    and abs(float(row.get("beta")) - beta) <= 1e-10
+                ]
+                return dict(matches[0] if matches else rows[0])
+
+
+            def pack_scan_sample_batches(sample_batches: list[dict]) -> dict:
+                log_weight_blocks = []
+                tail_blocks = []
+                for batch in sample_batches:
+                    logw = np.asarray(batch.get("log_weights", []), dtype=float)
+                    tail = np.asarray(batch.get("tail_indicators", []), dtype=np.int8)
+                    if logw.size != tail.size:
+                        raise ValueError("scan sample batch log_weights and tail_indicators must have matching sizes")
+                    if logw.size:
+                        log_weight_blocks.append(logw)
+                        tail_blocks.append(tail)
+                if log_weight_blocks:
+                    log_weights = np.concatenate(log_weight_blocks)
+                    tail_indicators = np.concatenate(tail_blocks)
+                else:
+                    log_weights = np.asarray([], dtype=float)
+                    tail_indicators = np.asarray([], dtype=np.int8)
+                return {
+                    "log_weights": log_weights,
+                    "tail_indicators": tail_indicators,
+                    "n_batches": int(len(sample_batches)),
+                    "n_weighted_samples": int(tail_indicators.size),
+                }
+
+
+            def run_production_traces(
+                problem,
+                *,
+                checkpoints: tuple[int, ...],
+                beta: float,
+                sigma_t: float,
+                cfg,
+                seed: int,
+                init_states: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
+            ) -> tuple[list[dict], dict[int, int]]:
+                checkpoints = tuple(sorted({int(v) for v in checkpoints}))
+                max_total_steps = int(checkpoints[-1])
+                max_steps_per_chain = _steps_per_chain(max_total_steps, int(cfg.chains))
+                steps_per_checkpoint = {int(cp): _steps_per_chain(int(cp), int(cfg.chains)) for cp in checkpoints}
+                unique_step_checkpoints = tuple(sorted(set(steps_per_checkpoint.values())))
+                n_swap_pairs = resolve_n_swap_pairs(
+                    problem.n_treated,
+                    problem.n_control,
+                    proposal_size=cfg.proposal_size,
+                )
+                seed_seq = np.random.SeedSequence(seed)
+                spawned = seed_seq.spawn(int(cfg.chains))
+                if init_states is None:
+                    normalized_init_states = [None] * int(cfg.chains)
+                else:
+                    if len(init_states) != int(cfg.chains):
+                        raise ValueError("init_states length must match cfg.chains")
+                    normalized_init_states = [np.asarray(state, dtype=np.int8).copy() for state in init_states]
+                traces = []
+                for chain_idx, ss in enumerate(spawned):
+                    rng = np.random.default_rng(ss)
+                    traces.append(
+                        _run_single_chain_full_trace(
+                            problem,
+                            rng,
+                            beta=float(beta),
+                            sigma_t=float(sigma_t),
+                            n_steps=max_steps_per_chain,
+                            init="random" if normalized_init_states[chain_idx] is None else "observed",
+                            init_state=normalized_init_states[chain_idx],
+                            tilt_mode=str(cfg.tilt_mode),
+                            n_swap_pairs=n_swap_pairs,
+                            checkpoint_steps=unique_step_checkpoints,
+                        )
+                    )
+                return traces, steps_per_checkpoint
+
+
+            def production_prefix_payload(
+                *,
+                traces: list[dict],
+                steps_per_chain: int,
+                burn_in: int,
+                thin: int,
+                beta: float,
+            ) -> dict:
+                q_chunks = []
+                tail_chunks = []
+                for trace in traces:
+                    q_chunks.append(np.asarray(trace["q_trace"][burn_in:steps_per_chain:thin], dtype=float))
+                    tail_chunks.append(np.asarray(trace["tail_trace"][burn_in:steps_per_chain:thin], dtype=np.int8))
+                q_samples = np.concatenate(q_chunks) if q_chunks else np.asarray([], dtype=float)
+                tail_indicators = np.concatenate(tail_chunks) if tail_chunks else np.asarray([], dtype=np.int8)
+                return {
+                    "log_weights": np.asarray(float(beta) * q_samples, dtype=float),
+                    "tail_indicators": np.asarray(tail_indicators, dtype=np.int8),
+                }
+
+
+            def pooled_scan_plus_production_row(
+                *,
+                exact_p: float,
+                base_row: dict,
+                scan_sample_pack: dict,
+                production_payload: dict,
+            ) -> dict:
+                scan_logw = np.asarray(scan_sample_pack.get("log_weights", []), dtype=float)
+                scan_tail = np.asarray(scan_sample_pack.get("tail_indicators", []), dtype=np.int8)
+                prod_logw = np.asarray(production_payload.get("log_weights", []), dtype=float)
+                prod_tail = np.asarray(production_payload.get("tail_indicators", []), dtype=np.int8)
+
+                log_weight_blocks = [arr for arr in (scan_logw, prod_logw) if arr.size]
+                tail_blocks = [arr for arr in (scan_tail, prod_tail) if arr.size]
+                if not log_weight_blocks or not tail_blocks:
+                    raise ValueError("pooled estimator requires at least one non-empty sample block")
+
+                all_logw = np.concatenate(log_weight_blocks)
+                all_tail = np.concatenate(tail_blocks)
+                shift = float(np.max(all_logw))
+                weights = np.exp(all_logw - shift)
+                weight_sum = float(np.sum(weights))
+                estimate = float(np.dot(weights, all_tail) / weight_sum)
+                weight_summary = summarize_weights(weights)
+
+                row = dict(base_row)
+                row["estimate"] = float(estimate)
+                row["variance_estimate"] = np.nan
+                row["snis_mcse_obm"] = np.nan
+                row["tail_hits"] = int(np.sum(all_tail))
+                row["tail_share_raw"] = np.nan
+                row["ess"] = float(effective_sample_size(weights))
+                row["weight_cv"] = float(weight_summary.cv)
+                row["n_weighted_samples"] = int(weights.size)
+                row["estimator_variant"] = "scan_plus_production"
+                row["scan_n_weighted_samples"] = int(scan_tail.size)
+                row["production_n_weighted_samples"] = int(prod_tail.size)
+                row["pooled_scan_batch_count"] = int(scan_sample_pack.get("n_batches", 0))
+                return _annotate_error_fields(row, float(exact_p))
+            """
+        ),
+        markdown_cell("## Load Scenarios"),
+        code_cell(
+            """
+            scenarios = load_selected_scenarios(
+                catalog_path=CATALOG_PATH,
+                scenario_keys=SCENARIO_KEYS_OVERRIDE,
+                portfolio_group=None,
+                min_tail_states=MIN_TAIL_STATES,
+            )
+            scenario_by_key = {scenario.key: scenario for scenario in scenarios}
+            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "scan_budget_policy") if SAVE_OUTPUTS else None
+
+            pd.DataFrame([
+                {
+                    "scenario": s.key,
+                    "exact_p": s.exact_p,
+                    "family": s.portfolio.get("family"),
+                    "statistic_family": s.portfolio.get("statistic_family"),
+                    "sample_size_band": s.portfolio.get("sample_size_band"),
+                    "proposal_size": mcmc_proposal_size_for_scenario(s),
+                }
+                for s in scenarios
+            ])
+            """
+        ),
+        markdown_cell(
+            """
+            ## Run Policy Scans
+
+            Each `(scenario, repeat)` job uses one common IID pilot and reuses it across all budget policies. Jobs are independent, so the notebook can parallelize at that outer level while still charging the pilot cost to every policy.
+            """
+        ),
+        code_cell(
+            """
+            scan_records: list[dict] = []
+            production_records: list[dict] = []
+            repeat_jobs: list[dict] = []
+
+            for scenario_idx, scenario in enumerate(scenarios):
+                rule_budgets = [resolve_budget_rule(rule, scenario, base_mcmc_cfg) for rule in BUDGET_RULE_SPECS]
+                print(
+                    f"Prepared scenario {scenario.key} | exact p={scenario.exact_p:.3e} "
+                    f"| repeats={N_REPEATS} | rules={len(rule_budgets)}"
+                )
+                for repeat_idx in range(N_REPEATS):
+                    pilot_seed = BASE_SEED + 100_000 * scenario_idx + 10_000 * repeat_idx
+                    repeat_jobs.append(
+                        {
+                            "scenario_key": str(scenario.key),
+                            "scenario_display": str(scenario.description),
+                            "family": scenario.portfolio.get("family"),
+                            "statistic_family": scenario.portfolio.get("statistic_family"),
+                            "sample_size_band": scenario.portfolio.get("sample_size_band"),
+                            "problem": scenario.problem,
+                            "exact_p": float(scenario.exact_p),
+                            "repeat_idx": int(repeat_idx),
+                            "pilot_seed": int(pilot_seed),
+                            "total_budget": int(TOTAL_BUDGET),
+                            "base_mcmc_cfg": base_mcmc_cfg,
+                            "rule_budgets": [dict(rule_budget) for rule_budget in rule_budgets],
+                            "production_estimate_variance": bool(PRODUCTION_ESTIMATE_VARIANCE),
+                        }
+                    )
+
+            t0 = time.perf_counter()
+            n_workers = _effective_n_jobs(N_JOBS, len(repeat_jobs))
+            executor = _try_make_process_pool(n_workers) if n_workers > 1 else None
+            print(f"Running {len(repeat_jobs)} scenario-repeat jobs with n_workers={n_workers}")
+
+            def _consume_job_result(result: dict) -> None:
+                scan_records.extend(result["scan_records"])
+                production_records.extend(result["production_records"])
+
+
+            if executor is None:
+                for job_idx, job in enumerate(repeat_jobs, start=1):
+                    _consume_job_result(run_scan_budget_repeat_job(**job))
+                    if job_idx % max(1, len(repeat_jobs) // 6) == 0 or job_idx == len(repeat_jobs):
+                        print(f"Completed {job_idx}/{len(repeat_jobs)} jobs")
+            else:
+                with executor:
+                    futures = [executor.submit(run_scan_budget_repeat_job, **job) for job in repeat_jobs]
+                    for job_idx, future in enumerate(cf.as_completed(futures), start=1):
+                        _consume_job_result(future.result())
+                        if job_idx % max(1, len(repeat_jobs) // 6) == 0 or job_idx == len(repeat_jobs):
+                            print(f"Completed {job_idx}/{len(repeat_jobs)} jobs")
+
+            scan_df = pd.DataFrame(scan_records)
+            production_df = pd.DataFrame(production_records)
+            print(
+                f"Completed {len(scan_df)} scans and {len(production_df)} production rows "
+                f"in {time.perf_counter() - t0:.1f}s"
+            )
+            display(scan_df.sort_values(["scenario", "repeat", "rule_name"])[[
+                "scenario", "repeat", "rule_name", "beta_selection_budget", "production_budget",
+                "screen_total_steps", "final_total_steps", "scan_n_weighted_samples", "selected_q_multiplier",
+                "selected_beta", "selected_q_tilt_tail_share", "selected_ess", "selected_weight_cv",
+            ]])
+            """
+        ),
+        markdown_cell(
+            """
+            ## Run Deduplicated Production
+
+            Production is already executed inside each parallel `(scenario, repeat)` job. Within a job, if multiple budget policies select the same beta/proposal, we run one cumulative production chain up to the largest required leftover budget and read off the shorter checkpoints for the other policies.
+
+            For each rule we record two estimators:
+            1. `production_only`, which uses only the post-scan production chain.
+            2. `scan_plus_production`, which pools all stored scan sample batches with the production samples.
+
+            We intentionally do not reuse scan final states here. That keeps the production runs groupable and isolates the beta/proposal selection effect from differences in scan-generated initialization states.
+            """
+        ),
+        code_cell(
+            """
+            print(f"Loaded {len(production_df)} policy production rows from the completed scenario-repeat jobs")
+            display(production_df.sort_values(["scenario", "repeat", "rule_name", "estimator_variant"])[[
+                "scenario", "repeat", "rule_name", "estimator_variant", "estimate", "exact_p", "root_squared_error",
+                "abs_log10_error", "selected_q_multiplier", "selected_beta", "beta_selection_budget",
+                "production_budget", "available_scan_n_weighted_samples", "scan_n_weighted_samples",
+                "production_n_weighted_samples", "ess", "weight_cv", "acceptance_rate",
+            ]])
+            """
+        ),
+        markdown_cell("## Summarize Budget Policies"),
+        code_cell(
+            """
+            def summarize_policy_records(df: pd.DataFrame) -> pd.DataFrame:
+                rows = []
+                for (scenario, rule_name, estimator_variant), sub in df.groupby(["scenario", "rule_name", "estimator_variant"], sort=True):
+                    exact_p = float(sub["exact_p"].iloc[0])
+                    estimates = sub["estimate"].astype(float).to_numpy()
+                    rows.append({
+                        "scenario": scenario,
+                        "rule_name": rule_name,
+                        "estimator_variant": estimator_variant,
+                        "n_runs": int(len(sub)),
+                        "exact_p": exact_p,
+                        "mean_estimate": float(np.mean(estimates)),
+                        "rmse": float(np.sqrt(np.mean((estimates - exact_p) ** 2))),
+                        "mean_abs_log10_error": float(np.nanmean(sub["abs_log10_error"].astype(float))),
+                        "mean_selected_q_multiplier": float(np.nanmean(sub["selected_q_multiplier"].astype(float))),
+                        "median_selected_q_multiplier": float(np.nanmedian(sub["selected_q_multiplier"].astype(float))),
+                        "mean_beta_selection_budget": float(np.mean(sub["beta_selection_budget"].astype(float))),
+                        "mean_production_budget": float(np.mean(sub["production_budget"].astype(float))),
+                        "mean_q_tilt_tail_share": float(np.nanmean(sub["tail_share_raw"].astype(float))),
+                        "mean_ess": float(np.nanmean(sub["ess"].astype(float))),
+                        "mean_weight_cv": float(np.nanmean(sub["weight_cv"].astype(float))),
+                        "mean_acceptance_rate": float(np.nanmean(sub["acceptance_rate"].astype(float))),
+                        "mean_available_scan_n_weighted_samples": float(np.nanmean(sub["available_scan_n_weighted_samples"].astype(float))),
+                        "mean_scan_n_weighted_samples": float(np.nanmean(sub["scan_n_weighted_samples"].astype(float))),
+                        "mean_production_n_weighted_samples": float(np.nanmean(sub["production_n_weighted_samples"].astype(float))),
+                    })
+                return pd.DataFrame(rows).sort_values(["scenario", "estimator_variant", "rmse", "mean_abs_log10_error"]).reset_index(drop=True)
+
+
+            policy_summary = summarize_policy_records(production_df)
+            policy_summary["rmse_rank"] = policy_summary.groupby(["scenario", "estimator_variant"])["rmse"].rank(method="min")
+            policy_summary["abs_log10_error_rank"] = policy_summary.groupby(["scenario", "estimator_variant"])["mean_abs_log10_error"].rank(method="min")
+            display(policy_summary)
+
+            leaderboard = (
+                policy_summary
+                .groupby(["estimator_variant", "rule_name"], as_index=False)
+                .agg(
+                    mean_rmse_rank=("rmse_rank", "mean"),
+                    mean_abs_log10_error_rank=("abs_log10_error_rank", "mean"),
+                    mean_rmse=("rmse", "mean"),
+                    mean_abs_log10_error=("mean_abs_log10_error", "mean"),
+                    mean_beta_selection_budget=("mean_beta_selection_budget", "mean"),
+                    mean_production_budget=("mean_production_budget", "mean"),
+                    mean_available_scan_n_weighted_samples=("mean_available_scan_n_weighted_samples", "mean"),
+                    mean_scan_n_weighted_samples=("mean_scan_n_weighted_samples", "mean"),
+                    mean_production_n_weighted_samples=("mean_production_n_weighted_samples", "mean"),
+                    mean_ess=("mean_ess", "mean"),
+                    mean_weight_cv=("mean_weight_cv", "mean"),
+                )
+                .sort_values(["estimator_variant", "mean_rmse_rank", "mean_abs_log10_error_rank", "mean_rmse"])
+                .reset_index(drop=True)
+            )
+            display(leaderboard)
+
+            comparison_rows = []
+            for (scenario, rule_name), sub in policy_summary.groupby(["scenario", "rule_name"], sort=True):
+                if set(sub["estimator_variant"]) != {"production_only", "scan_plus_production"}:
+                    continue
+                base = sub[sub["estimator_variant"] == "production_only"].iloc[0]
+                pooled = sub[sub["estimator_variant"] == "scan_plus_production"].iloc[0]
+                comparison_rows.append({
+                    "scenario": scenario,
+                    "rule_name": rule_name,
+                    "exact_p": float(base["exact_p"]),
+                    "production_only_rmse": float(base["rmse"]),
+                    "scan_plus_production_rmse": float(pooled["rmse"]),
+                    "rmse_ratio_scan_over_prod": (
+                        float(pooled["rmse"] / base["rmse"])
+                        if np.isfinite(base["rmse"]) and float(base["rmse"]) > 0.0
+                        else np.nan
+                    ),
+                    "production_only_abs_log10_error": float(base["mean_abs_log10_error"]),
+                    "scan_plus_production_abs_log10_error": float(pooled["mean_abs_log10_error"]),
+                    "abs_log10_error_delta": float(pooled["mean_abs_log10_error"] - base["mean_abs_log10_error"]),
+                    "scan_n_weighted_samples_added": float(pooled["mean_scan_n_weighted_samples"]),
+                })
+            comparison_df = pd.DataFrame(comparison_rows).sort_values(["scenario", "rmse_ratio_scan_over_prod"])
+            display(comparison_df)
+            """
+        ),
+        markdown_cell("## Save Outputs"),
+        code_cell(
+            """
+            if SAVE_OUTPUTS and run_dir is not None:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                scan_df.to_json(run_dir / "scan_records.jsonl", orient="records", lines=True)
+                production_df.to_json(run_dir / "production_records.jsonl", orient="records", lines=True)
+                policy_summary.to_json(run_dir / "policy_summary.json", orient="records", indent=2)
+                leaderboard.to_json(run_dir / "policy_leaderboard.json", orient="records", indent=2)
+                comparison_df.to_json(run_dir / "estimator_comparison.json", orient="records", indent=2)
+                (run_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "TOTAL_BUDGET": TOTAL_BUDGET,
+                            "N_REPEATS": N_REPEATS,
+                            "N_JOBS": N_JOBS,
+                            "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
+                            "Q_MULTIPLIERS": Q_MULTIPLIERS,
+                            "BUDGET_RULE_SPECS": BUDGET_RULE_SPECS,
+                            "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+                            "PRODUCTION_ESTIMATE_VARIANCE": PRODUCTION_ESTIMATE_VARIANCE,
+                            "ESTIMATOR_VARIANTS": ["production_only", "scan_plus_production"],
+                            "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"Saved scan-budget policy outputs to {run_dir}")
+            else:
+                print("SAVE_OUTPUTS is False; nothing saved.")
+            """
+        ),
+    ]
+    return notebook(cells)
+
+
+def build_mcmc_scan_budget_grid_notebook() -> dict:
+    nb = build_mcmc_scan_budget_policy_notebook()
+    cells = nb["cells"]
+    cells[0] = markdown_cell(
+        """
+        # Experiment: Fixed Scan-Budget Grid for MCMC-IS
+
+        Objective:
+        - At a fixed total MCMC-IS budget of 10 million evaluations, compare several fixed beta-selection budgets.
+        - For each scan budget, choose beta by the same local scan objective and then spend the remaining budget on production.
+        - Avoid duplicate production work by grouping identical selected beta/proposal pairs and evaluating all required production cutoffs from one cumulative run.
+
+        This is an offline calibration tool. After the run, we can fit a coarse rule of thumb such as scan budget as a function of total budget and/or \\(p_0\\).
+        """
+    )
+    cells[3] = markdown_cell(
+        """
+        ## Configuration
+
+        `TOTAL_BUDGET` is the full MCMC-IS evaluation budget: IID pilot + beta scan + production. `SCAN_BUDGETS` below are target beta-selection budgets, including the IID pilot. The actual charged budget can differ by a few evaluations because MCMC chains are split across chains and candidates.
+
+        The scan-budget grid is deliberately simple: it asks whether spending roughly `50k`, `100k`, `500k`, `1m`, or `2m` on beta selection is worthwhile when the full budget is `10m`.
+        """
+    )
+    cells[4] = code_cell(
+        """
+        FAST_MODE = False
+        SAVE_OUTPUTS = True
+
+        CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
+        OUTPUT_ROOT = project_root / "results" / "mcmcis_scan_budget_grid"
+
+        SCENARIO_KEYS_OVERRIDE = [
+            "gwas_additive_score_n40",
+            "linear_stat_dp_n40",
+            "rank_sum_dp_n40",
+        ]
+        MIN_TAIL_STATES = 2
+
+        TOTAL_BUDGET = 10_000_000 if not FAST_MODE else 200_000
+        N_REPEATS = 6 if not FAST_MODE else 1
+        N_JOBS = min(6, os.cpu_count() or 1) if not FAST_MODE else 1
+        BASE_SEED = 83_083
+
+        SCAN_BUDGETS = (
+            50_000,
+            100_000,
+            500_000,
+            1_000_000,
+            2_000_000,
+        ) if not FAST_MODE else (25_000, 50_000)
+        SCAN_FINALIST_COUNT = 5
+        SCAN_FINAL_TO_SCREEN_RATIO = 2.0
+
+        Q_MULTIPLIERS = (0.001, 0.005, 0.01, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.25, 0.33, 1.0)
+        MCMC_LOCAL_SCAN_OBJECTIVE = "varhat_qmatch_soft"
+        PRODUCTION_ESTIMATE_VARIANCE = False
+        MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND = {
+            "small": 1,
+            "medium": 1,
+            "large": 2,
+        }
+
+        BUDGET_RULE_SPECS = [
+            {
+                "name": f"scan_{budget // 1_000_000}m" if budget >= 1_000_000 else f"scan_{budget // 1_000}k",
+                "kind": "fixed_scan_budget",
+                "target_beta_selection_budget": int(budget),
+                "finalist_count": SCAN_FINALIST_COUNT,
+                "final_to_screen_ratio": SCAN_FINAL_TO_SCREEN_RATIO,
+            }
+            for budget in SCAN_BUDGETS
+        ]
+
+        base_mcmc_cfg = MCMCWorkflowConfig(
+            pilot_samples=25_000 if not FAST_MODE else 5_000,
+            chains=2,
+            thin=1,
+            estimate_variance=True,
+            proposal_size=1,
+            local_scan_objective=MCMC_LOCAL_SCAN_OBJECTIVE,
+            local_scan_q_multipliers=Q_MULTIPLIERS,
+            local_scan_screen_chains=1,
+            local_scan_chains=2,
+            local_scan_burn_in_fraction=0.20,
+            local_scan_thin=1,
+        )
+
+        print(json.dumps({
+            "FAST_MODE": FAST_MODE,
+            "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
+            "TOTAL_BUDGET": TOTAL_BUDGET,
+            "N_REPEATS": N_REPEATS,
+            "N_JOBS": N_JOBS,
+            "SCAN_BUDGETS": SCAN_BUDGETS,
+            "SCAN_FINALIST_COUNT": SCAN_FINALIST_COUNT,
+            "SCAN_FINAL_TO_SCREEN_RATIO": SCAN_FINAL_TO_SCREEN_RATIO,
+            "Q_MULTIPLIERS": Q_MULTIPLIERS,
+            "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+            "PRODUCTION_ESTIMATE_VARIANCE": PRODUCTION_ESTIMATE_VARIANCE,
+            "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+            "BUDGET_RULE_SPECS": BUDGET_RULE_SPECS,
+        }, indent=2))
+        """
+    )
+    cells[6] = code_cell(
+        """
+        def mcmc_proposal_size_for_scenario(scenario) -> int:
+            band = str(scenario.portfolio.get("sample_size_band", "medium"))
+            return int(MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
+
+
+        def q_target_from_p0(p0: float, cfg: MCMCWorkflowConfig) -> float:
+            return float(float(p0) ** float(cfg.d_alpha))
+
+
+        def kept_samples_total(total_steps: int, *, n_chains: int, burn_in_fraction: float, thin: int) -> int:
+            steps_per_chain = _steps_per_chain(int(total_steps), int(n_chains))
+            burn_in = _burn_in(steps_per_chain, float(burn_in_fraction))
+            return int(n_chains) * _kept_samples_per_chain(steps_per_chain, burn_in, int(thin))
+
+
+        def stage_eval_total(total_steps: int, *, n_candidates: int, n_chains: int) -> int:
+            steps_per_chain = _steps_per_chain(int(total_steps), int(n_chains))
+            return int(n_candidates) * _mcmc_eval_count(steps_per_chain, int(n_chains))
+
+
+        def split_fixed_scan_budget(
+            *,
+            target_beta_selection_budget: int,
+            cfg: MCMCWorkflowConfig,
+            n_candidates: int,
+            finalist_count: int,
+            final_to_screen_ratio: float,
+        ) -> tuple[int, int]:
+            scan_budget_ex_pilot = max(int(target_beta_selection_budget) - int(cfg.pilot_samples), 1)
+            budget_units = float(n_candidates) + float(finalist_count) * float(final_to_screen_ratio)
+            screen_total_steps = max(int(scan_budget_ex_pilot / max(budget_units, 1.0)), 1)
+            final_total_steps = max(int(round(float(final_to_screen_ratio) * screen_total_steps)), 1)
+            return int(screen_total_steps), int(final_total_steps)
+
+
+        def resolve_budget_rule(rule: dict, scenario, cfg: MCMCWorkflowConfig) -> dict:
+            proposal_size = int(mcmc_proposal_size_for_scenario(scenario))
+            n_candidates = len(tuple(cfg.local_scan_q_multipliers))
+            finalist_count = min(int(rule.get("finalist_count", cfg.local_scan_finalist_count)), n_candidates)
+            q_target = q_target_from_p0(scenario.exact_p, cfg)
+
+            if rule["kind"] != "fixed_scan_budget":
+                raise ValueError(f"Unknown budget rule kind for this notebook: {rule['kind']}")
+
+            target_beta_selection_budget = int(rule["target_beta_selection_budget"])
+            if target_beta_selection_budget >= int(TOTAL_BUDGET):
+                raise ValueError("target_beta_selection_budget must be smaller than TOTAL_BUDGET")
+            final_to_screen_ratio = float(rule.get("final_to_screen_ratio", 2.0))
+            screen_total_steps, final_total_steps = split_fixed_scan_budget(
+                target_beta_selection_budget=target_beta_selection_budget,
+                cfg=cfg,
+                n_candidates=n_candidates,
+                finalist_count=finalist_count,
+                final_to_screen_ratio=final_to_screen_ratio,
+            )
+
+            screen_eval_total = stage_eval_total(
+                screen_total_steps,
+                n_candidates=n_candidates,
+                n_chains=int(cfg.local_scan_screen_chains),
+            )
+            final_eval_total_upper = stage_eval_total(
+                final_total_steps,
+                n_candidates=finalist_count,
+                n_chains=int(cfg.local_scan_chains),
+            )
+            expected_beta_selection_budget = int(cfg.pilot_samples) + int(screen_eval_total) + int(final_eval_total_upper)
+            return {
+                "rule_name": str(rule["name"]),
+                "rule_kind": str(rule["kind"]),
+                "proposal_size": proposal_size,
+                "n_candidates": int(n_candidates),
+                "finalist_count": int(finalist_count),
+                "q_target": float(q_target),
+                "q_ref": np.nan,
+                "tail_hit_steps": np.nan,
+                "screen_cap_steps": np.nan,
+                "target_beta_selection_budget": int(target_beta_selection_budget),
+                "target_scan_budget_ex_pilot": int(max(target_beta_selection_budget - int(cfg.pilot_samples), 1)),
+                "final_to_screen_ratio": float(final_to_screen_ratio),
+                "screen_total_steps": int(screen_total_steps),
+                "final_total_steps": int(final_total_steps),
+                "expected_screen_eval_total": int(screen_eval_total),
+                "expected_final_eval_total_upper": int(final_eval_total_upper),
+                "expected_beta_selection_budget_upper": int(expected_beta_selection_budget),
+            }
+
+
+        def mcmc_cfg_for_budget_rule(rule_budget: dict, cfg: MCMCWorkflowConfig) -> MCMCWorkflowConfig:
+            return replace(
+                cfg,
+                proposal_size=int(rule_budget["proposal_size"]),
+                local_scan_swap_counts=(int(rule_budget["proposal_size"]),),
+                local_scan_finalist_count=int(rule_budget["finalist_count"]),
+                local_scan_screen_total_steps=int(rule_budget["screen_total_steps"]),
+                local_scan_total_steps=int(rule_budget["final_total_steps"]),
+            )
+
+
+        def selected_scan_row(scan: dict) -> dict:
+            rows = list(scan.get("rows", []))
+            if not rows:
+                return {}
+            beta = float(scan.get("selected_beta", np.nan))
+            prop = int(scan.get("selected_proposal_size", -1))
+            matches = [
+                row
+                for row in rows
+                if int(row.get("n_swap_pairs", -999)) == prop
+                and np.isfinite(row.get("beta", np.nan))
+                and abs(float(row.get("beta")) - beta) <= 1e-10
+            ]
+            return dict(matches[0] if matches else rows[0])
+        """
+    )
+    cells[8] = code_cell(
+        """
+        scenarios = load_selected_scenarios(
+            catalog_path=CATALOG_PATH,
+            scenario_keys=SCENARIO_KEYS_OVERRIDE,
+            portfolio_group=None,
+            min_tail_states=MIN_TAIL_STATES,
+        )
+        scenario_by_key = {scenario.key: scenario for scenario in scenarios}
+        run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "scan_budget_grid") if SAVE_OUTPUTS else None
+
+        pd.DataFrame([
+            {
+                "scenario": s.key,
+                "exact_p": s.exact_p,
+                "family": s.portfolio.get("family"),
+                "statistic_family": s.portfolio.get("statistic_family"),
+                "sample_size_band": s.portfolio.get("sample_size_band"),
+                "proposal_size": mcmc_proposal_size_for_scenario(s),
+            }
+            for s in scenarios
+        ])
+        """
+    )
+    cells[9] = markdown_cell(
+        """
+        ## Run Fixed-Budget Scans
+
+        Each `(scenario, repeat)` job uses one common IID pilot and reuses it across all scan budgets. Jobs are independent, so the notebook can parallelize at that outer level while still charging the pilot cost to every budget setting.
+        """
+    )
+    cells[11] = markdown_cell(
+        """
+        ## Run Deduplicated Production
+
+        Production is already executed inside each parallel `(scenario, repeat)` job. Within a job, if multiple scan budgets select the same beta/proposal, we run one cumulative production chain up to the largest required leftover budget and read off the shorter checkpoints for the other scan budgets.
+
+        We intentionally do not reuse scan final states here. That keeps the production runs groupable and isolates the beta/proposal selection effect from differences in scan-generated initialization states.
+        """
+    )
+    cells[13] = markdown_cell("## Summarize Fixed Scan Budgets")
+    cells[15] = markdown_cell("## Save Outputs")
+    cells[16] = code_cell(
+        """
+        if SAVE_OUTPUTS and run_dir is not None:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            scan_df.to_json(run_dir / "scan_records.jsonl", orient="records", lines=True)
+            production_df.to_json(run_dir / "production_records.jsonl", orient="records", lines=True)
+            policy_summary.to_json(run_dir / "policy_summary.json", orient="records", indent=2)
+            leaderboard.to_json(run_dir / "policy_leaderboard.json", orient="records", indent=2)
+            comparison_df.to_json(run_dir / "estimator_comparison.json", orient="records", indent=2)
+            (run_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "TOTAL_BUDGET": TOTAL_BUDGET,
+                        "N_REPEATS": N_REPEATS,
+                        "N_JOBS": N_JOBS,
+                        "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
+                        "SCAN_BUDGETS": SCAN_BUDGETS,
+                        "SCAN_FINALIST_COUNT": SCAN_FINALIST_COUNT,
+                        "SCAN_FINAL_TO_SCREEN_RATIO": SCAN_FINAL_TO_SCREEN_RATIO,
+                        "Q_MULTIPLIERS": Q_MULTIPLIERS,
+                        "BUDGET_RULE_SPECS": BUDGET_RULE_SPECS,
+                        "MCMC_LOCAL_SCAN_OBJECTIVE": MCMC_LOCAL_SCAN_OBJECTIVE,
+                        "PRODUCTION_ESTIMATE_VARIANCE": PRODUCTION_ESTIMATE_VARIANCE,
+                        "ESTIMATOR_VARIANTS": ["production_only", "scan_plus_production"],
+                        "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"Saved fixed scan-budget grid outputs to {run_dir}")
+        else:
+            print("SAVE_OUTPUTS is False; nothing saved.")
+        """
+    )
+    return nb
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     notebooks_dir = repo_root / "notebooks"
@@ -989,6 +1963,8 @@ def main() -> None:
         notebooks_dir / "cross_method_simulation.ipynb": build_cross_method_notebook(),
         notebooks_dir / "mcmcis_beta_diagnostics.ipynb": build_beta_notebook(),
         notebooks_dir / "mcmcis_offline_objective_grid.ipynb": build_mcmc_objective_grid_notebook(),
+        notebooks_dir / "mcmcis_scan_budget_policy.ipynb": build_mcmc_scan_budget_policy_notebook(),
+        notebooks_dir / "mcmcis_scan_budget_grid.ipynb": build_mcmc_scan_budget_grid_notebook(),
     }
     for path, data in outputs.items():
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")

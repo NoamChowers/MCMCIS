@@ -508,6 +508,7 @@ def _run_local_scan_stage(
     n_chains: int,
     seed: int,
     stage: str,
+    return_sample_batches: bool = False,
 ) -> dict[str, Any]:
     steps_per_chain, burn_in = _local_scan_steps(
         total_steps,
@@ -516,6 +517,7 @@ def _run_local_scan_stage(
     )
     rows: list[dict[str, Any]] = []
     final_states: dict[str, list[np.ndarray]] = {}
+    sample_batches: list[dict[str, Any]] = []
     t_start = time.perf_counter()
     for idx, candidate in enumerate(candidates):
         if str(candidate["status"]) != "ok":
@@ -611,6 +613,21 @@ def _run_local_scan_stage(
             }
         )
         final_states[str(candidate["config_id"])] = [np.asarray(state, dtype=np.int8).copy() for state in res.final_states]
+        if return_sample_batches:
+            sample_batches.append(
+                {
+                    "stage": str(stage),
+                    "config_id": str(candidate["config_id"]),
+                    "label": str(candidate["label"]),
+                    "beta": float(candidate["beta"]),
+                    "n_swap_pairs": int(candidate["n_swap_pairs"]),
+                    "q_multiplier": float(candidate["q_multiplier"]),
+                    "q_scan_target": float(candidate["q_scan_target"]),
+                    "n_weighted_samples": int(res.n_weighted_samples),
+                    "log_weights": np.asarray(res.log_weights, dtype=float).copy(),
+                    "tail_indicators": np.asarray(res.tail_indicators, dtype=np.int8).copy(),
+                }
+            )
 
     return {
         "rows": rows,
@@ -619,6 +636,7 @@ def _run_local_scan_stage(
         "eval_total": int(len(candidates) * _mcmc_eval_count(steps_per_chain, n_chains)),
         "wall_time_sec": float(time.perf_counter() - t_start),
         "final_states": final_states,
+        "sample_batches": sample_batches,
     }
 
 
@@ -692,6 +710,7 @@ def local_beta_scan(
     sigma_t: float,
     q_target: float,
     seed: int,
+    return_sample_batches: bool = False,
 ) -> dict[str, Any]:
     if cfg.local_scan_screen_total_steps <= 0:
         raise ValueError("local_scan_screen_total_steps must be positive.")
@@ -739,6 +758,7 @@ def local_beta_scan(
         n_chains=int(cfg.local_scan_screen_chains),
         seed=seed,
         stage="screen",
+        return_sample_batches=bool(return_sample_batches),
     )
     screen_rows = screen["rows"]
     ranked_screen_indices = _rank_scan_rows(screen_rows, objective_name=cfg.local_scan_objective)
@@ -760,6 +780,7 @@ def local_beta_scan(
         n_chains=int(cfg.local_scan_chains),
         seed=seed + 1_000_000,
         stage="final",
+        return_sample_batches=bool(return_sample_batches),
     )
     rows = final["rows"]
     ranked_final_indices = _rank_scan_rows(rows, objective_name=cfg.local_scan_objective)
@@ -843,6 +864,351 @@ def local_beta_scan(
         "screen_rows": screen_rows,
         "rows": rows,
         "production_init_states": production_init_states,
+        "sample_batches": list(screen.get("sample_batches", [])) + list(final.get("sample_batches", [])),
+    }
+
+
+def _selected_scan_row(scan: dict[str, Any]) -> dict[str, Any]:
+    rows = list(scan.get("rows", []))
+    if not rows:
+        return {}
+    beta = float(scan.get("selected_beta", np.nan))
+    proposal_size = int(scan.get("selected_proposal_size", -1))
+    matches = [
+        row
+        for row in rows
+        if int(row.get("n_swap_pairs", -999)) == proposal_size
+        and np.isfinite(row.get("beta", np.nan))
+        and abs(float(row["beta"]) - beta) <= 1e-10
+    ]
+    return dict(matches[0] if matches else rows[0])
+
+
+def _pack_scan_sample_batches(sample_batches: list[dict[str, Any]]) -> dict[str, Any]:
+    log_weight_blocks: list[np.ndarray] = []
+    tail_blocks: list[np.ndarray] = []
+    for batch in sample_batches:
+        logw = np.asarray(batch.get("log_weights", []), dtype=float)
+        tail = np.asarray(batch.get("tail_indicators", []), dtype=np.int8)
+        if logw.size != tail.size:
+            raise ValueError("scan sample batch log_weights and tail_indicators must have matching sizes")
+        if logw.size:
+            log_weight_blocks.append(logw)
+            tail_blocks.append(tail)
+    if log_weight_blocks:
+        log_weights = np.concatenate(log_weight_blocks)
+        tail_indicators = np.concatenate(tail_blocks)
+    else:
+        log_weights = np.asarray([], dtype=float)
+        tail_indicators = np.asarray([], dtype=np.int8)
+    return {
+        "log_weights": log_weights,
+        "tail_indicators": tail_indicators,
+        "n_batches": int(len(sample_batches)),
+        "n_weighted_samples": int(tail_indicators.size),
+    }
+
+
+def _run_scan_budget_production_traces(
+    problem: PermutationTestProblem,
+    *,
+    checkpoints: tuple[int, ...],
+    beta: float,
+    sigma_t: float,
+    cfg: MCMCWorkflowConfig,
+    seed: int,
+    init_states: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    checkpoints = tuple(sorted({int(v) for v in checkpoints}))
+    if not checkpoints:
+        raise ValueError("checkpoints must contain at least one positive value")
+    max_total_steps = int(checkpoints[-1])
+    max_steps_per_chain = _steps_per_chain(max_total_steps, int(cfg.chains))
+    steps_per_checkpoint = {int(cp): _steps_per_chain(int(cp), int(cfg.chains)) for cp in checkpoints}
+    unique_step_checkpoints = tuple(sorted(set(steps_per_checkpoint.values())))
+    n_swap_pairs = resolve_n_swap_pairs(
+        problem.n_treated,
+        problem.n_control,
+        proposal_size=cfg.proposal_size,
+    )
+    seed_seq = np.random.SeedSequence(seed)
+    spawned = seed_seq.spawn(int(cfg.chains))
+    if init_states is None:
+        normalized_init_states = [None] * int(cfg.chains)
+    else:
+        if len(init_states) != int(cfg.chains):
+            raise ValueError("init_states length must match cfg.chains")
+        normalized_init_states = [np.asarray(state, dtype=np.int8).copy() for state in init_states]
+
+    traces: list[dict[str, Any]] = []
+    for chain_idx, ss in enumerate(spawned):
+        rng = np.random.default_rng(ss)
+        traces.append(
+            _run_single_chain_full_trace(
+                problem,
+                rng,
+                beta=float(beta),
+                sigma_t=float(sigma_t),
+                n_steps=max_steps_per_chain,
+                init="random" if normalized_init_states[chain_idx] is None else "observed",
+                init_state=normalized_init_states[chain_idx],
+                tilt_mode=str(cfg.tilt_mode),
+                n_swap_pairs=n_swap_pairs,
+                checkpoint_steps=unique_step_checkpoints,
+            )
+        )
+    return traces, steps_per_checkpoint
+
+
+def _production_prefix_payload(
+    *,
+    traces: list[dict[str, Any]],
+    steps_per_chain: int,
+    burn_in: int,
+    thin: int,
+    beta: float,
+) -> dict[str, np.ndarray]:
+    q_chunks: list[np.ndarray] = []
+    tail_chunks: list[np.ndarray] = []
+    for trace in traces:
+        q_chunks.append(np.asarray(trace["q_trace"][burn_in:steps_per_chain:thin], dtype=float))
+        tail_chunks.append(np.asarray(trace["tail_trace"][burn_in:steps_per_chain:thin], dtype=np.int8))
+    q_samples = np.concatenate(q_chunks) if q_chunks else np.asarray([], dtype=float)
+    tail_indicators = np.concatenate(tail_chunks) if tail_chunks else np.asarray([], dtype=np.int8)
+    return {
+        "log_weights": np.asarray(float(beta) * q_samples, dtype=float),
+        "tail_indicators": np.asarray(tail_indicators, dtype=np.int8),
+    }
+
+
+def _pooled_scan_plus_production_row(
+    *,
+    exact_p: float,
+    base_row: dict[str, Any],
+    scan_sample_pack: dict[str, Any],
+    production_payload: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    scan_logw = np.asarray(scan_sample_pack.get("log_weights", []), dtype=float)
+    scan_tail = np.asarray(scan_sample_pack.get("tail_indicators", []), dtype=np.int8)
+    prod_logw = np.asarray(production_payload.get("log_weights", []), dtype=float)
+    prod_tail = np.asarray(production_payload.get("tail_indicators", []), dtype=np.int8)
+
+    log_weight_blocks = [arr for arr in (scan_logw, prod_logw) if arr.size]
+    tail_blocks = [arr for arr in (scan_tail, prod_tail) if arr.size]
+    if not log_weight_blocks or not tail_blocks:
+        raise ValueError("pooled estimator requires at least one non-empty sample block")
+
+    all_logw = np.concatenate(log_weight_blocks)
+    all_tail = np.concatenate(tail_blocks)
+    shift = float(np.max(all_logw))
+    weights = np.exp(all_logw - shift)
+    weight_sum = float(np.sum(weights))
+    estimate = float(np.dot(weights, all_tail) / weight_sum)
+    weight_summary = summarize_weights(weights)
+
+    row = dict(base_row)
+    row["estimate"] = float(estimate)
+    row["variance_estimate"] = np.nan
+    row["snis_mcse_obm"] = np.nan
+    row["tail_hits"] = int(np.sum(all_tail))
+    row["tail_share_raw"] = np.nan
+    row["ess"] = float(effective_sample_size(weights))
+    row["weight_cv"] = float(weight_summary.cv)
+    row["n_weighted_samples"] = int(weights.size)
+    row["estimator_variant"] = "scan_plus_production"
+    row["scan_n_weighted_samples"] = int(scan_tail.size)
+    row["production_n_weighted_samples"] = int(prod_tail.size)
+    row["pooled_scan_batch_count"] = int(scan_sample_pack.get("n_batches", 0))
+    return _annotate_error_fields(row, float(exact_p))
+
+
+def run_scan_budget_repeat_job(
+    *,
+    scenario_key: str,
+    scenario_display: str,
+    family: str | None,
+    statistic_family: str | None,
+    sample_size_band: str | None,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    repeat_idx: int,
+    pilot_seed: int,
+    total_budget: int,
+    base_mcmc_cfg: MCMCWorkflowConfig,
+    rule_budgets: list[dict[str, Any]],
+    production_estimate_variance: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    pilot_t = iid_pilot_statistics(
+        problem,
+        n_samples=int(base_mcmc_cfg.pilot_samples),
+        seed=int(pilot_seed),
+    )
+    sigma_t = estimate_scale_T(pilot_t, method=str(base_mcmc_cfg.scale_method))
+    p0_for_qtarget = float(exact_p) if base_mcmc_cfg.use_true_p0_for_q_target else float(base_mcmc_cfg.p0_guess)
+    q_target = float(float(p0_for_qtarget) ** float(base_mcmc_cfg.d_alpha))
+
+    scan_records: list[dict[str, Any]] = []
+    scan_sample_packs: dict[str, dict[str, Any]] = {}
+
+    for rule_idx, rule_budget in enumerate(rule_budgets):
+        cfg = replace(
+            base_mcmc_cfg,
+            proposal_size=int(rule_budget["proposal_size"]),
+            local_scan_swap_counts=(int(rule_budget["proposal_size"]),),
+            local_scan_finalist_count=int(rule_budget["finalist_count"]),
+            local_scan_screen_total_steps=int(rule_budget["screen_total_steps"]),
+            local_scan_total_steps=int(rule_budget["final_total_steps"]),
+        )
+        scan_seed = int(pilot_seed) + 1_000 + 100 * int(rule_idx)
+        scan = local_beta_scan(
+            problem,
+            cfg,
+            pilot_t=pilot_t,
+            p0_for_qtarget=p0_for_qtarget,
+            sigma_t=float(sigma_t),
+            q_target=float(q_target),
+            seed=int(scan_seed),
+            return_sample_batches=True,
+        )
+        row = _selected_scan_row(scan)
+        scan_sample_pack = _pack_scan_sample_batches(list(scan.get("sample_batches", [])))
+        beta_selection_budget = int(cfg.pilot_samples) + int(scan.get("scan_eval_total", 0))
+        production_budget = int(total_budget) - int(beta_selection_budget)
+        record = {
+            **dict(rule_budget),
+            "scenario": str(scenario_key),
+            "scenario_display": str(scenario_display),
+            "family": family,
+            "statistic_family": statistic_family,
+            "sample_size_band": sample_size_band,
+            "repeat": int(repeat_idx),
+            "pilot_seed": int(pilot_seed),
+            "scan_seed": int(scan_seed),
+            "exact_p": float(exact_p),
+            "sigma_t": float(sigma_t),
+            "p0_for_qtarget": float(p0_for_qtarget),
+            "q_target": float(q_target),
+            "selected_beta": float(scan.get("selected_beta", np.nan)),
+            "selected_q_multiplier": float(scan.get("selected_q_multiplier", np.nan)),
+            "selected_proposal_size": int(scan.get("selected_proposal_size", rule_budget["proposal_size"])),
+            "selected_reason": str(scan.get("selected_reason", "")),
+            "selected_q_tilt_tail_share": float(row.get("q_tilt_tail_share", np.nan)),
+            "selected_ess": float(row.get("ess", np.nan)),
+            "selected_weight_cv": float(row.get("weight_cv", np.nan)),
+            "selected_objective": float(row.get("objective_selected", np.nan)),
+            "pilot_eval_total": int(cfg.pilot_samples),
+            "screen_eval_total": int(scan.get("screen_eval_total", 0)),
+            "final_eval_total": int(scan.get("final_eval_total", 0)),
+            "scan_eval_total": int(scan.get("scan_eval_total", 0)),
+            "scan_sample_batch_count": int(scan_sample_pack["n_batches"]),
+            "scan_n_weighted_samples": int(scan_sample_pack["n_weighted_samples"]),
+            "beta_selection_budget": int(beta_selection_budget),
+            "production_budget": int(production_budget),
+            "total_budget": int(total_budget),
+            "valid_for_production": int(production_budget > 0 and np.isfinite(scan.get("selected_beta", np.nan))),
+        }
+        scan_records.append(record)
+        scan_sample_packs[str(rule_budget["rule_name"])] = scan_sample_pack
+
+    valid_scan_records = [row for row in scan_records if int(row["valid_for_production"]) == 1]
+    grouped_rows: dict[tuple[int, float], list[dict[str, Any]]] = {}
+    for row in valid_scan_records:
+        grouped_rows.setdefault((int(row["selected_proposal_size"]), float(row["selected_beta"])), []).append(row)
+
+    production_records: list[dict[str, Any]] = []
+    for group_idx, ((proposal_size, beta), group_rows) in enumerate(
+        sorted(grouped_rows.items(), key=lambda item: (int(item[0][0]), float(item[0][1])))
+    ):
+        checkpoints = tuple(sorted({int(row["production_budget"]) for row in group_rows if int(row["production_budget"]) > 0}))
+        if not checkpoints:
+            continue
+        prod_cfg = replace(
+            base_mcmc_cfg,
+            estimate_variance=bool(production_estimate_variance),
+            proposal_size=int(proposal_size),
+            local_scan_swap_counts=(int(proposal_size),),
+        )
+        prod_seed = int(pilot_seed) + 1_000_000 + 10_000 * int(group_idx)
+        traces, steps_per_checkpoint = _run_scan_budget_production_traces(
+            problem,
+            checkpoints=checkpoints,
+            beta=float(beta),
+            sigma_t=float(sigma_t),
+            cfg=prod_cfg,
+            seed=int(prod_seed),
+            init_states=None,
+        )
+
+        rows_by_checkpoint: dict[int, dict[str, Any]] = {}
+        payloads_by_checkpoint: dict[int, dict[str, np.ndarray]] = {}
+        for checkpoint in checkpoints:
+            steps_per_chain = int(steps_per_checkpoint[int(checkpoint)])
+            burn_in = _burn_in(steps_per_chain, float(prod_cfg.burn_in_fraction))
+            rows_by_checkpoint[int(checkpoint)] = _mcmc_prefix_row(
+                exact_p=float(exact_p),
+                checkpoint=int(checkpoint),
+                steps_per_chain=steps_per_chain,
+                burn_in=burn_in,
+                thin=int(prod_cfg.thin),
+                beta=float(beta),
+                sigma_t=float(sigma_t),
+                tilt_mode=str(prod_cfg.tilt_mode),
+                estimate_variance=bool(prod_cfg.estimate_variance),
+                obm_batch_size=prod_cfg.obm_batch_size,
+                traces=traces,
+                n_chains=int(prod_cfg.chains),
+            )
+            payloads_by_checkpoint[int(checkpoint)] = _production_prefix_payload(
+                traces=traces,
+                steps_per_chain=steps_per_chain,
+                burn_in=burn_in,
+                thin=int(prod_cfg.thin),
+                beta=float(beta),
+            )
+
+        for scan_row in group_rows:
+            checkpoint = int(scan_row["production_budget"])
+            base_row = dict(rows_by_checkpoint[checkpoint])
+            base_row.update(
+                {
+                    "scenario": str(scenario_key),
+                    "repeat": int(repeat_idx),
+                    "rule_name": str(scan_row["rule_name"]),
+                    "rule_kind": str(scan_row["rule_kind"]),
+                    "beta_selection_budget": int(scan_row["beta_selection_budget"]),
+                    "production_budget": int(scan_row["production_budget"]),
+                    "total_budget": int(scan_row["total_budget"]),
+                    "eval_incl_scan": int(scan_row["beta_selection_budget"]) + int(scan_row["production_budget"]),
+                    "selected_q_multiplier": float(scan_row["selected_q_multiplier"]),
+                    "selected_beta": float(scan_row["selected_beta"]),
+                    "selected_proposal_size": int(scan_row["selected_proposal_size"]),
+                    "selected_scan_q_tilt_tail_share": float(scan_row["selected_q_tilt_tail_share"]),
+                    "selected_scan_ess": float(scan_row["selected_ess"]),
+                    "selected_scan_weight_cv": float(scan_row["selected_weight_cv"]),
+                    "scan_sample_batch_count": int(scan_row.get("scan_sample_batch_count", 0)),
+                    "available_scan_n_weighted_samples": int(scan_row.get("scan_n_weighted_samples", 0)),
+                    "prod_seed": int(prod_seed),
+                }
+            )
+
+            prod_only_row = dict(base_row)
+            prod_only_row["estimator_variant"] = "production_only"
+            prod_only_row["scan_n_weighted_samples"] = 0
+            prod_only_row["production_n_weighted_samples"] = int(prod_only_row.get("n_weighted_samples", 0))
+            prod_only_row["pooled_scan_batch_count"] = 0
+            production_records.append(prod_only_row)
+
+            pooled_row = _pooled_scan_plus_production_row(
+                exact_p=float(exact_p),
+                base_row=base_row,
+                scan_sample_pack=scan_sample_packs[str(scan_row["rule_name"])],
+                production_payload=payloads_by_checkpoint[checkpoint],
+            )
+            production_records.append(pooled_row)
+
+    return {
+        "scan_records": scan_records,
+        "production_records": production_records,
     }
 
 
