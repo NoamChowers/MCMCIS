@@ -63,14 +63,22 @@ class MCMCWorkflowConfig:
     thin: int = 1
     estimate_variance: bool = True
     obm_batch_size: int | None = None
+    production_estimator_variant: str = "production_only"
     tilt_mode: str = "smooth_hinge"
     proposal_size: float | int = 0.075
     local_scan_enabled: bool = True
+    local_scan_strategy: str = "fixed_grid"
     local_scan_q_multipliers: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.10, 0.15, 0.25, 0.33)
+    local_scan_coarse_q_multipliers: tuple[float, ...] = ()
     local_scan_swap_counts: tuple[int, ...] = (1, 2, 3)
     local_scan_objective: str = "varhat_qmatch_soft"
     local_scan_screen_total_steps: int = 6_000
     local_scan_screen_chains: int = 1
+    local_scan_refine_total_steps: int | None = None
+    local_scan_refine_chains: int | None = None
+    local_scan_refine_top_k: int = 2
+    local_scan_refine_radius: int = 1
+    local_scan_refine_max_q_points: int = 6
     local_scan_finalist_count: int = 3
     local_scan_total_steps: int = 32_000
     local_scan_chains: int = 2
@@ -471,6 +479,22 @@ def _build_q_scan_candidates(
     return candidates
 
 
+def _candidate_multiplier_key(q_multiplier: float) -> str:
+    return f"{float(q_multiplier):.12g}"
+
+
+def _select_candidate_subset_by_multipliers(
+    candidates: list[dict[str, Any]],
+    q_multipliers: Iterable[float],
+) -> list[dict[str, Any]]:
+    allowed = {_candidate_multiplier_key(v) for v in q_multipliers}
+    return [
+        dict(candidate)
+        for candidate in candidates
+        if _candidate_multiplier_key(float(candidate["q_multiplier"])) in allowed
+    ]
+
+
 def _rank_scan_rows(rows: list[dict[str, Any]], *, objective_name: str) -> list[int]:
     metric_key = _scan_metric_key(objective_name)
     finite_indices = [
@@ -498,6 +522,85 @@ def _rank_scan_rows(rows: list[dict[str, Any]], *, objective_name: str) -> list[
     )
 
 
+def _rank_scan_q_indices(rows: list[dict[str, Any]], *, objective_name: str) -> list[int]:
+    metric_key = _scan_metric_key(objective_name)
+    best_by_q: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        q_index = int(row["q_index"])
+        current = best_by_q.get(q_index)
+        candidate_key = (
+            float(row.get(metric_key, np.inf)),
+            int(row["q_index"]),
+            int(row["n_swap_pairs"]),
+            float(row["beta"]) if np.isfinite(row.get("beta", np.nan)) else float("inf"),
+        )
+        if current is None:
+            best_by_q[q_index] = dict(row)
+            continue
+        current_key = (
+            float(current.get(metric_key, np.inf)),
+            int(current["q_index"]),
+            int(current["n_swap_pairs"]),
+            float(current["beta"]) if np.isfinite(current.get("beta", np.nan)) else float("inf"),
+        )
+        if candidate_key < current_key:
+            best_by_q[q_index] = dict(row)
+
+    finite_q = [
+        q_index
+        for q_index, row in best_by_q.items()
+        if np.isfinite(row.get(metric_key, np.inf))
+    ]
+    if finite_q:
+        return sorted(
+            finite_q,
+            key=lambda q_index: (
+                float(best_by_q[q_index][metric_key]),
+                int(best_by_q[q_index]["q_index"]),
+                int(best_by_q[q_index]["n_swap_pairs"]),
+                float(best_by_q[q_index]["beta"]),
+            ),
+        )
+    return sorted(best_by_q)
+
+
+def _adaptive_refine_q_indices(
+    rows: list[dict[str, Any]],
+    *,
+    objective_name: str,
+    max_master_q_index: int,
+    top_k: int,
+    radius: int,
+    max_q_points: int,
+) -> list[int]:
+    ranked_q_indices = _rank_scan_q_indices(rows, objective_name=objective_name)
+    if not ranked_q_indices:
+        return []
+
+    anchor_indices = ranked_q_indices[: max(int(top_k), 1)]
+    anchor_rank = {int(q_idx): rank for rank, q_idx in enumerate(anchor_indices)}
+    candidates: dict[int, tuple[int, int, int]] = {}
+    for q_idx in anchor_indices:
+        for offset in range(-int(radius), int(radius) + 1):
+            candidate_q = int(q_idx) + int(offset)
+            if candidate_q < 0 or candidate_q > int(max_master_q_index):
+                continue
+            score = (abs(int(offset)), int(anchor_rank[int(q_idx)]), int(candidate_q))
+            current = candidates.get(candidate_q)
+            if current is None or score < current:
+                candidates[candidate_q] = score
+
+    ordered = [q_idx for q_idx, _ in sorted(candidates.items(), key=lambda item: item[1])]
+    limit = max(int(max_q_points), len(anchor_indices), 1)
+    if len(ordered) < limit:
+        for q_idx in ranked_q_indices:
+            if q_idx not in candidates:
+                ordered.append(int(q_idx))
+            if len(ordered) >= limit:
+                break
+    return ordered[:limit]
+
+
 def _run_local_scan_stage(
     problem: PermutationTestProblem,
     cfg: MCMCWorkflowConfig,
@@ -509,6 +612,7 @@ def _run_local_scan_stage(
     seed: int,
     stage: str,
     return_sample_batches: bool = False,
+    init_states_by_config: dict[str, list[np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     steps_per_chain, burn_in = _local_scan_steps(
         total_steps,
@@ -535,6 +639,9 @@ def _run_local_scan_stage(
                     "tail_hits_weighted_sample": 0,
                     "acceptance_rate": np.nan,
                     "weight_cv": np.nan,
+                    "state_reused_init": 0,
+                    "state_reuse_mode": "fresh_observed",
+                    "scan_burn_in": int(burn_in),
                     "objective_selected": float("inf"),
                     "screen_rank": None,
                     "advanced_to_final": None,
@@ -553,16 +660,43 @@ def _run_local_scan_stage(
             )
             continue
 
+        candidate_key = str(candidate["config_id"])
+        raw_init_states = None if init_states_by_config is None else init_states_by_config.get(candidate_key)
+        if raw_init_states:
+            if len(raw_init_states) >= int(n_chains):
+                reused_init_states = [
+                    np.asarray(raw_init_states[chain_idx], dtype=np.int8).copy()
+                    for chain_idx in range(int(n_chains))
+                ]
+                candidate_burn_in = 0
+                state_reuse_mode = "continued"
+            else:
+                # Expanding from fewer chains to more chains duplicates initial
+                # states. Keep the usual burn-in so the new chains decorrelate.
+                reused_init_states = [
+                    np.asarray(raw_init_states[chain_idx % len(raw_init_states)], dtype=np.int8).copy()
+                    for chain_idx in range(int(n_chains))
+                ]
+                candidate_burn_in = burn_in
+                state_reuse_mode = "expanded_with_burn_in"
+            candidate_init: str | list[np.ndarray] = reused_init_states
+            state_reused_init = 1
+        else:
+            candidate_init = "observed"
+            candidate_burn_in = burn_in
+            state_reused_init = 0
+            state_reuse_mode = "fresh_observed"
+
         res = run_mcmc_is(
             problem,
             beta=float(candidate["beta"]),
             sigma_t=sigma_t,
             n_steps=steps_per_chain,
-            burn_in=burn_in,
+            burn_in=candidate_burn_in,
             thin=cfg.local_scan_thin,
             n_chains=int(n_chains),
             seed=seed + 10_000 * idx,
-            init="observed",
+            init=candidate_init,
             tilt_mode=str(cfg.tilt_mode),
             proposal_size=int(candidate["n_swap_pairs"]),
             estimate_variance=True,
@@ -578,7 +712,7 @@ def _run_local_scan_stage(
             tail_indicators=np.asarray(res.tail_indicators, dtype=np.int8),
             p_reference=float(candidate["q_scan_target"]),
             n_chains=int(n_chains),
-            chain_kept_samples=int(_kept_samples_per_chain(steps_per_chain, burn_in, cfg.local_scan_thin)),
+            chain_kept_samples=int(_kept_samples_per_chain(steps_per_chain, candidate_burn_in, cfg.local_scan_thin)),
             obm_batch_size=cfg.obm_batch_size,
         )
         objective_values = _compute_varhat_objectives(
@@ -603,6 +737,9 @@ def _run_local_scan_stage(
                 "tail_hits_weighted_sample": int(res.tail_hits_weighted_sample),
                 "acceptance_rate": float(res.overall_acceptance_rate),
                 "weight_cv": float(res.weight_summary.cv),
+                "state_reused_init": int(state_reused_init),
+                "state_reuse_mode": str(state_reuse_mode),
+                "scan_burn_in": int(candidate_burn_in),
                 "objective_selected": float(objective_values.get(_scan_metric_key(cfg.local_scan_objective), np.inf)),
                 "screen_rank": None,
                 "advanced_to_final": None,
@@ -714,6 +851,8 @@ def local_beta_scan(
 ) -> dict[str, Any]:
     if cfg.local_scan_screen_total_steps <= 0:
         raise ValueError("local_scan_screen_total_steps must be positive.")
+    if cfg.local_scan_refine_total_steps is not None and int(cfg.local_scan_refine_total_steps) <= 0:
+        raise ValueError("local_scan_refine_total_steps must be positive when provided.")
     if cfg.local_scan_finalist_count <= 0:
         raise ValueError("local_scan_finalist_count must be positive.")
     if cfg.local_scan_variance_near_min_ratio < 1.0:
@@ -749,39 +888,150 @@ def local_beta_scan(
             "scan_wall_time_sec": 0.0,
             "selected_reason": "no_local_scan_candidates",
         }
-    screen = _run_local_scan_stage(
-        problem,
-        cfg,
-        candidates=candidates,
-        sigma_t=sigma_t,
-        total_steps=int(cfg.local_scan_screen_total_steps),
-        n_chains=int(cfg.local_scan_screen_chains),
-        seed=seed,
-        stage="screen",
-        return_sample_batches=bool(return_sample_batches),
-    )
-    screen_rows = screen["rows"]
-    ranked_screen_indices = _rank_scan_rows(screen_rows, objective_name=cfg.local_scan_objective)
-    target_finalist_count = min(int(cfg.local_scan_finalist_count), len(screen_rows))
-    finalist_indices = [int(idx) for idx in ranked_screen_indices[:target_finalist_count]]
-    finalist_candidates = [dict(screen_rows[idx]) for idx in finalist_indices]
-    for rank, idx in enumerate(ranked_screen_indices):
-        screen_rows[idx]["screen_rank"] = int(rank)
-        screen_rows[idx]["advanced_to_final"] = int(idx in finalist_indices)
-        if idx in finalist_indices:
-            screen_rows[idx]["advanced_reason"] = "screen_objective_rank"
+    strategy = str(cfg.local_scan_strategy)
+    refine_rows: list[dict[str, Any]] = []
+    refine_eval_total = 0
+    refine_wall_time_sec = 0.0
+    refine_steps_per_chain = 0
+    refine_burn_in = 0
+    sample_batches: list[dict[str, Any]] = []
 
-    final = _run_local_scan_stage(
-        problem,
-        cfg,
-        candidates=finalist_candidates,
-        sigma_t=sigma_t,
-        total_steps=int(cfg.local_scan_total_steps),
-        n_chains=int(cfg.local_scan_chains),
-        seed=seed + 1_000_000,
-        stage="final",
-        return_sample_batches=bool(return_sample_batches),
-    )
+    if strategy == "adaptive_q":
+        coarse_q_multipliers = tuple(
+            float(v) for v in (
+                cfg.local_scan_coarse_q_multipliers
+                if cfg.local_scan_coarse_q_multipliers
+                else cfg.local_scan_q_multipliers
+            )
+        )
+        coarse_candidates = _select_candidate_subset_by_multipliers(candidates, coarse_q_multipliers)
+        if not coarse_candidates:
+            coarse_candidates = list(candidates)
+        screen = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=coarse_candidates,
+            sigma_t=sigma_t,
+            total_steps=int(cfg.local_scan_screen_total_steps),
+            n_chains=int(cfg.local_scan_screen_chains),
+            seed=seed,
+            stage="coarse",
+            return_sample_batches=bool(return_sample_batches),
+        )
+        screen_rows = screen["rows"]
+        ranked_screen_indices = _rank_scan_rows(screen_rows, objective_name=cfg.local_scan_objective)
+        for rank, idx in enumerate(ranked_screen_indices):
+            screen_rows[idx]["screen_rank"] = int(rank)
+            screen_rows[idx]["advanced_to_final"] = 0
+            screen_rows[idx]["advanced_reason"] = None
+
+        max_master_q_index = max(int(candidate["q_index"]) for candidate in candidates)
+        refine_q_indices = _adaptive_refine_q_indices(
+            screen_rows,
+            objective_name=cfg.local_scan_objective,
+            max_master_q_index=max_master_q_index,
+            top_k=int(cfg.local_scan_refine_top_k),
+            radius=int(cfg.local_scan_refine_radius),
+            max_q_points=int(cfg.local_scan_refine_max_q_points),
+        )
+        refine_candidates = [
+            dict(candidate)
+            for candidate in candidates
+            if int(candidate["q_index"]) in set(int(v) for v in refine_q_indices)
+        ]
+        refine_total_steps = int(
+            cfg.local_scan_refine_total_steps
+            if cfg.local_scan_refine_total_steps is not None
+            else cfg.local_scan_screen_total_steps
+        )
+        refine_chains = int(
+            cfg.local_scan_refine_chains
+            if cfg.local_scan_refine_chains is not None
+            else cfg.local_scan_screen_chains
+        )
+        refine = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=refine_candidates,
+            sigma_t=sigma_t,
+            total_steps=refine_total_steps,
+            n_chains=refine_chains,
+            seed=seed + 500_000,
+            stage="refine",
+            return_sample_batches=bool(return_sample_batches),
+            init_states_by_config=screen["final_states"],
+        )
+        refine_rows = refine["rows"]
+        refine_eval_total = int(refine["eval_total"])
+        refine_wall_time_sec = float(refine["wall_time_sec"])
+        refine_steps_per_chain = int(refine["steps_per_chain"])
+        refine_burn_in = int(refine["burn_in"])
+        ranked_refine_indices = _rank_scan_rows(refine_rows, objective_name=cfg.local_scan_objective)
+        target_finalist_count = min(int(cfg.local_scan_finalist_count), len(refine_rows))
+        finalist_indices = [int(idx) for idx in ranked_refine_indices[:target_finalist_count]]
+        finalist_candidates = [dict(refine_rows[idx]) for idx in finalist_indices]
+        for rank, idx in enumerate(ranked_refine_indices):
+            refine_rows[idx]["refine_rank"] = int(rank)
+            refine_rows[idx]["advanced_to_final"] = int(idx in finalist_indices)
+            if idx in finalist_indices:
+                refine_rows[idx]["advanced_reason"] = "refine_objective_rank"
+        final = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=finalist_candidates,
+            sigma_t=sigma_t,
+            total_steps=int(cfg.local_scan_total_steps),
+            n_chains=int(cfg.local_scan_chains),
+            seed=seed + 1_000_000,
+            stage="final",
+            return_sample_batches=bool(return_sample_batches),
+            init_states_by_config=refine["final_states"],
+        )
+        sample_batches = (
+            list(screen.get("sample_batches", []))
+            + list(refine.get("sample_batches", []))
+            + list(final.get("sample_batches", []))
+        )
+    elif strategy == "fixed_grid":
+        screen = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=candidates,
+            sigma_t=sigma_t,
+            total_steps=int(cfg.local_scan_screen_total_steps),
+            n_chains=int(cfg.local_scan_screen_chains),
+            seed=seed,
+            stage="screen",
+            return_sample_batches=bool(return_sample_batches),
+        )
+        screen_rows = screen["rows"]
+        ranked_screen_indices = _rank_scan_rows(screen_rows, objective_name=cfg.local_scan_objective)
+        target_finalist_count = min(int(cfg.local_scan_finalist_count), len(screen_rows))
+        finalist_indices = [int(idx) for idx in ranked_screen_indices[:target_finalist_count]]
+        finalist_candidates = [dict(screen_rows[idx]) for idx in finalist_indices]
+        for rank, idx in enumerate(ranked_screen_indices):
+            screen_rows[idx]["screen_rank"] = int(rank)
+            screen_rows[idx]["advanced_to_final"] = int(idx in finalist_indices)
+            if idx in finalist_indices:
+                screen_rows[idx]["advanced_reason"] = "screen_objective_rank"
+
+        final = _run_local_scan_stage(
+            problem,
+            cfg,
+            candidates=finalist_candidates,
+            sigma_t=sigma_t,
+            total_steps=int(cfg.local_scan_total_steps),
+            n_chains=int(cfg.local_scan_chains),
+            seed=seed + 1_000_000,
+            stage="final",
+            return_sample_batches=bool(return_sample_batches),
+            init_states_by_config=screen["final_states"],
+        )
+        screen_rows = screen["rows"]
+        sample_batches = list(screen.get("sample_batches", [])) + list(final.get("sample_batches", []))
+    else:
+        raise ValueError(f"Unknown local_scan_strategy: {strategy}")
+
     rows = final["rows"]
     ranked_final_indices = _rank_scan_rows(rows, objective_name=cfg.local_scan_objective)
     metric_key = _scan_metric_key(cfg.local_scan_objective)
@@ -832,39 +1082,60 @@ def local_beta_scan(
         "screen_steps_per_chain": int(screen["steps_per_chain"]),
         "screen_burn_in": int(screen["burn_in"]),
         "screen_eval_total": int(screen["eval_total"]),
+        "refine_steps_per_chain": int(refine_steps_per_chain),
+        "refine_burn_in": int(refine_burn_in),
+        "refine_eval_total": int(refine_eval_total),
         "final_eval_total": int(final["eval_total"]),
-        "scan_eval_total": int(screen["eval_total"] + final["eval_total"]),
+        "scan_eval_total": int(screen["eval_total"] + refine_eval_total + final["eval_total"]),
         "scan_wall_time_sec": float(time.perf_counter() - t_start),
         "screen_wall_time_sec": float(screen["wall_time_sec"]),
+        "refine_wall_time_sec": float(refine_wall_time_sec),
         "final_wall_time_sec": float(final["wall_time_sec"]),
         "selection_metrics": {
             "selection_rule": {
-                "type": "two_stage_smallest_stable_configuration",
+                "type": "adaptive_q_smallest_stable_configuration" if strategy == "adaptive_q" else "two_stage_smallest_stable_configuration",
                 "objective": str(cfg.local_scan_objective),
                 "objective_near_min_ratio": float(cfg.local_scan_variance_near_min_ratio),
                 "preference_within_tolerance": "smaller_q_then_smaller_swap_then_smaller_beta",
             },
             "screening_rule": {
-                "type": "discrete_q_swap_grid",
+                "type": "adaptive_coarse_refine_final" if strategy == "adaptive_q" else "discrete_q_swap_grid",
+                "strategy": strategy,
                 "screen_total_steps": int(cfg.local_scan_screen_total_steps),
                 "screen_chains": int(cfg.local_scan_screen_chains),
+                "refine_total_steps": (
+                    int(cfg.local_scan_refine_total_steps)
+                    if cfg.local_scan_refine_total_steps is not None
+                    else int(cfg.local_scan_screen_total_steps)
+                ),
+                "refine_chains": (
+                    int(cfg.local_scan_refine_chains)
+                    if cfg.local_scan_refine_chains is not None
+                    else int(cfg.local_scan_screen_chains)
+                ),
+                "refine_top_k": int(cfg.local_scan_refine_top_k),
+                "refine_radius": int(cfg.local_scan_refine_radius),
+                "refine_max_q_points": int(cfg.local_scan_refine_max_q_points),
                 "final_total_steps": int(cfg.local_scan_total_steps),
                 "final_chains": int(cfg.local_scan_chains),
                 "finalist_count": int(cfg.local_scan_finalist_count),
                 "screen_ranking": str(cfg.local_scan_objective),
+                "reuse_state_across_scan_stages": True,
                 "reuse_finalist_state_for_production": True,
             },
             "q_ladder": {
-                "type": "fixed_discrete_grid",
+                "type": "adaptive_coarse_refine_grid" if strategy == "adaptive_q" else "fixed_discrete_grid",
                 "q_target_center": float(q_target),
                 "q_multipliers": [float(mult) for mult in cfg.local_scan_q_multipliers],
+                "coarse_q_multipliers": [float(mult) for mult in cfg.local_scan_coarse_q_multipliers],
                 "swap_counts": [int(v) for v in cfg.local_scan_swap_counts],
             },
         },
         "screen_rows": screen_rows,
+        "refine_rows": refine_rows,
         "rows": rows,
         "production_init_states": production_init_states,
-        "sample_batches": list(screen.get("sample_batches", [])) + list(final.get("sample_batches", [])),
+        "sample_batches": sample_batches,
     }
 
 
@@ -907,6 +1178,19 @@ def _pack_scan_sample_batches(sample_batches: list[dict[str, Any]]) -> dict[str,
         "n_batches": int(len(sample_batches)),
         "n_weighted_samples": int(tail_indicators.size),
     }
+
+
+def _selected_scan_sample_pack(scan: dict[str, Any]) -> dict[str, Any]:
+    selected_beta = float(scan.get("selected_beta", np.nan))
+    selected_proposal_size = int(scan.get("selected_proposal_size", -1))
+    selected_batches = [
+        batch
+        for batch in list(scan.get("sample_batches", []))
+        if int(batch.get("n_swap_pairs", -999)) == selected_proposal_size
+        and np.isfinite(batch.get("beta", np.nan))
+        and abs(float(batch["beta"]) - selected_beta) <= 1e-10
+    ]
+    return _pack_scan_sample_batches(selected_batches)
 
 
 def _run_scan_budget_production_traces(
@@ -987,6 +1271,7 @@ def _pooled_scan_plus_production_row(
     base_row: dict[str, Any],
     scan_sample_pack: dict[str, Any],
     production_payload: dict[str, np.ndarray],
+    estimator_variant: str = "scan_plus_production",
 ) -> dict[str, Any]:
     scan_logw = np.asarray(scan_sample_pack.get("log_weights", []), dtype=float)
     scan_tail = np.asarray(scan_sample_pack.get("tail_indicators", []), dtype=np.int8)
@@ -1015,7 +1300,7 @@ def _pooled_scan_plus_production_row(
     row["ess"] = float(effective_sample_size(weights))
     row["weight_cv"] = float(weight_summary.cv)
     row["n_weighted_samples"] = int(weights.size)
-    row["estimator_variant"] = "scan_plus_production"
+    row["estimator_variant"] = str(estimator_variant)
     row["scan_n_weighted_samples"] = int(scan_tail.size)
     row["production_n_weighted_samples"] = int(prod_tail.size)
     row["pooled_scan_batch_count"] = int(scan_sample_pack.get("n_batches", 0))
@@ -1048,7 +1333,8 @@ def run_scan_budget_repeat_job(
     q_target = float(float(p0_for_qtarget) ** float(base_mcmc_cfg.d_alpha))
 
     scan_records: list[dict[str, Any]] = []
-    scan_sample_packs: dict[str, dict[str, Any]] = {}
+    all_scan_sample_packs: dict[str, dict[str, Any]] = {}
+    selected_scan_sample_packs: dict[str, dict[str, Any]] = {}
 
     for rule_idx, rule_budget in enumerate(rule_budgets):
         cfg = replace(
@@ -1057,6 +1343,11 @@ def run_scan_budget_repeat_job(
             local_scan_swap_counts=(int(rule_budget["proposal_size"]),),
             local_scan_finalist_count=int(rule_budget["finalist_count"]),
             local_scan_screen_total_steps=int(rule_budget["screen_total_steps"]),
+            local_scan_refine_total_steps=(
+                int(rule_budget["refine_total_steps"])
+                if rule_budget.get("refine_total_steps") is not None
+                else base_mcmc_cfg.local_scan_refine_total_steps
+            ),
             local_scan_total_steps=int(rule_budget["final_total_steps"]),
         )
         scan_seed = int(pilot_seed) + 1_000 + 100 * int(rule_idx)
@@ -1072,6 +1363,7 @@ def run_scan_budget_repeat_job(
         )
         row = _selected_scan_row(scan)
         scan_sample_pack = _pack_scan_sample_batches(list(scan.get("sample_batches", [])))
+        selected_scan_pack = _selected_scan_sample_pack(scan)
         beta_selection_budget = int(cfg.pilot_samples) + int(scan.get("scan_eval_total", 0))
         production_budget = int(total_budget) - int(beta_selection_budget)
         record = {
@@ -1098,17 +1390,21 @@ def run_scan_budget_repeat_job(
             "selected_objective": float(row.get("objective_selected", np.nan)),
             "pilot_eval_total": int(cfg.pilot_samples),
             "screen_eval_total": int(scan.get("screen_eval_total", 0)),
+            "refine_eval_total": int(scan.get("refine_eval_total", 0)),
             "final_eval_total": int(scan.get("final_eval_total", 0)),
             "scan_eval_total": int(scan.get("scan_eval_total", 0)),
             "scan_sample_batch_count": int(scan_sample_pack["n_batches"]),
             "scan_n_weighted_samples": int(scan_sample_pack["n_weighted_samples"]),
+            "selected_scan_sample_batch_count": int(selected_scan_pack["n_batches"]),
+            "selected_scan_n_weighted_samples": int(selected_scan_pack["n_weighted_samples"]),
             "beta_selection_budget": int(beta_selection_budget),
             "production_budget": int(production_budget),
             "total_budget": int(total_budget),
             "valid_for_production": int(production_budget > 0 and np.isfinite(scan.get("selected_beta", np.nan))),
         }
         scan_records.append(record)
-        scan_sample_packs[str(rule_budget["rule_name"])] = scan_sample_pack
+        all_scan_sample_packs[str(rule_budget["rule_name"])] = scan_sample_pack
+        selected_scan_sample_packs[str(rule_budget["rule_name"])] = selected_scan_pack
 
     valid_scan_records = [row for row in scan_records if int(row["valid_for_production"]) == 1]
     grouped_rows: dict[tuple[int, float], list[dict[str, Any]]] = {}
@@ -1187,6 +1483,7 @@ def run_scan_budget_repeat_job(
                     "selected_scan_weight_cv": float(scan_row["selected_weight_cv"]),
                     "scan_sample_batch_count": int(scan_row.get("scan_sample_batch_count", 0)),
                     "available_scan_n_weighted_samples": int(scan_row.get("scan_n_weighted_samples", 0)),
+                    "available_selected_scan_n_weighted_samples": int(scan_row.get("selected_scan_n_weighted_samples", 0)),
                     "prod_seed": int(prod_seed),
                 }
             )
@@ -1198,11 +1495,21 @@ def run_scan_budget_repeat_job(
             prod_only_row["pooled_scan_batch_count"] = 0
             production_records.append(prod_only_row)
 
+            selected_scan_row = _pooled_scan_plus_production_row(
+                exact_p=float(exact_p),
+                base_row=base_row,
+                scan_sample_pack=selected_scan_sample_packs[str(scan_row["rule_name"])],
+                production_payload=payloads_by_checkpoint[checkpoint],
+                estimator_variant="selected_scan_plus_production",
+            )
+            production_records.append(selected_scan_row)
+
             pooled_row = _pooled_scan_plus_production_row(
                 exact_p=float(exact_p),
                 base_row=base_row,
-                scan_sample_pack=scan_sample_packs[str(scan_row["rule_name"])],
+                scan_sample_pack=all_scan_sample_packs[str(scan_row["rule_name"])],
                 production_payload=payloads_by_checkpoint[checkpoint],
+                estimator_variant="all_scan_plus_production",
             )
             production_records.append(pooled_row)
 
@@ -1261,6 +1568,12 @@ def build_beta_workflow(
             sigma_t=float(sigma_t),
             q_target=q_target,
             seed=seed + 7,
+            return_sample_batches=bool(
+                str(cfg.production_estimator_variant) in {
+                    "selected_scan_plus_production",
+                    "all_scan_plus_production",
+                }
+            ),
         )
         beta_used = float(scan["selected_beta"])
 
@@ -1292,6 +1605,7 @@ def build_beta_workflow(
             "tuning_chain_eval_total": tuning_chain_eval_total,
             "tuning_eval_total": int(tuning_eval_total),
             "screen_eval_total": int(scan.get("screen_eval_total", 0)),
+            "refine_eval_total": int(scan.get("refine_eval_total", 0)),
             "final_eval_total": int(scan.get("final_eval_total", 0)),
             "scan_eval_total": scan_eval_total,
             "beta_selection_eval_total": beta_selection_eval_total,
@@ -1303,6 +1617,14 @@ def build_beta_workflow(
         "tune_burn_in": 0,
         "tune_thin": int(cfg.tune_thin),
         "production_init_states": scan.get("production_init_states"),
+        "production_estimator_variant": str(cfg.production_estimator_variant),
+        "scan_sample_pack": (
+            _selected_scan_sample_pack(scan)
+            if str(cfg.production_estimator_variant) == "selected_scan_plus_production"
+            else _pack_scan_sample_batches(list(scan.get("sample_batches", [])))
+            if str(cfg.production_estimator_variant) == "all_scan_plus_production"
+            else None
+        ),
         "beta_selection_strategy": "pilot_only_discrete_q_swap_grid",
     }
 
@@ -2522,6 +2844,8 @@ def _run_mcmc_cumulative_checkpoints(
     seed: int,
     init_states: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
     reuse_init_state: bool = False,
+    scan_sample_pack: dict[str, Any] | None = None,
+    estimator_variant: str = "production_only",
 ) -> list[dict[str, Any]]:
     checkpoints = _sorted_unique_points(checkpoints)
     if reported_checkpoints is None:
@@ -2585,6 +2909,29 @@ def _run_mcmc_cumulative_checkpoints(
                 traces=traces,
                 n_chains=int(cfg.chains),
             )
+        if (
+            str(estimator_variant) in {"selected_scan_plus_production", "all_scan_plus_production"}
+            and scan_sample_pack is not None
+            and int(scan_sample_pack.get("n_weighted_samples", 0)) > 0
+        ):
+            row = _pooled_scan_plus_production_row(
+                exact_p=float(exact_p),
+                base_row=row,
+                scan_sample_pack=scan_sample_pack,
+                production_payload=_production_prefix_payload(
+                    traces=traces,
+                    steps_per_chain=steps_per_chain,
+                    burn_in=burn_in,
+                    thin=int(cfg.thin),
+                    beta=float(beta),
+                ),
+                estimator_variant=str(estimator_variant),
+            )
+        else:
+            row["estimator_variant"] = "production_only"
+            row["scan_n_weighted_samples"] = 0
+            row["production_n_weighted_samples"] = int(row.get("n_weighted_samples", 0))
+            row["pooled_scan_batch_count"] = 0
         row["mcmc_chain_budget"] = int(checkpoint)
         row["mcmc_reported_budget"] = int(report_checkpoint)
         row["state_reused_init"] = int(reuse_init_state)
@@ -2744,6 +3091,8 @@ def _mcmc_cross_replicate_worker(
         seed=rep_seed + 1,
         init_states=beta_workflow.get("production_init_states"),
         reuse_init_state=beta_workflow.get("production_init_states") is not None,
+        scan_sample_pack=beta_workflow.get("scan_sample_pack"),
+        estimator_variant=str(beta_workflow.get("production_estimator_variant", "production_only")),
     )
     for row in rows:
         row["scenario"] = scenario_key
@@ -2922,12 +3271,13 @@ def run_cross_method_study(
     )
     samc_setup = tune_samc_setup(scenario.problem, samc_cfg, seed=cross_cfg.base_seed + 20_000)
     beta_selection_budget = int(beta_workflow["beta_selection_eval_total"])
-    mcmc_chain_checkpoints = tuple(int(cp - beta_selection_budget) for cp in checkpoints)
-    if any(cp <= 0 for cp in mcmc_chain_checkpoints):
-        raise ValueError(
-            "Cross-method estimation_points must all exceed the fixed MCMC-IS beta-selection budget. "
-            f"Received estimation_points={list(checkpoints)}, beta_selection_budget={beta_selection_budget}."
-        )
+    mcmc_checkpoint_pairs = [
+        (int(cp), int(cp - beta_selection_budget))
+        for cp in checkpoints
+        if int(cp - beta_selection_budget) > 0
+    ]
+    mcmc_reported_checkpoints = tuple(int(cp) for cp, _ in mcmc_checkpoint_pairs)
+    mcmc_chain_checkpoints = tuple(int(chain_cp) for _, chain_cp in mcmc_checkpoint_pairs)
 
     records: list[dict[str, Any]] = []
     repeat_jobs = [(int(rep), int(cross_cfg.base_seed + 1_000 * rep)) for rep in range(cross_cfg.repeats)]
@@ -2949,22 +3299,23 @@ def run_cross_method_study(
                     confidence_level=cross_cfg.confidence_level,
                 )
             )
-        for rep, rep_seed in repeat_jobs:
-            records.extend(
-                _mcmc_cross_replicate_worker(
-                    scenario_key=scenario.key,
-                    scenario_display=scenario.description,
-                    problem=scenario.problem,
-                    exact_p=scenario.exact_p,
-                    checkpoints=checkpoints,
-                    mcmc_chain_checkpoints=mcmc_chain_checkpoints,
-                    beta_workflow=beta_workflow,
-                    beta_selection_budget=beta_selection_budget,
-                    mcmc_cfg=mcmc_cfg,
-                    rep=rep,
-                    rep_seed=rep_seed,
+        if mcmc_chain_checkpoints:
+            for rep, rep_seed in repeat_jobs:
+                records.extend(
+                    _mcmc_cross_replicate_worker(
+                        scenario_key=scenario.key,
+                        scenario_display=scenario.description,
+                        problem=scenario.problem,
+                        exact_p=scenario.exact_p,
+                        checkpoints=mcmc_reported_checkpoints,
+                        mcmc_chain_checkpoints=mcmc_chain_checkpoints,
+                        beta_workflow=beta_workflow,
+                        beta_selection_budget=beta_selection_budget,
+                        mcmc_cfg=mcmc_cfg,
+                        rep=rep,
+                        rep_seed=rep_seed,
+                    )
                 )
-            )
         for rep, rep_seed in repeat_jobs:
             records.extend(
                 _samc_replicate_worker(
@@ -2998,25 +3349,26 @@ def run_cross_method_study(
             for future in cf.as_completed(futures):
                 records.extend(future.result())
 
-            futures = [
-                executor.submit(
-                    _mcmc_cross_replicate_worker,
-                    scenario_key=scenario.key,
-                    scenario_display=scenario.description,
-                    problem=scenario.problem,
-                    exact_p=scenario.exact_p,
-                    checkpoints=checkpoints,
-                    mcmc_chain_checkpoints=mcmc_chain_checkpoints,
-                    beta_workflow=beta_workflow,
-                    beta_selection_budget=beta_selection_budget,
-                    mcmc_cfg=mcmc_cfg,
-                    rep=rep,
-                    rep_seed=rep_seed,
-                )
-                for rep, rep_seed in repeat_jobs
-            ]
-            for future in cf.as_completed(futures):
-                records.extend(future.result())
+            if mcmc_chain_checkpoints:
+                futures = [
+                    executor.submit(
+                        _mcmc_cross_replicate_worker,
+                        scenario_key=scenario.key,
+                        scenario_display=scenario.description,
+                        problem=scenario.problem,
+                        exact_p=scenario.exact_p,
+                        checkpoints=mcmc_reported_checkpoints,
+                        mcmc_chain_checkpoints=mcmc_chain_checkpoints,
+                        beta_workflow=beta_workflow,
+                        beta_selection_budget=beta_selection_budget,
+                        mcmc_cfg=mcmc_cfg,
+                        rep=rep,
+                        rep_seed=rep_seed,
+                    )
+                    for rep, rep_seed in repeat_jobs
+                ]
+                for future in cf.as_completed(futures):
+                    records.extend(future.result())
 
             futures = [
                 executor.submit(
@@ -3054,6 +3406,7 @@ def run_cross_method_study(
         "estimation_points": list(checkpoints),
         "beta_workflow": beta_workflow,
         "mcmc_beta_selection_budget": beta_selection_budget,
+        "mcmc_reported_checkpoints": list(mcmc_reported_checkpoints),
         "samc_setup": {
             "lambda_min": float(samc_setup["lambda_min"]),
             "bin_edges": np.asarray(samc_setup["bin_edges"], dtype=float),
@@ -3484,6 +3837,12 @@ def save_cross_method_outputs(
     )
     beta_workflow_payload = dict(study["beta_workflow"])
     beta_workflow_payload.pop("production_init_states", None)
+    beta_workflow_payload.pop("scan_sample_pack", None)
+    local_scan_payload = beta_workflow_payload.get("local_scan")
+    if isinstance(local_scan_payload, dict):
+        local_scan_payload = dict(local_scan_payload)
+        local_scan_payload.pop("sample_batches", None)
+        beta_workflow_payload["local_scan"] = local_scan_payload
     write_jsonl(output_dir / "run_records.jsonl", study["records"])
     write_json(output_dir / "summary.json", study["summary"])
     write_json(
@@ -3497,6 +3856,7 @@ def save_cross_method_outputs(
             "exact_tail_hits": study["exact_tail_hits"],
             "exact_n_perm": study["exact_n_perm"],
             "estimation_points": study["estimation_points"],
+            "mcmc_reported_checkpoints": study.get("mcmc_reported_checkpoints", study["estimation_points"]),
             "cross_config": cross_cfg,
             "mcmc_config": mcmc_cfg,
             "samc_config": samc_cfg,
