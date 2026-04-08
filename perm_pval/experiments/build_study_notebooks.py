@@ -155,7 +155,7 @@ def build_cross_method_notebook() -> dict:
                 "medium": 1,
                 "large": 2,
             }
-            MCMC_LOCAL_SCAN_Q_MULTIPLIERS = (0.001, 0.005, 0.01, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.25, 0.33, 0.5, 1.0)
+            MCMC_LOCAL_SCAN_Q_MULTIPLIERS = (0.001, 0.003, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15, 0.20, 0.25, 0.33, 0.5, 1.0)
             MCMC_LOCAL_SCAN_COARSE_Q_MULTIPLIERS = (0.001, 0.01, 0.10, 0.5)
 
             cross_cfg = CrossMethodStudyConfig(
