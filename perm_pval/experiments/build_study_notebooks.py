@@ -205,7 +205,7 @@ def build_cross_method_notebook() -> dict:
                     return 500_000
                 if 1e-8 <= p0 < 1e-6:
                     return 1_000_000
-                return 2_000_000
+                return 1_000_000
 
 
             def stage_eval_total(total_steps: int, *, n_candidates: int, n_chains: int) -> int:

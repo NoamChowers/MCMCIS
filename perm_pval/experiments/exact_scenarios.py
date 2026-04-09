@@ -515,6 +515,69 @@ def _make_gwas_additive_score_scenario(
     )
 
 
+def _make_skew_sparse_burden_scenario(
+    *,
+    key: str = "skew_sparse_burden_sum_tiny",
+    description: str = (
+        "Highly skewed sparse-burden benchmark: 78 zeros plus seven rare positive scores, "
+        "n=85 with a tiny right-tail treated-sum event."
+    ),
+) -> ExactScenario:
+    n = 85
+    n_treated = 6
+    x = np.asarray([0] * 78 + [1, 2, 2, 2, 4, 8, 16], dtype=float)
+    y = np.zeros(n, dtype=np.int8)
+    # Observed treated set gives score 33, which has exactly four right-tail hits.
+    y[[78, 80, 81, 82, 83, 84]] = 1
+
+    problem = PermutationTestProblem(X=x, y_obs=y, statistic=treated_sum, tail="right")
+    exact = LinearStatisticDPSolver(
+        problem,
+        scores=x,
+        score_scale=1,
+        scale=1.0,
+        offset=0.0,
+    ).compute()
+
+    if exact.tail_hits != 4:
+        raise ValueError(
+            f"Scenario '{key}' expected 4 tail hits but got {exact.tail_hits}."
+        )
+
+    scenario = ExactScenario(
+        key=key,
+        description=description,
+        problem=problem,
+        statistic_name="treated_sum",
+        exact_method="LinearStatisticDPSolver",
+        exact_p_value=float(exact.p_value),
+        tail_hits=int(exact.tail_hits),
+        n_permutations=int(exact.n_permutations),
+        notes=(
+            "Sparse burden-style treated-sum benchmark with a deliberately highly skewed permutation null. "
+            "Observed labels select six of seven rare positive scores, yielding a non-singleton tiny right tail."
+        ),
+        extra={
+            "n": int(n),
+            "n_treated": int(n_treated),
+            "positive_scores": [1, 2, 2, 2, 4, 8, 16],
+            "n_zeros": 78,
+            "observed_score": float(problem.t_obs),
+            "exact_tail_hits": int(exact.tail_hits),
+        },
+    )
+    return _apply_portfolio_metadata(
+        scenario,
+        family="skew_sparse_burden",
+        statistic_family="linear_statistic",
+        data_family="sparse_discrete_score",
+        difficulty="hard",
+        groups=("exploratory_exact", "stress_test", "shape_stress"),
+        has_ties=True,
+        is_discrete=True,
+    )
+
+
 def _make_zero_inflated_poisson_diffmeans_scenario(
     *,
     key: str = "zip_diffmeans_righttail_n40",
@@ -763,6 +826,7 @@ def build_exact_scenarios() -> list[ExactScenario]:
             seed=21,
             downgrade_swaps=1,
         ),
+        _make_skew_sparse_burden_scenario(),
         _make_rank_sum_dp_scenario(),
         _make_rank_sum_family_scenario(
             key="rank_sum_dp_swap2_n40",
