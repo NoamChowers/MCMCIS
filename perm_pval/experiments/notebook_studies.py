@@ -820,6 +820,161 @@ def _has_positive_finite(arrays: list[np.ndarray]) -> bool:
     return False
 
 
+_CROSS_METHOD_LABELS: dict[str, str] = {
+    "iid": "IID",
+    "mcmc_is": "MCMC-IS",
+    "samc": "SAMC",
+}
+
+_CROSS_METHOD_COLORS: dict[str, str] = {
+    "iid": "#4e79a7",
+    "mcmc_is": "#f28e2b",
+    "samc": "#59a14f",
+}
+
+_CROSS_METHOD_TITLES: dict[str, str] = {
+    "bruteforce_welch_nonextreme_n22": "Welch t-statistic on ordered scores (X = 1, ..., 22)",
+    "gwas_additive_score_n40": "Treated dosage sum on Binomial(2, maf = 0.15) genotypes",
+    "gwas_additive_score_sig_n60": "Treated dosage sum on Binomial(2, maf = 0.25) genotypes",
+    "hypergeom_1e7": "Treated-success count on binary outcomes",
+    "linear_stat_dp_n40": "Difference in means on deterministic quadratic scores (X = i^2)",
+    "rank_sum_dp_n40": "Mann-Whitney U on ordered scores (X = 1, ..., 40)",
+}
+
+
+def _compact_plot_title(
+    scenario_name: str,
+    *,
+    scenario_key: str | None = None,
+    n_control: int | None = None,
+    n_treated: int | None = None,
+) -> str:
+    if scenario_key is not None and scenario_key in _CROSS_METHOD_TITLES:
+        title = _CROSS_METHOD_TITLES[str(scenario_key)]
+    else:
+        title = " ".join(str(scenario_name).split()).rstrip(".")
+    if n_control is not None and n_treated is not None:
+        return f"{title}\nControl/Treated size: {int(n_control)} / {int(n_treated)}"
+    return title
+
+
+def _format_scientific_tick(value: int | float) -> str:
+    val = float(value)
+    if not np.isfinite(val) or val == 0.0:
+        return str(value)
+    exponent = int(np.floor(np.log10(abs(val))))
+    mantissa = val / (10.0 ** exponent)
+    rounded = round(mantissa, 1)
+    if np.isclose(rounded, round(rounded)):
+        mantissa_str = str(int(round(rounded)))
+    else:
+        mantissa_str = f"{rounded:.1f}".rstrip("0").rstrip(".")
+    return f"{mantissa_str}e{exponent}"
+
+
+def _style_article_axis(ax, *, grid_axis: str = "y") -> None:
+    ax.set_facecolor("#fbfbfb")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis=grid_axis, which="major", color="#dddddd", linewidth=0.9, alpha=0.85)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for spine_name in ("left", "bottom"):
+        ax.spines[spine_name].set_color("#b8b8b8")
+        ax.spines[spine_name].set_linewidth(0.9)
+    ax.tick_params(colors="#333333", labelsize=10)
+
+
+def _set_budget_ticks(ax, budgets: Iterable[int | float], *, max_labels: int = 4) -> None:
+    ticks = sorted({int(v) for v in budgets if int(v) > 0})
+    if not ticks:
+        return
+    label_ticks = ticks
+    if max_labels > 0 and len(ticks) > max_labels:
+        step = max(int(np.ceil((len(ticks) - 1) / max(max_labels - 1, 1))), 1)
+        label_ticks = ticks[::step]
+        if label_ticks[-1] != ticks[-1]:
+            label_ticks.append(ticks[-1])
+        label_ticks = sorted(set(label_ticks))
+    ax.set_xticks(label_ticks)
+    ax.set_xticklabels([_format_scientific_tick(tick) for tick in label_ticks], fontsize=8.5)
+    ax.minorticks_off()
+
+
+def _resolve_group_sizes(
+    *,
+    scenario_key: str | None = None,
+    n_control: int | None = None,
+    n_treated: int | None = None,
+) -> tuple[int | None, int | None]:
+    if n_control is not None and n_treated is not None:
+        return int(n_control), int(n_treated)
+    if not scenario_key:
+        return None, None
+    catalog_path = Path("results") / "exact_scenarios" / "v1" / "catalog.json"
+    if not catalog_path.exists():
+        return None, None
+    try:
+        scenarios = load_saved_exact_scenarios(catalog_path)
+    except Exception:
+        return None, None
+    for scenario in scenarios:
+        if scenario.key == str(scenario_key):
+            return int(scenario.problem.n_control), int(scenario.problem.n_treated)
+    return None, None
+
+
+def _styled_boxplot(
+    ax,
+    data: list[np.ndarray],
+    *,
+    labels: list[str],
+    colors: list[str],
+):
+    artists = ax.boxplot(
+        data,
+        tick_labels=labels,
+        widths=0.58,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": "#222222", "linewidth": 1.5},
+        whiskerprops={"color": "#666666", "linewidth": 1.1},
+        capprops={"color": "#666666", "linewidth": 1.1},
+        boxprops={"edgecolor": "#666666", "linewidth": 1.1},
+    )
+    for patch, color in zip(artists["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.78)
+    return artists
+
+
+def _overlay_boxplot_points(
+    ax,
+    data: list[np.ndarray],
+    *,
+    colors: list[str],
+) -> None:
+    for idx, (arr, color) in enumerate(zip(data, colors), start=1):
+        vals = np.asarray(arr, dtype=float)
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        if vals.size == 0:
+            continue
+        vals = np.sort(vals)
+        if vals.size == 1:
+            x = np.asarray([float(idx)], dtype=float)
+        else:
+            x = float(idx) + np.linspace(-0.09, 0.09, vals.size)
+        ax.scatter(
+            x,
+            vals,
+            s=24,
+            color=color,
+            edgecolors="white",
+            linewidths=0.7,
+            alpha=0.95,
+            zorder=3.5,
+        )
+
+
 def _stat_label(problem: PermutationTestProblem) -> str:
     return str(getattr(problem.statistic, "__name__", "statistic"))
 
@@ -3421,54 +3576,82 @@ def plot_cross_method_max_budget(
     records: list[dict[str, Any]],
     *,
     scenario_name: str,
+    scenario_key: str | None = None,
     exact_p: float,
     max_budget: int,
+    n_control: int | None = None,
+    n_treated: int | None = None,
     beta_workflow: dict[str, Any] | None = None,
     save_path: Path | None = None,
 ) -> None:
     rows = [row for row in records if int(row["checkpoint"]) == int(max_budget)]
     methods = ["iid", "mcmc_is", "samc"]
-    labels = ["IID", "MCMC-IS", "SAMC"]
+    labels = [_CROSS_METHOD_LABELS[method] for method in methods]
+    colors = [_CROSS_METHOD_COLORS[method] for method in methods]
 
     est_data = []
-    rmse_data = []
+    abs_error_data = []
+    omission_notes: list[str] = []
     for method in methods:
         sub = [row for row in rows if row["method"] == method]
         est = np.asarray([row["estimate"] for row in sub], dtype=float)
         rse = np.asarray([row["root_squared_error"] for row in sub], dtype=float)
         if method == "iid":
             tail_hits = np.asarray([row.get("tail_hits", 0) for row in sub], dtype=int)
+            zero_hit_count = int(np.sum(tail_hits <= 0))
+            if zero_hit_count > 0:
+                omission_notes.append(
+                    f"IID: {zero_hit_count}/{tail_hits.size} runs did not hit the tail once; omitted on the log scale."
+                )
             est[tail_hits <= 0] = np.nan
             rse[tail_hits <= 0] = np.nan
         est_data.append(_positive_for_plot(est))
-        rmse_data.append(_positive_for_plot(rse))
+        abs_error_data.append(_positive_for_plot(rse))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2))
-    axes[0].boxplot(est_data, tick_labels=labels, showfliers=False)
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4))
+    _styled_boxplot(axes[0], est_data, labels=labels, colors=colors)
+    _overlay_boxplot_points(axes[0], est_data, colors=colors)
     if _has_positive_finite(est_data):
         axes[0].set_yscale("log")
-    axes[0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
+    axes[0].axhline(exact_p, color="#444444", linestyle="--", linewidth=1.2, label="Exact p")
     _set_log_ylim(axes[0], est_data)
-    axes[0].set_title("Estimator distribution")
-    axes[0].set_ylabel("p_hat")
-    axes[0].legend()
+    axes[0].set_title("Estimate", fontsize=12, pad=10)
+    axes[0].set_ylabel(r"$\hat{p}$")
+    axes[0].legend(frameon=False, fontsize=10, loc="upper right")
+    _style_article_axis(axes[0], grid_axis="y")
 
-    axes[1].boxplot(rmse_data, tick_labels=labels, showfliers=False)
-    if _has_positive_finite(rmse_data):
+    _styled_boxplot(axes[1], abs_error_data, labels=labels, colors=colors)
+    _overlay_boxplot_points(axes[1], abs_error_data, colors=colors)
+    if _has_positive_finite(abs_error_data):
         axes[1].set_yscale("log")
-    _set_log_ylim(axes[1], rmse_data)
-    axes[1].set_title("RMSE across repeats")
-    axes[1].set_ylabel("root squared error")
+    _set_log_ylim(axes[1], abs_error_data)
+    axes[1].set_title("Absolute error", fontsize=12, pad=10)
+    axes[1].set_ylabel(r"$|\hat{p} - p|$")
+    _style_article_axis(axes[1], grid_axis="y")
 
-    title = f"Cross-method comparison: {scenario_name}\nmax iterations={max_budget:,}, true p={exact_p:.3e}"
-    if beta_workflow is not None:
-        title = (
-            f"{title}\nMCMC-IS beta (laplace/tuned/used): "
-            f"{beta_workflow['beta0_laplace']:.4g} / {beta_workflow['beta_hat_tuned']:.4g} / {beta_workflow['beta_used']:.4g}"
-            f" | beta-selection budget (pilot+tuning+scan)={int(beta_workflow.get('beta_selection_eval_total', 0)):,}"
+    fig.suptitle(
+        _compact_plot_title(
+            scenario_name,
+            scenario_key=scenario_key,
+            n_control=n_control,
+            n_treated=n_treated,
+        ),
+        fontsize=14,
+        fontweight="semibold",
+        y=0.99,
+    )
+    layout_rect = (0.0, 0.05, 1.0, 0.95) if omission_notes else (0.0, 0.0, 1.0, 0.95)
+    if omission_notes:
+        fig.text(
+            0.5,
+            0.015,
+            "\n".join(omission_notes),
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color="#555555",
         )
-    fig.suptitle(title)
-    plt.tight_layout()
+    plt.tight_layout(rect=layout_rect)
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=170, bbox_inches="tight")
@@ -3479,42 +3662,67 @@ def plot_cross_method_convergence(
     summary: list[dict[str, Any]],
     *,
     scenario_name: str,
+    scenario_key: str | None = None,
     exact_p: float,
+    n_control: int | None = None,
+    n_treated: int | None = None,
     mcmc_beta_selection_budget: int = 0,
     save_path: Path | None = None,
 ) -> None:
     methods = ["iid", "mcmc_is", "samc"]
-    labels = {"iid": "IID", "mcmc_is": "MCMC-IS", "samc": "SAMC"}
-    colors = {"iid": "#4e79a7", "mcmc_is": "#f28e2b", "samc": "#59a14f"}
+    budgets = sorted({int(row["checkpoint"]) for row in summary})
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2))
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4))
     for method in methods:
         sub = sorted([row for row in summary if row["method"] == method], key=lambda row: row["checkpoint"])
         x = np.asarray([row["checkpoint"] for row in sub], dtype=float)
         mean_est = np.asarray([row["mean_estimate"] for row in sub], dtype=float)
         rmse = np.asarray([row["rmse"] for row in sub], dtype=float)
 
-        axes[0].plot(x, mean_est, marker="o", label=labels[method], color=colors[method])
-        axes[1].plot(x, rmse, marker="o", label=labels[method], color=colors[method])
+        plot_kwargs = {
+            "marker": "o",
+            "markersize": 5.5,
+            "linewidth": 2.2,
+            "markeredgecolor": "white",
+            "markeredgewidth": 0.8,
+            "label": _CROSS_METHOD_LABELS[method],
+            "color": _CROSS_METHOD_COLORS[method],
+        }
+        axes[0].plot(x, mean_est, **plot_kwargs)
+        axes[1].plot(x, rmse, **plot_kwargs)
 
-    axes[0].axhline(exact_p, color="black", linestyle="--", linewidth=1.2, label=f"true p={exact_p:.2e}")
+    axes[0].axhline(exact_p, color="#444444", linestyle="--", linewidth=1.2, label="Exact p")
+    est_arrays = [np.asarray([row["mean_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]
+    rmse_arrays = [np.asarray([row["rmse"] for row in summary if row["method"] == method], dtype=float) for method in methods]
     for ax in axes:
         ax.set_xscale("log")
-        ax.set_xlabel("iterations")
-    if _has_positive_finite([np.asarray([row["mean_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
+        _set_budget_ticks(ax, budgets)
+        ax.set_xlabel("Total budget")
+        _style_article_axis(ax, grid_axis="y")
+        ax.margins(x=0.05)
+    if _has_positive_finite(est_arrays):
         axes[0].set_yscale("log")
-    if _has_positive_finite([np.asarray([row["rmse"] for row in summary if row["method"] == method], dtype=float) for method in methods]):
+        _set_log_ylim(axes[0], [*est_arrays, np.asarray([exact_p], dtype=float)])
+    if _has_positive_finite(rmse_arrays):
         axes[1].set_yscale("log")
-    axes[0].set_title("Mean estimate vs iterations")
-    axes[0].set_ylabel("p_hat")
-    axes[1].set_title("RMSE vs iterations")
+        _set_log_ylim(axes[1], rmse_arrays)
+    axes[0].set_title("Estimate", fontsize=12, pad=10)
+    axes[0].set_ylabel(r"mean $\hat{p}$")
+    axes[1].set_title("RMSE", fontsize=12, pad=10)
     axes[1].set_ylabel("RMSE")
-    axes[0].legend()
+    axes[0].legend(frameon=False, fontsize=10, loc="upper right")
     fig.suptitle(
-        f"Cross-method convergence: {scenario_name} (true p={exact_p:.3e})\n"
-        f"MCMC-IS total budget includes fixed beta-selection budget (pilot+tuning+scan)={int(mcmc_beta_selection_budget):,}"
+        _compact_plot_title(
+            scenario_name,
+            scenario_key=scenario_key,
+            n_control=n_control,
+            n_treated=n_treated,
+        ),
+        fontsize=14,
+        fontweight="semibold",
+        y=0.99,
     )
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=170, bbox_inches="tight")
@@ -3809,15 +4017,21 @@ def save_cross_method_outputs(
     plot_cross_method_max_budget(
         study["records"],
         scenario_name=study["scenario_display"],
+        scenario_key=study["scenario"],
         exact_p=float(study["exact_p"]),
         max_budget=max(study["estimation_points"]),
+        n_control=int(scenario.problem.n_control),
+        n_treated=int(scenario.problem.n_treated),
         beta_workflow=study["beta_workflow"],
         save_path=output_dir / "cross_method_max_budget.png",
     )
     plot_cross_method_convergence(
         study["summary"],
         scenario_name=study["scenario_display"],
+        scenario_key=study["scenario"],
         exact_p=float(study["exact_p"]),
+        n_control=int(scenario.problem.n_control),
+        n_treated=int(scenario.problem.n_treated),
         mcmc_beta_selection_budget=int(study.get("mcmc_beta_selection_budget", 0)),
         save_path=output_dir / "cross_method_convergence.png",
     )
@@ -3855,6 +4069,9 @@ def save_cross_method_outputs(
             "exact_method": study["exact_method"],
             "exact_tail_hits": study["exact_tail_hits"],
             "exact_n_perm": study["exact_n_perm"],
+            "n_treated": int(scenario.problem.n_treated),
+            "n_control": int(scenario.problem.n_control),
+            "n_total": int(scenario.problem.n),
             "estimation_points": study["estimation_points"],
             "mcmc_reported_checkpoints": study.get("mcmc_reported_checkpoints", study["estimation_points"]),
             "cross_config": cross_cfg,
@@ -4010,6 +4227,11 @@ def regenerate_cross_method_plots_from_saved(
             beta_workflow.get("beta_selection_eval_total", 0),
         )
     )
+    n_control, n_treated = _resolve_group_sizes(
+        scenario_key=str(metadata.get("scenario", "")) or None,
+        n_control=metadata.get("n_control"),
+        n_treated=metadata.get("n_treated"),
+    )
 
     out = {
         "cross_method_max_budget": save_dir / "cross_method_max_budget.png",
@@ -4019,15 +4241,21 @@ def regenerate_cross_method_plots_from_saved(
     plot_cross_method_max_budget(
         saved["records"],
         scenario_name=str(metadata["scenario_display"]),
+        scenario_key=str(metadata.get("scenario", "")) or None,
         exact_p=float(metadata["exact_p"]),
         max_budget=max_budget,
+        n_control=n_control,
+        n_treated=n_treated,
         beta_workflow=beta_workflow,
         save_path=out["cross_method_max_budget"],
     )
     plot_cross_method_convergence(
         saved["summary"],
         scenario_name=str(metadata["scenario_display"]),
+        scenario_key=str(metadata.get("scenario", "")) or None,
         exact_p=float(metadata["exact_p"]),
+        n_control=n_control,
+        n_treated=n_treated,
         mcmc_beta_selection_budget=mcmc_budget,
         save_path=out["cross_method_convergence"],
     )

@@ -132,11 +132,12 @@ def build_cross_method_notebook() -> dict:
 
             SCENARIO_GROUP = "core_claim"
             SCENARIO_KEYS_OVERRIDE = [
-                "linear_stat_dp_n40",
-                "gwas_additive_score_n40",
-                "hypergeom_1e7",
-                "bruteforce_welch_nonextreme_n22",
-                "rank_sum_dp_n40",
+                "gwas_additive_score_ultra_n60",
+                "poisson_diffmeans_hep_ultra_n200",
+                "gwas_additive_score_sig_n60",
+                "poisson_diffmeans_hep_sig_n200",
+                "gwas_additive_score_above_n60",
+                "poisson_diffmeans_hep_above_n200",
             ]
 
             ESTIMATION_POINTS = (750_000, 1_000_000, 2_500_000, 5_000_000, 7_500_000, 10_000_000, 15_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
@@ -199,6 +200,13 @@ def build_cross_method_notebook() -> dict:
                 return int(MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
 
 
+            def reference_p0_for_scenario(scenario) -> float:
+                threshold = scenario.extra.get("known_significance_threshold")
+                if threshold is not None and np.isfinite(float(threshold)) and float(threshold) > 0.0:
+                    return float(threshold)
+                return float(scenario.exact_p)
+
+
             def target_scan_budget_from_p0(p0: float) -> int:
                 p0 = float(p0)
                 if 1e-6 <= p0 <= 1e-4:
@@ -220,7 +228,7 @@ def build_cross_method_notebook() -> dict:
 
 
             def split_scan_budget_for_scenario(scenario, cfg: MCMCWorkflowConfig) -> dict:
-                target_beta_selection_budget = int(target_scan_budget_from_p0(scenario.exact_p))
+                target_beta_selection_budget = int(target_scan_budget_from_p0(reference_p0_for_scenario(scenario)))
                 scan_budget_ex_pilot = max(int(target_beta_selection_budget) - int(cfg.pilot_samples), 1)
                 coarse_count, refine_count = adaptive_candidate_counts(cfg)
                 finalist_count = int(cfg.local_scan_finalist_count)
@@ -274,8 +282,11 @@ def build_cross_method_notebook() -> dict:
             def mcmc_cfg_for_scenario(scenario):
                 proposal_size = int(mcmc_proposal_size_for_scenario(scenario))
                 scan_budget = split_scan_budget_for_scenario(scenario, base_mcmc_cfg)
+                reference_p0 = float(reference_p0_for_scenario(scenario))
                 return replace(
                     base_mcmc_cfg,
+                    use_true_p0_for_q_target=False,
+                    p0_guess=reference_p0,
                     proposal_size=proposal_size,
                     local_scan_swap_counts=(proposal_size,),
                     local_scan_screen_total_steps=int(scan_budget["screen_total_steps"]),
@@ -302,6 +313,7 @@ def build_cross_method_notebook() -> dict:
                 "MCMC_LOCAL_SCAN_Q_MULTIPLIERS": MCMC_LOCAL_SCAN_Q_MULTIPLIERS,
                 "MCMC_LOCAL_SCAN_COARSE_Q_MULTIPLIERS": MCMC_LOCAL_SCAN_COARSE_Q_MULTIPLIERS,
                 "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+                "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
             }, indent=2))
             """
         ),
@@ -352,13 +364,15 @@ def build_cross_method_notebook() -> dict:
                 print(f"Running {scenario.key} | exact p={scenario.exact_p:.3e}")
                 print(json.dumps({
                     "scenario": scenario.key,
+                    "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
+                    "reference_p0_for_qtarget": reference_p0_for_scenario(scenario),
                     "sample_size_band": scenario.portfolio.get("sample_size_band"),
                     "mcmc_proposal_size": scenario_mcmc_cfg.proposal_size,
                     "mcmc_local_scan_strategy": scenario_mcmc_cfg.local_scan_strategy,
                     "mcmc_local_scan_swap_counts": scenario_mcmc_cfg.local_scan_swap_counts,
                     "mcmc_local_scan_objective": scenario_mcmc_cfg.local_scan_objective,
                     "mcmc_production_estimator_variant": scenario_mcmc_cfg.production_estimator_variant,
-                    "target_beta_selection_budget": target_scan_budget_from_p0(scenario.exact_p),
+                    "target_beta_selection_budget": target_scan_budget_from_p0(reference_p0_for_scenario(scenario)),
                     "local_scan_screen_total_steps": scenario_mcmc_cfg.local_scan_screen_total_steps,
                     "local_scan_refine_total_steps": scenario_mcmc_cfg.local_scan_refine_total_steps,
                     "local_scan_final_total_steps": scenario_mcmc_cfg.local_scan_total_steps,
@@ -447,7 +461,7 @@ def build_cross_method_notebook() -> dict:
             """
             # RELOAD_SCENARIO_DIR = None
             # # Example:
-            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260306_120000_cross_method" / "gwas_additive_score_n40"
+            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260306_120000_cross_method" / "gwas_additive_score_sig_n60"
 
             # if RELOAD_SCENARIO_DIR is not None:
             #     saved = load_cross_method_saved_output(RELOAD_SCENARIO_DIR)
@@ -643,7 +657,7 @@ def build_beta_notebook() -> dict:
             """
             # RELOAD_BETA_DIR = None
             # # Example:
-            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260306_120000_beta_diag" / "gwas_additive_score_n40"
+            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260306_120000_beta_diag" / "gwas_additive_score_sig_n60"
 
             # if RELOAD_BETA_DIR is not None:
             #     saved = load_beta_sweep_saved_output(RELOAD_BETA_DIR)
@@ -1154,7 +1168,7 @@ def build_mcmc_scan_budget_policy_notebook() -> dict:
 
             SCENARIO_KEYS_OVERRIDE = [
                 "bruteforce_welch_nonextreme_n22",
-                "gwas_additive_score_n40",
+                "gwas_additive_score_sig_n60",
                 "hypergeom_1e7",
                 "linear_stat_dp_n40",
                 "rank_sum_dp_n40",
@@ -1852,7 +1866,7 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
         OUTPUT_ROOT = project_root / "results" / "mcmcis_scan_budget_grid"
 
         SCENARIO_KEYS_OVERRIDE = [
-            "gwas_additive_score_n40",
+            "gwas_additive_score_sig_n60",
             "linear_stat_dp_n40",
             "rank_sum_dp_n40",
         ]

@@ -146,6 +146,35 @@ def _apply_portfolio_metadata(
     return scenario
 
 
+def _attach_application_threshold(
+    scenario: ExactScenario,
+    *,
+    known_significance_threshold: float,
+    setting_key: str,
+    setting_label: str,
+    threshold_band: str,
+) -> ExactScenario:
+    extra = dict(scenario.extra)
+    extra["known_significance_threshold"] = float(known_significance_threshold)
+    extra["application_setting_key"] = str(setting_key)
+    extra["application_setting_label"] = str(setting_label)
+    extra["threshold_band"] = str(threshold_band)
+    scenario.extra = extra
+
+    portfolio = dict(scenario.portfolio)
+    groups = [str(v) for v in portfolio.get("groups", [])]
+    for group in ("threshold_suite", str(setting_key), f"{setting_key}_{threshold_band}"):
+        if group not in groups:
+            groups.append(group)
+    portfolio["groups"] = groups
+    portfolio["known_significance_threshold"] = float(known_significance_threshold)
+    portfolio["application_setting_key"] = str(setting_key)
+    portfolio["application_setting_label"] = str(setting_label)
+    portfolio["threshold_band"] = str(threshold_band)
+    scenario.portfolio = portfolio
+    return scenario
+
+
 def _near_extreme_linear_labels(x: np.ndarray, n_treated: int, *, downgrade_swaps: int = 1) -> np.ndarray:
     """
     Start from the top-score labeling and downgrade it by a small number of swaps.
@@ -508,7 +537,7 @@ def _make_gwas_additive_score_scenario(
         data_family="discrete_score",
         difficulty="hard" if downgrade_swaps == 1 else "moderate",
         groups=("exploratory_exact",)
-        + (("core_claim",) if key == "gwas_additive_score_n40" else tuple())
+        + (("core_claim",) if key in {"gwas_additive_score_n40", "gwas_additive_score_sig_n60"} else tuple())
         + (("stress_test",) if downgrade_swaps == 1 else tuple()),
         has_ties=True,
         is_discrete=True,
@@ -811,6 +840,42 @@ def build_exact_scenarios() -> list[ExactScenario]:
         ),
         _make_gwas_additive_score_scenario(),
         _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_sig_n60",
+            description=(
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
+                "right-tail treated dosage sum with a larger permutation space and null-rejecting exact p-value."
+            ),
+            n=60,
+            n_treated=30,
+            maf=0.25,
+            seed=132,
+            downgrade_swaps=5,
+        ),
+        _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_ultra_n60",
+            description=(
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
+                "right-tail treated dosage sum with p-value far below the genome-wide threshold."
+            ),
+            n=60,
+            n_treated=30,
+            maf=0.25,
+            seed=132,
+            downgrade_swaps=3,
+        ),
+        _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_above_n60",
+            description=(
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
+                "right-tail treated dosage sum with p-value above the genome-wide threshold."
+            ),
+            n=60,
+            n_treated=30,
+            maf=0.25,
+            seed=132,
+            downgrade_swaps=6,
+        ),
+        _make_gwas_additive_score_scenario(
             key="gwas_additive_score_swap2_n40",
             description=(
                 "GWAS-like additive score with a two-swap downgrade from the maximal dosage sum, n=40."
@@ -877,6 +942,42 @@ def build_exact_scenarios() -> list[ExactScenario]:
             seed=24,
         ),
         _make_poisson_diffmeans_righttail_scenario(),
+        _make_poisson_diffmeans_righttail_scenario(
+            key="poisson_diffmeans_hep_sig_n200",
+            description=(
+                "Poisson count benchmark resembling a high-energy-physics counting test: "
+                "treated~Pois(3), control~Pois(2), n1=n2=100, with p-value near the 3e-7 discovery threshold."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=5,
+        ),
+        _make_poisson_diffmeans_righttail_scenario(
+            key="poisson_diffmeans_hep_above_n200",
+            description=(
+                "Poisson count benchmark resembling a high-energy-physics counting test: "
+                "treated~Pois(3), control~Pois(2), n1=n2=100, with p-value above the 3e-7 discovery threshold."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=1,
+        ),
+        _make_poisson_diffmeans_righttail_scenario(
+            key="poisson_diffmeans_hep_ultra_n200",
+            description=(
+                "Poisson count benchmark resembling a high-energy-physics counting test: "
+                "treated~Pois(3), control~Pois(2), n1=n2=100, with p-value far below the 3e-7 discovery threshold."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=57,
+        ),
         _make_bruteforce_welch_scenario(),
         _make_bruteforce_welch_scenario(
             key="bruteforce_welch_swap1_n22",
@@ -889,6 +990,25 @@ def build_exact_scenarios() -> list[ExactScenario]:
             swap_from_extreme=3,
         ),
     ]
+    threshold_tags = {
+        "gwas_additive_score_ultra_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "ultra"),
+        "gwas_additive_score_sig_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "near"),
+        "gwas_additive_score_above_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "above"),
+        "poisson_diffmeans_hep_ultra_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "ultra"),
+        "poisson_diffmeans_hep_sig_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "near"),
+        "poisson_diffmeans_hep_above_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "above"),
+    }
+    for scenario in scenarios:
+        tag = threshold_tags.get(scenario.key)
+        if tag is not None:
+            threshold, setting_key, setting_label, threshold_band = tag
+            _attach_application_threshold(
+                scenario,
+                known_significance_threshold=float(threshold),
+                setting_key=str(setting_key),
+                setting_label=str(setting_label),
+                threshold_band=str(threshold_band),
+            )
     return scenarios
 
 
