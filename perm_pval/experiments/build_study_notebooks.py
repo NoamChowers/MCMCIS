@@ -142,7 +142,7 @@ def build_cross_method_notebook() -> dict:
                 "poisson_diffmeans_hep_above_n200",
             ]
 
-            ESTIMATION_POINTS = (5_000_000,) if not FAST_MODE else (200_000,)
+            ESTIMATION_POINTS = (500_000, 1_000_000, 2_500_000, 5_000_000) if not FAST_MODE else (200_000,)
             N_REPEATS = 5 if not FAST_MODE else 2
             N_JOBS = min(6, N_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
@@ -551,17 +551,19 @@ def build_beta_notebook() -> dict:
                 "gwas_additive_score_above_n60",
                 "poisson_diffmeans_hep_above_n200",
             ]
-            ESTIMATION_POINTS = (5_000_000,) if not FAST_MODE else (200_000,)
+            ESTIMATION_POINTS = (500_000, 1_000_000, 2_500_000, 5_000_000) if not FAST_MODE else (200_000,)
             HPO_CHECKPOINT = max(ESTIMATION_POINTS)
-            HPO_N_TRIALS = 30 if not FAST_MODE else 5
+            HPO_N_TRIALS = 10 if not FAST_MODE else 5
             HPO_TRIAL_REPEATS = 3 if not FAST_MODE else 1
+            HPO_RECHECK_TOP_K = 3
+            HPO_RECHECK_REPEATS = 10 if not FAST_MODE else 2
             HPO_OBJECTIVE_METRIC = "rmse"
-            HPO_BETA_MULTIPLIER_LOW = 0.25
+            HPO_BETA_MULTIPLIER_LOW = 0.001
             HPO_BETA_MULTIPLIER_HIGH = 4.0
-            HPO_SWAP_CHOICES_DEFAULT = (1, 2, 3, 4, 6, 8)
+            HPO_SWAP_CHOICES_DEFAULT = (1, 2, 3)
             HPO_SWAP_CHOICES_BY_SETTING = {
-                "gwas_threshold_suite": (1, 2, 3, 4),
-                "hep_threshold_suite": (2, 4, 6, 8, 10),
+                "gwas_threshold_suite": (1, 2),
+                "hep_threshold_suite": (1, 2, 4, 6, 8),
             }
             DEFAULT_BASELINE_SWAP_BY_SETTING = {
                 "gwas_threshold_suite": 2,
@@ -588,9 +590,10 @@ def build_beta_notebook() -> dict:
                 estimation_points=(HPO_CHECKPOINT,),
                 repeats=HPO_TRIAL_REPEATS,
                 beta_multipliers=(1.0,),
-                chains=2,
+                chains=3,
                 thin=1,
                 estimate_variance=False,
+                chain_n_jobs=3,
                 proposal_size=1,
                 base_seed=BASE_SEED,
                 n_jobs=1,
@@ -646,10 +649,14 @@ def build_beta_notebook() -> dict:
                 "HPO_CHECKPOINT": HPO_CHECKPOINT,
                 "HPO_N_TRIALS": HPO_N_TRIALS,
                 "HPO_TRIAL_REPEATS": HPO_TRIAL_REPEATS,
+                "HPO_RECHECK_TOP_K": HPO_RECHECK_TOP_K,
+                "HPO_RECHECK_REPEATS": HPO_RECHECK_REPEATS,
                 "HPO_OBJECTIVE_METRIC": HPO_OBJECTIVE_METRIC,
                 "HPO_BETA_MULTIPLIER_LOW": HPO_BETA_MULTIPLIER_LOW,
                 "HPO_BETA_MULTIPLIER_HIGH": HPO_BETA_MULTIPLIER_HIGH,
                 "HPO_SWAP_CHOICES_BY_SETTING": HPO_SWAP_CHOICES_BY_SETTING,
+                "HPO_CHAINS_PER_TRIAL": int(hpo_eval_cfg.chains),
+                "HPO_CHAIN_N_JOBS": int(hpo_eval_cfg.chain_n_jobs),
                 "FINAL_EVAL_REPEATS": FINAL_EVAL_REPEATS,
                 "FINAL_EVAL_N_JOBS": FINAL_EVAL_N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
@@ -704,6 +711,9 @@ def build_beta_notebook() -> dict:
                 swap_choices = swap_choices_for_scenario(scenario)
                 baseline_swap = baseline_swap_for_scenario(scenario)
                 trial_rows = []
+                scenario_dir = (run_dir / scenario.key) if (SAVE_OUTPUTS and run_dir is not None) else None
+                if scenario_dir is not None:
+                    scenario_dir.mkdir(parents=True, exist_ok=True)
 
                 print(json.dumps({
                     "scenario": scenario.key,
@@ -763,21 +773,141 @@ def build_beta_notebook() -> dict:
                         **summary_row,
                     }
                     trial_rows.append(trial_payload)
+                    if scenario_dir is not None:
+                        pd.DataFrame(trial_rows).to_json(
+                            scenario_dir / "hpo_trials.jsonl",
+                            orient="records",
+                            lines=True,
+                        )
+                        (scenario_dir / "hpo_status.json").write_text(
+                            json.dumps(
+                                {
+                                    "scenario": scenario.key,
+                                    "completed_trials": len(trial_rows),
+                                    "target_trials": int(HPO_N_TRIALS),
+                                    "latest_trial_number": int(trial.number),
+                                },
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
                     for key, value in trial_payload.items():
                         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
                             trial.set_user_attr(str(key), value)
                     return float(objective_value)
+
+                def persist_hpo_state(study, trial):
+                    if scenario_dir is None or len(study.trials) == 0:
+                        return
+                    best_trial = study.best_trial
+                    best_payload = {
+                        "scenario": scenario.key,
+                        "reference_p0": float(p0_reference),
+                        "beta_init": float(beta_init),
+                        "beta0_formula": float(init_payload["beta0_formula"]),
+                        "beta0_laplace": float(init_payload["beta0_laplace"]),
+                        "sigma_t": float(sigma_t),
+                        "best_beta_multiplier": float(best_trial.params["beta_multiplier"]),
+                        "best_beta": float(beta_init * float(best_trial.params["beta_multiplier"])),
+                        "best_proposal_size": int(best_trial.params["proposal_size"]),
+                        "best_objective_value": float(study.best_value),
+                        "best_trial_number": int(best_trial.number),
+                        "completed_trials": int(len(study.trials)),
+                    }
+                    (scenario_dir / "best_config.partial.json").write_text(
+                        json.dumps(best_payload, indent=2),
+                        encoding="utf-8",
+                    )
+                    pd.DataFrame(
+                        [
+                            {
+                                "trial_number": int(t.number),
+                                "state": str(t.state),
+                                "value": float(t.value) if t.value is not None else None,
+                                **{str(k): v for k, v in t.params.items()},
+                            }
+                            for t in study.trials
+                        ]
+                    ).to_json(
+                        scenario_dir / "optuna_trials.json",
+                        orient="records",
+                        indent=2,
+                    )
 
                 study = optuna.create_study(
                     direction="minimize",
                     sampler=TPESampler(seed=BASE_SEED + 10_000 * scenario_idx + 7),
                     study_name=f"{scenario.key}_oracle_beta",
                 )
-                study.optimize(objective, n_trials=HPO_N_TRIALS, show_progress_bar=False)
+                study.optimize(
+                    objective,
+                    n_trials=HPO_N_TRIALS,
+                    show_progress_bar=False,
+                    callbacks=[persist_hpo_state],
+                )
 
-                best_multiplier = float(study.best_trial.params["beta_multiplier"])
-                best_proposal_size = int(study.best_trial.params["proposal_size"])
-                best_beta = float(beta_init * best_multiplier)
+                top_trial_rows = (
+                    pd.DataFrame(trial_rows)
+                    .sort_values("objective_value")
+                    .drop_duplicates(subset=["beta", "proposal_size"])
+                    .head(HPO_RECHECK_TOP_K)
+                )
+                recheck_specs = [
+                    {
+                        "label": "init_recheck",
+                        "config_id": "init_recheck",
+                        "beta": float(beta_init),
+                        "proposal_size": int(baseline_swap),
+                        "source": "pilot_init",
+                    }
+                ]
+                for _, top_row in top_trial_rows.iterrows():
+                    recheck_specs.append(
+                        {
+                            "label": f"oracle_trial_{int(top_row['trial_number'])}",
+                            "config_id": f"oracle_trial_{int(top_row['trial_number'])}",
+                            "beta": float(top_row["beta"]),
+                            "proposal_size": int(top_row["proposal_size"]),
+                            "source": "oracle_hpo",
+                        }
+                    )
+
+                recheck_cfg = replace(
+                    hpo_eval_cfg,
+                    repeats=HPO_RECHECK_REPEATS,
+                    base_seed=BASE_SEED + 2_000_000 + 100_000 * scenario_idx,
+                    n_jobs=min(HPO_RECHECK_REPEATS, os.cpu_count() or 1),
+                )
+                recheck_eval = run_named_mcmc_checkpoint_study(
+                    scenario.problem,
+                    scenario.exact_p,
+                    config_specs=recheck_specs,
+                    sigma_t=sigma_t,
+                    estimation_points=(HPO_CHECKPOINT,),
+                    repeats=HPO_RECHECK_REPEATS,
+                    base_seed=int(recheck_cfg.base_seed),
+                    template_cfg=recheck_cfg,
+                    n_jobs=int(recheck_cfg.n_jobs),
+                )
+                recheck_summary_df = pd.DataFrame(recheck_eval["summary"]).sort_values(HPO_OBJECTIVE_METRIC)
+                recheck_best = dict(recheck_summary_df.iloc[0])
+                if str(recheck_best["label"]) == "init_recheck":
+                    best_multiplier = 1.0
+                    best_proposal_size = int(baseline_swap)
+                    best_beta = float(beta_init)
+                    best_source = "pilot_init_recheck"
+                    best_trial_number = -1
+                else:
+                    best_beta = float(recheck_best["beta"])
+                    best_multiplier = float(best_beta / beta_init) if beta_init > 0 else float("nan")
+                    best_proposal_size = int(recheck_best["proposal_size"])
+                    best_source = "oracle_hpo_recheck"
+                    matched_trial = top_trial_rows[
+                        (top_trial_rows["proposal_size"] == best_proposal_size)
+                        & np.isclose(top_trial_rows["beta"], best_beta)
+                    ]
+                    best_trial_number = int(matched_trial.iloc[0]["trial_number"]) if not matched_trial.empty else int(study.best_trial.number)
+
                 best_config = {
                     "scenario": scenario.key,
                     "reference_p0": float(p0_reference),
@@ -785,12 +915,15 @@ def build_beta_notebook() -> dict:
                     "beta0_formula": float(init_payload["beta0_formula"]),
                     "beta0_laplace": float(init_payload["beta0_laplace"]),
                     "sigma_t": float(sigma_t),
-                    "best_beta_multiplier": best_multiplier,
+                    "best_beta_multiplier": float(best_beta / beta_init) if beta_init > 0 else float("nan"),
                     "best_beta": best_beta,
                     "best_proposal_size": int(best_proposal_size),
-                    "best_objective_value": float(study.best_value),
-                    "best_trial_number": int(study.best_trial.number),
+                    "best_objective_value": float(recheck_best[HPO_OBJECTIVE_METRIC]),
+                    "best_trial_number": int(best_trial_number),
                     "n_trials": int(len(study.trials)),
+                    "selection_source": best_source,
+                    "recheck_top_k": int(HPO_RECHECK_TOP_K),
+                    "recheck_repeats": int(HPO_RECHECK_REPEATS),
                 }
 
                 final_eval = run_named_mcmc_checkpoint_study(
@@ -824,6 +957,7 @@ def build_beta_notebook() -> dict:
                 oracle_results[scenario.key] = {
                     "best_config": best_config,
                     "trial_rows": list(trial_rows),
+                    "recheck_eval": recheck_eval,
                     "final_eval": final_eval,
                     "init_payload": {
                         key: value
@@ -833,8 +967,6 @@ def build_beta_notebook() -> dict:
                 }
 
                 if SAVE_OUTPUTS and run_dir is not None:
-                    scenario_dir = run_dir / scenario.key
-                    scenario_dir.mkdir(parents=True, exist_ok=True)
                     pd.DataFrame(trial_rows).to_json(
                         scenario_dir / "hpo_trials.jsonl",
                         orient="records",
@@ -847,6 +979,16 @@ def build_beta_notebook() -> dict:
                     )
                     pd.DataFrame(final_eval["summary"]).to_json(
                         scenario_dir / "final_eval_summary.json",
+                        orient="records",
+                        indent=2,
+                    )
+                    pd.DataFrame(recheck_eval["records"]).to_json(
+                        scenario_dir / "recheck_eval_records.jsonl",
+                        orient="records",
+                        lines=True,
+                    )
+                    pd.DataFrame(recheck_eval["summary"]).to_json(
+                        scenario_dir / "recheck_eval_summary.json",
                         orient="records",
                         indent=2,
                     )
@@ -867,6 +1009,8 @@ def build_beta_notebook() -> dict:
                                 "hpo_settings": {
                                     "n_trials": int(HPO_N_TRIALS),
                                     "trial_repeats": int(HPO_TRIAL_REPEATS),
+                                    "recheck_top_k": int(HPO_RECHECK_TOP_K),
+                                    "recheck_repeats": int(HPO_RECHECK_REPEATS),
                                     "objective_metric": str(HPO_OBJECTIVE_METRIC),
                                     "beta_multiplier_low": float(HPO_BETA_MULTIPLIER_LOW),
                                     "beta_multiplier_high": float(HPO_BETA_MULTIPLIER_HIGH),

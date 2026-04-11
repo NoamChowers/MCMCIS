@@ -63,6 +63,7 @@ class MCMCWorkflowConfig:
     thin: int = 1
     estimate_variance: bool = True
     obm_batch_size: int | None = None
+    chain_n_jobs: int = 1
     production_estimator_variant: str = "production_only"
     tilt_mode: str = "smooth_hinge"
     proposal_size: float | int = 0.075
@@ -120,6 +121,7 @@ class BetaSweepStudyConfig:
     thin: int = 1
     estimate_variance: bool = True
     obm_batch_size: int | None = None
+    chain_n_jobs: int = 1
     tilt_mode: str = "smooth_hinge"
     proposal_size: float | int = 0.075
     base_seed: int = 54_321
@@ -2616,6 +2618,7 @@ def _named_mcmc_replicate_worker(
         thin=int(template_cfg.thin),
         estimate_variance=bool(template_cfg.estimate_variance),
         obm_batch_size=template_cfg.obm_batch_size,
+        chain_n_jobs=int(getattr(template_cfg, "chain_n_jobs", 1)),
         tilt_mode=str(template_cfg.tilt_mode),
         proposal_size=config_spec["proposal_size"],
         base_seed=int(rep_seed),
@@ -2930,6 +2933,34 @@ def _run_single_chain_full_trace(
     }
 
 
+def _run_single_chain_full_trace_from_seed(
+    *,
+    problem: PermutationTestProblem,
+    seed: int,
+    beta: float,
+    sigma_t: float,
+    n_steps: int,
+    init: str,
+    init_state: np.ndarray | None,
+    tilt_mode: str,
+    n_swap_pairs: int,
+    checkpoint_steps: tuple[int, ...],
+) -> dict[str, Any]:
+    rng = np.random.default_rng(int(seed))
+    return _run_single_chain_full_trace(
+        problem,
+        rng,
+        beta=beta,
+        sigma_t=sigma_t,
+        n_steps=n_steps,
+        init=init,
+        init_state=init_state,
+        tilt_mode=tilt_mode,
+        n_swap_pairs=n_swap_pairs,
+        checkpoint_steps=checkpoint_steps,
+    )
+
+
 def _mcmc_prefix_row(
     *,
     exact_p: float,
@@ -3055,7 +3086,6 @@ def _run_mcmc_cumulative_checkpoints(
     )
 
     seed_seq = np.random.SeedSequence(seed)
-    traces: list[dict[str, Any]] = []
     spawned = seed_seq.spawn(cfg.chains)
     normalized_init_states: list[np.ndarray | None]
     if init_states is None:
@@ -3064,22 +3094,62 @@ def _run_mcmc_cumulative_checkpoints(
         if len(init_states) != int(cfg.chains):
             raise ValueError("init_states length must match cfg.chains.")
         normalized_init_states = [np.asarray(state, dtype=np.int8).copy() for state in init_states]
+    chain_jobs = []
     for chain_idx, ss in enumerate(spawned):
-        rng = np.random.default_rng(ss)
-        traces.append(
-            _run_single_chain_full_trace(
-                problem,
-                rng,
-                beta=beta,
-                sigma_t=sigma_t,
-                n_steps=max_steps_per_chain,
-                init="random" if normalized_init_states[chain_idx] is None else "observed",
-                init_state=normalized_init_states[chain_idx],
-                tilt_mode=str(cfg.tilt_mode),
-                n_swap_pairs=n_swap_pairs,
-                checkpoint_steps=unique_step_checkpoints,
-            )
+        chain_seed = int(ss.generate_state(1, dtype=np.uint64)[0])
+        chain_jobs.append(
+            {
+                "chain_idx": int(chain_idx),
+                "problem": problem,
+                "seed": int(chain_seed),
+                "beta": float(beta),
+                "sigma_t": float(sigma_t),
+                "n_steps": int(max_steps_per_chain),
+                "init": "random" if normalized_init_states[chain_idx] is None else "observed",
+                "init_state": normalized_init_states[chain_idx],
+                "tilt_mode": str(cfg.tilt_mode),
+                "n_swap_pairs": int(n_swap_pairs),
+                "checkpoint_steps": unique_step_checkpoints,
+            }
         )
+
+    chain_n_jobs = max(1, min(int(getattr(cfg, "chain_n_jobs", 1)), len(chain_jobs)))
+    executor = _try_make_process_pool(chain_n_jobs) if chain_n_jobs > 1 else None
+    traces: list[dict[str, Any]] = [None] * len(chain_jobs)  # type: ignore[list-item]
+    if executor is None:
+        for job in chain_jobs:
+            traces[int(job["chain_idx"])] = _run_single_chain_full_trace_from_seed(
+                problem=job["problem"],
+                seed=int(job["seed"]),
+                beta=float(job["beta"]),
+                sigma_t=float(job["sigma_t"]),
+                n_steps=int(job["n_steps"]),
+                init=str(job["init"]),
+                init_state=job["init_state"],
+                tilt_mode=str(job["tilt_mode"]),
+                n_swap_pairs=int(job["n_swap_pairs"]),
+                checkpoint_steps=tuple(int(v) for v in job["checkpoint_steps"]),
+            )
+    else:
+        with executor:
+            futures = {
+                executor.submit(
+                    _run_single_chain_full_trace_from_seed,
+                    problem=job["problem"],
+                    seed=int(job["seed"]),
+                    beta=float(job["beta"]),
+                    sigma_t=float(job["sigma_t"]),
+                    n_steps=int(job["n_steps"]),
+                    init=str(job["init"]),
+                    init_state=job["init_state"],
+                    tilt_mode=str(job["tilt_mode"]),
+                    n_swap_pairs=int(job["n_swap_pairs"]),
+                    checkpoint_steps=tuple(int(v) for v in job["checkpoint_steps"]),
+                ): int(job["chain_idx"])
+                for job in chain_jobs
+            }
+            for future in cf.as_completed(futures):
+                traces[futures[future]] = future.result()
 
     rows: list[dict[str, Any]] = []
     for checkpoint, report_checkpoint in zip(checkpoints, reported_checkpoints):
