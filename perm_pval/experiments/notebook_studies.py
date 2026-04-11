@@ -1681,25 +1681,22 @@ def build_beta_workflow(
     *,
     seed: int,
 ) -> dict[str, Any]:
-    p0_for_qtarget = float(exact_p) if cfg.use_true_p0_for_q_target else float(cfg.p0_guess)
-    q_target = float(p0_for_qtarget ** cfg.d_alpha)
-
-    t_start = time.perf_counter()
-    pilot_t = iid_pilot_statistics(problem, n_samples=cfg.pilot_samples, seed=seed)
-    sigma_t = estimate_scale_T(pilot_t, method=cfg.scale_method)
-    beta0_formula = float(np.sqrt(np.log(1.0 / exact_p)))
-    beta0_laplace = init_beta_from_iid_pilot(
-        pilot_T=pilot_t,
-        T_obs=problem.t_obs,
-        sigma_T=sigma_t,
-        p0=p0_for_qtarget,
-        q_target=q_target,
-        beta_max=cfg.beta_max_init,
+    init_payload = build_beta_initialization(
+        problem,
+        exact_p,
+        cfg,
+        seed=seed,
     )
-    pilot_eval_total = int(cfg.pilot_samples)
+    pilot_t = np.asarray(init_payload["pilot_t"], dtype=float)
+    sigma_t = float(init_payload["sigma_t"])
+    p0_for_qtarget = float(init_payload["p0_for_qtarget"])
+    q_target = float(init_payload["q_target"])
+    beta0_formula = float(init_payload["beta0_formula"])
+    beta0_laplace = float(init_payload["beta0_laplace"])
+    pilot_eval_total = int(init_payload["pilot_eval_total"])
     tuning_chain_eval_total = 0
     tuning_eval_total = int(pilot_eval_total + tuning_chain_eval_total)
-    tuning_wall_time_sec = float(time.perf_counter() - t_start)
+    tuning_wall_time_sec = float(init_payload["pilot_wall_time_sec"])
     beta_tuned = float(beta0_laplace)
 
     if cfg.beta_override is not None:
@@ -1781,6 +1778,44 @@ def build_beta_workflow(
             else None
         ),
         "beta_selection_strategy": "pilot_only_discrete_q_swap_grid",
+    }
+
+
+def build_beta_initialization(
+    problem: PermutationTestProblem,
+    exact_p: float,
+    cfg: MCMCWorkflowConfig,
+    *,
+    seed: int,
+    p0_reference: float | None = None,
+) -> dict[str, Any]:
+    if p0_reference is None:
+        p0_for_qtarget = float(exact_p) if cfg.use_true_p0_for_q_target else float(cfg.p0_guess)
+    else:
+        p0_for_qtarget = float(p0_reference)
+    q_target = float(p0_for_qtarget ** cfg.d_alpha)
+
+    t_start = time.perf_counter()
+    pilot_t = iid_pilot_statistics(problem, n_samples=cfg.pilot_samples, seed=seed)
+    sigma_t = estimate_scale_T(pilot_t, method=cfg.scale_method)
+    beta0_formula = float(np.sqrt(np.log(1.0 / exact_p)))
+    beta0_laplace = init_beta_from_iid_pilot(
+        pilot_T=pilot_t,
+        T_obs=problem.t_obs,
+        sigma_T=sigma_t,
+        p0=p0_for_qtarget,
+        q_target=q_target,
+        beta_max=cfg.beta_max_init,
+    )
+    return {
+        "pilot_t": np.asarray(pilot_t, dtype=float),
+        "sigma_t": float(sigma_t),
+        "beta0_formula": beta0_formula,
+        "beta0_laplace": float(beta0_laplace),
+        "p0_for_qtarget": p0_for_qtarget,
+        "q_target": q_target,
+        "pilot_eval_total": int(cfg.pilot_samples),
+        "pilot_wall_time_sec": float(time.perf_counter() - t_start),
     }
 
 

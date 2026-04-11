@@ -79,12 +79,14 @@ def _common_setup_code() -> str:
         SAMCWorkflowConfig,
         _mcmc_eval_count,
         _steps_per_chain,
+        build_beta_initialization,
         build_beta_workflow,
         create_timestamped_run_dir,
         load_beta_sweep_saved_output,
         load_cross_method_saved_output,
         load_mcmc_objective_grid_saved_output,
         load_selected_scenarios,
+        run_named_mcmc_checkpoint_study,
         run_mcmc_objective_grid_study,
         save_mcmc_objective_grid_outputs,
         regenerate_beta_sweep_plots_from_saved,
@@ -140,8 +142,8 @@ def build_cross_method_notebook() -> dict:
                 "poisson_diffmeans_hep_above_n200",
             ]
 
-            ESTIMATION_POINTS = (750_000, 1_000_000, 2_500_000, 5_000_000, 7_500_000, 10_000_000, 15_000_000) if not FAST_MODE else (50_000, 100_000, 200_000)
-            N_REPEATS = 10 if not FAST_MODE else 2
+            ESTIMATION_POINTS = (5_000_000,) if not FAST_MODE else (200_000,)
+            N_REPEATS = 5 if not FAST_MODE else 2
             N_JOBS = min(6, N_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
             BASE_SEED = 12_345
@@ -151,7 +153,7 @@ def build_cross_method_notebook() -> dict:
             MCMC_SCAN_REFINE_TO_SCREEN_RATIO = 1.0
             MCMC_SCAN_FINAL_TO_SCREEN_RATIO = 2.0
             MCMC_SCAN_FINALIST_COUNT = 4
-            MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND = {
+            DEFAULT_PROPOSAL_SIZE_BY_SAMPLE_BAND = {
                 "small": 1,
                 "medium": 1,
                 "large": 2,
@@ -195,24 +197,37 @@ def build_cross_method_notebook() -> dict:
                 proposal_size=0.1,
             )
 
-            def mcmc_proposal_size_for_scenario(scenario):
+            def proposal_size_for_scenario(scenario):
+                setting_key = str(scenario.extra.get("application_setting_key", ""))
+                if setting_key == "gwas_threshold_suite":
+                    return 2
+                if setting_key == "hep_threshold_suite":
+                    return 6
                 band = str(scenario.portfolio.get("sample_size_band", "medium"))
-                return int(MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
+                return int(DEFAULT_PROPOSAL_SIZE_BY_SAMPLE_BAND.get(band, 1))
+
+
+            def mcmc_proposal_size_for_scenario(scenario):
+                return int(proposal_size_for_scenario(scenario))
+
+
+            def samc_cfg_for_scenario(scenario):
+                return replace(
+                    samc_cfg,
+                    proposal_size=int(proposal_size_for_scenario(scenario)),
+                )
 
 
             def reference_p0_for_scenario(scenario) -> float:
                 threshold = scenario.extra.get("known_significance_threshold")
-                if threshold is not None and np.isfinite(float(threshold)) and float(threshold) > 0.0:
-                    return float(threshold)
+                if threshold is not None:
+                    threshold_f = float(threshold)
+                    if threshold_f == threshold_f and threshold_f > 0.0:
+                        return threshold_f
                 return float(scenario.exact_p)
 
 
             def target_scan_budget_from_p0(p0: float) -> int:
-                p0 = float(p0)
-                if 1e-6 <= p0 <= 1e-4:
-                    return 500_000
-                if 1e-8 <= p0 < 1e-6:
-                    return 1_000_000
                 return 1_000_000
 
 
@@ -312,9 +327,13 @@ def build_cross_method_notebook() -> dict:
                 "MCMC_SCAN_FINALIST_COUNT": MCMC_SCAN_FINALIST_COUNT,
                 "MCMC_LOCAL_SCAN_Q_MULTIPLIERS": MCMC_LOCAL_SCAN_Q_MULTIPLIERS,
                 "MCMC_LOCAL_SCAN_COARSE_Q_MULTIPLIERS": MCMC_LOCAL_SCAN_COARSE_Q_MULTIPLIERS,
-                "MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND": MCMC_PROPOSAL_SIZE_BY_SAMPLE_BAND,
-                "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
-            }, indent=2))
+                    "DEFAULT_PROPOSAL_SIZE_BY_SAMPLE_BAND": DEFAULT_PROPOSAL_SIZE_BY_SAMPLE_BAND,
+                    "APPLICATION_PROPOSAL_SIZE_OVERRIDES": {
+                        "gwas_threshold_suite": 2,
+                        "hep_threshold_suite": 6,
+                    },
+                    "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
+                }, indent=2))
             """
         ),
         markdown_cell("## Load Scenarios"),
@@ -361,13 +380,16 @@ def build_cross_method_notebook() -> dict:
 
             for scenario in scenarios:
                 scenario_mcmc_cfg = mcmc_cfg_for_scenario(scenario)
+                scenario_samc_cfg = samc_cfg_for_scenario(scenario)
                 print(f"Running {scenario.key} | exact p={scenario.exact_p:.3e}")
                 print(json.dumps({
                     "scenario": scenario.key,
+                    "application_setting_key": scenario.extra.get("application_setting_key"),
                     "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
                     "reference_p0_for_qtarget": reference_p0_for_scenario(scenario),
                     "sample_size_band": scenario.portfolio.get("sample_size_band"),
                     "mcmc_proposal_size": scenario_mcmc_cfg.proposal_size,
+                    "samc_proposal_size": scenario_samc_cfg.proposal_size,
                     "mcmc_local_scan_strategy": scenario_mcmc_cfg.local_scan_strategy,
                     "mcmc_local_scan_swap_counts": scenario_mcmc_cfg.local_scan_swap_counts,
                     "mcmc_local_scan_objective": scenario_mcmc_cfg.local_scan_objective,
@@ -381,7 +403,7 @@ def build_cross_method_notebook() -> dict:
                     scenario,
                     cross_cfg=cross_cfg,
                     mcmc_cfg=scenario_mcmc_cfg,
-                    samc_cfg=samc_cfg,
+                    samc_cfg=scenario_samc_cfg,
                 )
                 cross_results[scenario.key] = study
 
@@ -392,7 +414,7 @@ def build_cross_method_notebook() -> dict:
                         output_dir=run_dir / scenario.key,
                         cross_cfg=cross_cfg,
                         mcmc_cfg=scenario_mcmc_cfg,
-                        samc_cfg=samc_cfg,
+                        samc_cfg=scenario_samc_cfg,
                     )
 
                 print(json.dumps({
@@ -486,21 +508,30 @@ def build_beta_notebook() -> dict:
     cells = [
         markdown_cell(
             """
-            # Experiment: MCMC-IS Beta Diagnostics
+            # Experiment: Oracle Beta Search
 
             Objective:
-            - Fix one exact scenario.
-            - Compare MCMC-IS performance across beta values.
-            - Record estimates and diagnostics at intermediate estimation points.
+            - Use the same six application-style scenarios as the cross-method notebook.
+            - Initialize beta from a pilot-only rule, without the discrete scan.
+            - Run Optuna HPO over beta multiplier and swap size to obtain an oracle scenario-specific beta.
+            - Save the best oracle beta and compare it against the pilot-only initialization.
             """
         ),
         code_cell(_common_setup_code()),
+        code_cell(
+            """
+            import json
+            import numpy as np
+            import optuna
+            from optuna.samplers import TPESampler
+            """
+        ),
         markdown_cell(
             """
             ## Configuration
 
-            `ESTIMATION_POINTS` controls checkpoint budgets.  
-            The final checkpoint is used for the main beta boxplots; all checkpoints are used for convergence plots.
+            `ESTIMATION_POINTS` are the final evaluation checkpoints for the pilot-initialized and oracle-selected configurations.  
+            The Optuna objective itself is evaluated at `HPO_CHECKPOINT`, which is treated as an extra pre-production calibration budget and is not part of the article x-axis budget.
             """
         ),
         code_cell(
@@ -511,50 +542,122 @@ def build_beta_notebook() -> dict:
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
             OUTPUT_ROOT = project_root / "results" / "mcmcis_beta_notebook"
 
-            SCENARIO_GROUP = "stress_test"
-            SCENARIO_KEYS_OVERRIDE = None
-            ESTIMATION_POINTS = (333_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000) if not FAST_MODE else (2_000, 10_000, 20_000)
-            BETA_MULTIPLIERS = (0.5, 0.75, 1.00, 1.25, 1.5)
-            BETA_REPEATS = 5 if not FAST_MODE else 2
-            N_JOBS = min(BETA_REPEATS, os.cpu_count() or 1)
+            SCENARIO_GROUP = "threshold_suite"
+            SCENARIO_KEYS_OVERRIDE = [
+                "gwas_additive_score_ultra_n60",
+                "poisson_diffmeans_hep_ultra_n200",
+                "gwas_additive_score_sig_n60",
+                "poisson_diffmeans_hep_sig_n200",
+                "gwas_additive_score_above_n60",
+                "poisson_diffmeans_hep_above_n200",
+            ]
+            ESTIMATION_POINTS = (5_000_000,) if not FAST_MODE else (200_000,)
+            HPO_CHECKPOINT = max(ESTIMATION_POINTS)
+            HPO_N_TRIALS = 30 if not FAST_MODE else 5
+            HPO_TRIAL_REPEATS = 3 if not FAST_MODE else 1
+            HPO_OBJECTIVE_METRIC = "rmse"
+            HPO_BETA_MULTIPLIER_LOW = 0.25
+            HPO_BETA_MULTIPLIER_HIGH = 4.0
+            HPO_SWAP_CHOICES_DEFAULT = (1, 2, 3, 4, 6, 8)
+            HPO_SWAP_CHOICES_BY_SETTING = {
+                "gwas_threshold_suite": (1, 2, 3, 4),
+                "hep_threshold_suite": (2, 4, 6, 8, 10),
+            }
+            DEFAULT_BASELINE_SWAP_BY_SETTING = {
+                "gwas_threshold_suite": 2,
+                "hep_threshold_suite": 6,
+            }
+            FINAL_EVAL_REPEATS = 5 if not FAST_MODE else 2
+            FINAL_EVAL_N_JOBS = min(FINAL_EVAL_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
             BASE_SEED = 54_321
 
-            mcmc_cfg = MCMCWorkflowConfig(
+            init_cfg = MCMCWorkflowConfig(
+                use_true_p0_for_q_target=False,
+                p0_guess=1e-8,
                 pilot_samples=20_000 if not FAST_MODE else 1_000,
-                tune_steps=2_000 if not FAST_MODE else 1_000,
-                local_scan_screen_total_steps=12_000 if not FAST_MODE else 1_000,
-                local_scan_total_steps=32_000 if not FAST_MODE else 6_000,
+                scale_method="sd",
+                beta_max_init=1e6,
                 chains=2,
                 thin=1,
-                estimate_variance=True,
-                proposal_size=0.075,
+                estimate_variance=False,
+                proposal_size=1,
             )
-            beta_cfg = BetaSweepStudyConfig(
-                estimation_points=ESTIMATION_POINTS,
-                repeats=BETA_REPEATS,
-                beta_multipliers=BETA_MULTIPLIERS,
+
+            hpo_eval_cfg = BetaSweepStudyConfig(
+                estimation_points=(HPO_CHECKPOINT,),
+                repeats=HPO_TRIAL_REPEATS,
+                beta_multipliers=(1.0,),
                 chains=2,
                 thin=1,
-                estimate_variance=True,
-                proposal_size=0.075,
+                estimate_variance=False,
+                proposal_size=1,
                 base_seed=BASE_SEED,
-                n_jobs=N_JOBS,
+                n_jobs=1,
             )
+
+            final_eval_cfg = BetaSweepStudyConfig(
+                estimation_points=ESTIMATION_POINTS,
+                repeats=FINAL_EVAL_REPEATS,
+                beta_multipliers=(1.0,),
+                chains=2,
+                thin=1,
+                estimate_variance=True,
+                proposal_size=1,
+                base_seed=BASE_SEED + 500_000,
+                n_jobs=FINAL_EVAL_N_JOBS,
+            )
+
+            def reference_p0_for_scenario(scenario) -> float:
+                threshold = scenario.extra.get("known_significance_threshold")
+                if threshold is not None:
+                    threshold_f = float(threshold)
+                    if threshold_f == threshold_f and threshold_f > 0.0:
+                        return threshold_f
+                return float(scenario.exact_p)
+
+
+            def swap_choices_for_scenario(scenario) -> tuple[int, ...]:
+                setting_key = str(scenario.extra.get("application_setting_key", ""))
+                if setting_key in HPO_SWAP_CHOICES_BY_SETTING:
+                    return tuple(int(v) for v in HPO_SWAP_CHOICES_BY_SETTING[setting_key])
+                return tuple(int(v) for v in HPO_SWAP_CHOICES_DEFAULT)
+
+
+            def baseline_swap_for_scenario(scenario) -> int:
+                setting_key = str(scenario.extra.get("application_setting_key", ""))
+                if setting_key in DEFAULT_BASELINE_SWAP_BY_SETTING:
+                    return int(DEFAULT_BASELINE_SWAP_BY_SETTING[setting_key])
+                return int(swap_choices_for_scenario(scenario)[0])
+
+
+            def trial_objective_value(summary_row: dict, metric: str) -> float:
+                metric_val = float(summary_row[metric])
+                if not np.isfinite(metric_val):
+                    return float("inf")
+                return metric_val
+
 
             print(json.dumps({
                 "FAST_MODE": FAST_MODE,
                 "SCENARIO_GROUP": SCENARIO_GROUP,
                 "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
                 "ESTIMATION_POINTS": ESTIMATION_POINTS,
-                "BETA_MULTIPLIERS": BETA_MULTIPLIERS,
-                "BETA_REPEATS": BETA_REPEATS,
-                "N_JOBS": N_JOBS,
+                "HPO_CHECKPOINT": HPO_CHECKPOINT,
+                "HPO_N_TRIALS": HPO_N_TRIALS,
+                "HPO_TRIAL_REPEATS": HPO_TRIAL_REPEATS,
+                "HPO_OBJECTIVE_METRIC": HPO_OBJECTIVE_METRIC,
+                "HPO_BETA_MULTIPLIER_LOW": HPO_BETA_MULTIPLIER_LOW,
+                "HPO_BETA_MULTIPLIER_HIGH": HPO_BETA_MULTIPLIER_HIGH,
+                "HPO_SWAP_CHOICES_BY_SETTING": HPO_SWAP_CHOICES_BY_SETTING,
+                "FINAL_EVAL_REPEATS": FINAL_EVAL_REPEATS,
+                "FINAL_EVAL_N_JOBS": FINAL_EVAL_N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
+                "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
             }, indent=2))
             """
         ),
-        markdown_cell("## Load Scenario And Build Beta Workflow"),
+        markdown_cell("## Load Scenarios"),
         code_cell(
             """
             scenarios = load_selected_scenarios(
@@ -581,57 +684,211 @@ def build_beta_notebook() -> dict:
             ])
             """
         ),
-        markdown_cell("## Run Beta Sweep Across Checkpoints"),
+        markdown_cell("## Run Oracle Beta HPO"),
         code_cell(
             """
-            beta_results = {}
+            oracle_results = {}
 
             for scenario_idx, scenario in enumerate(scenarios):
-                workflow_seed = BASE_SEED + 10_000 + 1_000 * scenario_idx
-                beta_workflow = build_beta_workflow(
+                scenario_seed = BASE_SEED + 50_000 * scenario_idx
+                p0_reference = reference_p0_for_scenario(scenario)
+                init_payload = build_beta_initialization(
                     scenario.problem,
                     scenario.exact_p,
-                    mcmc_cfg,
-                    seed=workflow_seed,
+                    init_cfg,
+                    seed=scenario_seed,
+                    p0_reference=p0_reference,
                 )
+                beta_init = float(init_payload["beta0_laplace"])
+                sigma_t = float(init_payload["sigma_t"])
+                swap_choices = swap_choices_for_scenario(scenario)
+                baseline_swap = baseline_swap_for_scenario(scenario)
+                trial_rows = []
 
                 print(json.dumps({
                     "scenario": scenario.key,
                     "exact_p": scenario.exact_p,
-                    "beta0_laplace": beta_workflow["beta0_laplace"],
-                    "beta_hat_tuned": beta_workflow["beta_hat_tuned"],
-                    "beta_used": beta_workflow["beta_used"],
-                    "q_target": beta_workflow["q_target"],
+                    "application_setting_key": scenario.extra.get("application_setting_key"),
+                    "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
+                    "reference_p0": p0_reference,
+                    "beta0_formula": init_payload["beta0_formula"],
+                    "beta0_laplace": beta_init,
+                    "q_target": init_payload["q_target"],
+                    "sigma_t": sigma_t,
+                    "swap_choices": swap_choices,
+                    "baseline_swap": baseline_swap,
                 }, indent=2))
 
-                beta_study = run_beta_checkpoint_study(
+                def objective(trial):
+                    beta_multiplier = float(
+                        trial.suggest_float(
+                            "beta_multiplier",
+                            HPO_BETA_MULTIPLIER_LOW,
+                            HPO_BETA_MULTIPLIER_HIGH,
+                            log=True,
+                        )
+                    )
+                    proposal_size = int(trial.suggest_categorical("proposal_size", list(swap_choices)))
+                    beta = float(beta_init * beta_multiplier)
+                    trial_eval = run_named_mcmc_checkpoint_study(
+                        scenario.problem,
+                        scenario.exact_p,
+                        config_specs=[
+                            {
+                                "label": "oracle_trial",
+                                "config_id": f"trial_{trial.number}",
+                                "beta": beta,
+                                "proposal_size": proposal_size,
+                                "source": "oracle_hpo",
+                            }
+                        ],
+                        sigma_t=sigma_t,
+                        estimation_points=(HPO_CHECKPOINT,),
+                        repeats=HPO_TRIAL_REPEATS,
+                        base_seed=BASE_SEED + 1_000_000 * scenario_idx + 10_000 * trial.number,
+                        template_cfg=hpo_eval_cfg,
+                        n_jobs=int(hpo_eval_cfg.n_jobs),
+                    )
+                    summary_row = dict(pd.DataFrame(trial_eval["summary"]).iloc[0])
+                    objective_value = trial_objective_value(summary_row, HPO_OBJECTIVE_METRIC)
+                    trial_payload = {
+                        "trial_number": int(trial.number),
+                        "scenario": scenario.key,
+                        "beta_multiplier": beta_multiplier,
+                        "beta": beta,
+                        "proposal_size": proposal_size,
+                        "objective_metric": HPO_OBJECTIVE_METRIC,
+                        "objective_value": float(objective_value),
+                        "reference_p0": float(p0_reference),
+                        **summary_row,
+                    }
+                    trial_rows.append(trial_payload)
+                    for key, value in trial_payload.items():
+                        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                            trial.set_user_attr(str(key), value)
+                    return float(objective_value)
+
+                study = optuna.create_study(
+                    direction="minimize",
+                    sampler=TPESampler(seed=BASE_SEED + 10_000 * scenario_idx + 7),
+                    study_name=f"{scenario.key}_oracle_beta",
+                )
+                study.optimize(objective, n_trials=HPO_N_TRIALS, show_progress_bar=False)
+
+                best_multiplier = float(study.best_trial.params["beta_multiplier"])
+                best_proposal_size = int(study.best_trial.params["proposal_size"])
+                best_beta = float(beta_init * best_multiplier)
+                best_config = {
+                    "scenario": scenario.key,
+                    "reference_p0": float(p0_reference),
+                    "beta_init": float(beta_init),
+                    "beta0_formula": float(init_payload["beta0_formula"]),
+                    "beta0_laplace": float(init_payload["beta0_laplace"]),
+                    "sigma_t": float(sigma_t),
+                    "best_beta_multiplier": best_multiplier,
+                    "best_beta": best_beta,
+                    "best_proposal_size": int(best_proposal_size),
+                    "best_objective_value": float(study.best_value),
+                    "best_trial_number": int(study.best_trial.number),
+                    "n_trials": int(len(study.trials)),
+                }
+
+                final_eval = run_named_mcmc_checkpoint_study(
                     scenario.problem,
                     scenario.exact_p,
-                    beta_center=float(beta_workflow["beta_used"]),
-                    sigma_t=float(beta_workflow["sigma_t"]),
-                    beta_cfg=beta_cfg,
+                    config_specs=[
+                        {
+                            "label": "init",
+                            "config_id": "init",
+                            "beta": float(beta_init),
+                            "proposal_size": int(baseline_swap),
+                            "source": "pilot_init",
+                        },
+                        {
+                            "label": "oracle",
+                            "config_id": "oracle",
+                            "beta": float(best_beta),
+                            "proposal_size": int(best_proposal_size),
+                            "source": "oracle_hpo",
+                            "selected_by_objectives": ["optuna"],
+                        },
+                    ],
+                    sigma_t=sigma_t,
+                    estimation_points=ESTIMATION_POINTS,
+                    repeats=FINAL_EVAL_REPEATS,
+                    base_seed=BASE_SEED + 5_000_000 + 100_000 * scenario_idx,
+                    template_cfg=final_eval_cfg,
+                    n_jobs=FINAL_EVAL_N_JOBS,
                 )
-                beta_results[scenario.key] = {
-                    "study": beta_study,
-                    "beta_workflow": beta_workflow,
+
+                oracle_results[scenario.key] = {
+                    "best_config": best_config,
+                    "trial_rows": list(trial_rows),
+                    "final_eval": final_eval,
+                    "init_payload": {
+                        key: value
+                        for key, value in init_payload.items()
+                        if key != "pilot_t"
+                    },
                 }
 
                 if SAVE_OUTPUTS and run_dir is not None:
-                    save_beta_sweep_outputs(
-                        beta_study,
-                        output_dir=run_dir / scenario.key,
-                        scenario_name=scenario.description,
-                        exact_p=scenario.exact_p,
-                        beta_cfg=beta_cfg,
-                        beta_workflow=beta_workflow,
+                    scenario_dir = run_dir / scenario.key
+                    scenario_dir.mkdir(parents=True, exist_ok=True)
+                    pd.DataFrame(trial_rows).to_json(
+                        scenario_dir / "hpo_trials.jsonl",
+                        orient="records",
+                        lines=True,
+                    )
+                    pd.DataFrame(final_eval["records"]).to_json(
+                        scenario_dir / "final_eval_records.jsonl",
+                        orient="records",
+                        lines=True,
+                    )
+                    pd.DataFrame(final_eval["summary"]).to_json(
+                        scenario_dir / "final_eval_summary.json",
+                        orient="records",
+                        indent=2,
+                    )
+                    (scenario_dir / "best_config.json").write_text(
+                        json.dumps(best_config, indent=2),
+                        encoding="utf-8",
+                    )
+                    (scenario_dir / "metadata.json").write_text(
+                        json.dumps(
+                            {
+                                "scenario": scenario.key,
+                                "scenario_display": scenario.description,
+                                "exact_p": float(scenario.exact_p),
+                                "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
+                                "application_setting_key": scenario.extra.get("application_setting_key"),
+                                "reference_p0": float(p0_reference),
+                                "init_payload": oracle_results[scenario.key]["init_payload"],
+                                "hpo_settings": {
+                                    "n_trials": int(HPO_N_TRIALS),
+                                    "trial_repeats": int(HPO_TRIAL_REPEATS),
+                                    "objective_metric": str(HPO_OBJECTIVE_METRIC),
+                                    "beta_multiplier_low": float(HPO_BETA_MULTIPLIER_LOW),
+                                    "beta_multiplier_high": float(HPO_BETA_MULTIPLIER_HIGH),
+                                    "swap_choices": [int(v) for v in swap_choices],
+                                    "checkpoint": int(HPO_CHECKPOINT),
+                                },
+                                "final_eval_settings": final_eval["settings"],
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
                     )
 
-                beta_summary_df = pd.DataFrame(beta_study["summary"]).sort_values(["checkpoint", "beta"])
-                display(beta_summary_df[[
+                best_row = pd.DataFrame([best_config])
+                final_summary_df = pd.DataFrame(final_eval["summary"]).sort_values(["checkpoint", "label"])
+                display(best_row)
+                display(final_summary_df[[
                     "checkpoint",
-                    "beta",
+                    "label",
                     "mean_estimate",
                     "rmse",
+                    "mean_abs_log10_error",
                     "mean_variance_estimate",
                     "mean_q_tilt_tail_share",
                     "mean_ess",
@@ -640,16 +897,23 @@ def build_beta_notebook() -> dict:
                 ]])
             """
         ),
-        markdown_cell("## Review Saved Figures"),
+        markdown_cell("## Review Saved Outputs"),
         code_cell(
             """
             if SAVE_OUTPUTS and run_dir is not None:
-                scenario_dir = run_dir / scenario.key
-                print(f"Saved outputs under: {scenario_dir}")
-                display(Image(filename=str(scenario_dir / "beta_max_budget.png")))
-                display(Image(filename=str(scenario_dir / "beta_convergence.png")))
+                print(f"Saved outputs under: {run_dir}")
+                display(pd.DataFrame([
+                    {
+                        "scenario": key,
+                        "best_beta": payload["best_config"]["best_beta"],
+                        "best_multiplier": payload["best_config"]["best_beta_multiplier"],
+                        "best_proposal_size": payload["best_config"]["best_proposal_size"],
+                        "best_objective_value": payload["best_config"]["best_objective_value"],
+                    }
+                    for key, payload in oracle_results.items()
+                ]))
             else:
-                print("SAVE_OUTPUTS=False, so no saved figures to display.")
+                print("SAVE_OUTPUTS=False, so no saved outputs to display.")
             """
         ),
         markdown_cell("## Reload Saved Results Without Rerunning"),
@@ -657,21 +921,14 @@ def build_beta_notebook() -> dict:
             """
             # RELOAD_BETA_DIR = None
             # # Example:
-            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260306_120000_beta_diag" / "gwas_additive_score_sig_n60"
+            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260411_120000_beta_diag" / "gwas_additive_score_sig_n60"
 
             # if RELOAD_BETA_DIR is not None:
-            #     saved = load_beta_sweep_saved_output(RELOAD_BETA_DIR)
-            #     print(json.dumps({
-            #         "scenario_display": saved["metadata"]["scenario_display"],
-            #         "exact_p": saved["metadata"]["exact_p"],
-            #         "beta_center": saved["metadata"]["settings"]["beta_center"],
-            #     }, indent=2))
-            #     regen = regenerate_beta_sweep_plots_from_saved(RELOAD_BETA_DIR)
-            #     for name, path in regen.items():
-            #         print(name, path)
-            #         display(Image(filename=str(path)))
+            #     print(json.loads((RELOAD_BETA_DIR / "best_config.json").read_text()))
+            #     display(pd.read_json(RELOAD_BETA_DIR / "final_eval_summary.json"))
+            #     display(pd.read_json(RELOAD_BETA_DIR / "hpo_trials.jsonl", lines=True).sort_values("objective_value").head())
             # else:
-            #     print("Set RELOAD_BETA_DIR to a saved beta-study directory to regenerate plots from disk only.")
+            #     print("Set RELOAD_BETA_DIR to a saved oracle-beta directory to inspect saved results from disk only.")
             """
         ),
     ]
