@@ -7,7 +7,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -829,18 +829,23 @@ _CROSS_METHOD_LABELS: dict[str, str] = {
 }
 
 _CROSS_METHOD_COLORS: dict[str, str] = {
-    "iid": "#4e79a7",
-    "mcmc_is": "#f28e2b",
-    "samc": "#59a14f",
+    "iid": "#5b6c8f",
+    "mcmc_is": "#c48a3a",
+    "samc": "#4c8c77",
 }
 
 _CROSS_METHOD_TITLES: dict[str, str] = {
-    "bruteforce_welch_nonextreme_n22": "Welch t-statistic on ordered scores (X = 1, ..., 22)",
-    "gwas_additive_score_n40": "Treated dosage sum on Binomial(2, maf = 0.15) genotypes",
-    "gwas_additive_score_sig_n60": "Treated dosage sum on Binomial(2, maf = 0.25) genotypes",
-    "hypergeom_1e7": "Treated-success count on binary outcomes",
-    "linear_stat_dp_n40": "Difference in means on deterministic quadratic scores (X = i^2)",
-    "rank_sum_dp_n40": "Mann-Whitney U on ordered scores (X = 1, ..., 40)",
+    "bruteforce_welch_nonextreme_n22": "Welch t-statistic",
+    "gwas_additive_score_n40": "GWAS-like additive score",
+    "gwas_additive_score_ultra_n60": "GWAS-like additive score\nBelow threshold",
+    "gwas_additive_score_sig_n60": "GWAS-like additive score\nNear threshold",
+    "gwas_additive_score_above_n60": "GWAS-like additive score\nAbove threshold",
+    "hypergeom_1e7": "Hypergeometric count",
+    "linear_stat_dp_n40": "Difference in means",
+    "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nBelow threshold",
+    "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear threshold",
+    "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nAbove threshold",
+    "rank_sum_dp_n40": "Mann-Whitney U",
 }
 
 
@@ -852,12 +857,8 @@ def _compact_plot_title(
     n_treated: int | None = None,
 ) -> str:
     if scenario_key is not None and scenario_key in _CROSS_METHOD_TITLES:
-        title = _CROSS_METHOD_TITLES[str(scenario_key)]
-    else:
-        title = " ".join(str(scenario_name).split()).rstrip(".")
-    if n_control is not None and n_treated is not None:
-        return f"{title}\nControl/Treated size: {int(n_control)} / {int(n_treated)}"
-    return title
+        return _CROSS_METHOD_TITLES[str(scenario_key)]
+    return " ".join(str(scenario_name).split()).rstrip(".")
 
 
 def _format_scientific_tick(value: int | float) -> str:
@@ -874,22 +875,61 @@ def _format_scientific_tick(value: int | float) -> str:
     return f"{mantissa_str}e{exponent}"
 
 
-def _style_article_axis(ax, *, grid_axis: str = "y") -> None:
-    ax.set_facecolor("#fbfbfb")
+def _format_budget_tick_compact(value: int | float) -> str:
+    val = float(value)
+    if not np.isfinite(val):
+        return str(value)
+    abs_val = abs(val)
+    if abs_val >= 1_000_000:
+        scaled = val / 1_000_000.0
+        suffix = "M"
+    elif abs_val >= 1_000:
+        scaled = val / 1_000.0
+        suffix = "K"
+    else:
+        scaled = val
+        suffix = ""
+    if np.isclose(scaled, round(scaled)):
+        scaled_str = str(int(round(scaled)))
+    else:
+        scaled_str = f"{scaled:.1f}".rstrip("0").rstrip(".")
+    return f"{scaled_str}{suffix}"
+
+
+def _style_article_axis(
+    ax,
+    *,
+    grid_axis: str = "y",
+    add_minor_log_grid: bool = True,
+) -> None:
+    ax.set_facecolor("white")
     ax.set_axisbelow(True)
-    ax.grid(True, axis=grid_axis, which="major", color="#dddddd", linewidth=0.9, alpha=0.85)
+    ax.grid(True, axis=grid_axis, which="major", color="#dfe4e7", linewidth=0.85, alpha=0.95)
+    if add_minor_log_grid:
+        if ax.get_yscale() == "log" and grid_axis in {"y", "both"}:
+            ax.grid(True, axis="y", which="minor", color="#eff2f4", linewidth=0.55, alpha=0.9)
+        if ax.get_xscale() == "log" and grid_axis in {"x", "both"}:
+            ax.grid(True, axis="x", which="minor", color="#eff2f4", linewidth=0.55, alpha=0.85)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     for spine_name in ("left", "bottom"):
-        ax.spines[spine_name].set_color("#b8b8b8")
-        ax.spines[spine_name].set_linewidth(0.9)
+        ax.spines[spine_name].set_color("#bcc4c9")
+        ax.spines[spine_name].set_linewidth(0.85)
     ax.tick_params(colors="#333333", labelsize=10)
 
 
-def _set_budget_ticks(ax, budgets: Iterable[int | float], *, max_labels: int = 4) -> None:
+def _set_budget_ticks(
+    ax,
+    budgets: Iterable[int | float],
+    *,
+    max_labels: int = 6,
+    formatter: Callable[[int | float], str] | None = None,
+) -> None:
     ticks = sorted({int(v) for v in budgets if int(v) > 0})
     if not ticks:
         return
+    if formatter is None:
+        formatter = _format_scientific_tick
     label_ticks = ticks
     if max_labels > 0 and len(ticks) > max_labels:
         step = max(int(np.ceil((len(ticks) - 1) / max(max_labels - 1, 1))), 1)
@@ -898,7 +938,7 @@ def _set_budget_ticks(ax, budgets: Iterable[int | float], *, max_labels: int = 4
             label_ticks.append(ticks[-1])
         label_ticks = sorted(set(label_ticks))
     ax.set_xticks(label_ticks)
-    ax.set_xticklabels([_format_scientific_tick(tick) for tick in label_ticks], fontsize=8.5)
+    ax.set_xticklabels([formatter(tick) for tick in label_ticks], fontsize=9)
     ax.minorticks_off()
 
 
@@ -938,14 +978,14 @@ def _styled_boxplot(
         widths=0.58,
         patch_artist=True,
         showfliers=False,
-        medianprops={"color": "#222222", "linewidth": 1.5},
-        whiskerprops={"color": "#666666", "linewidth": 1.1},
-        capprops={"color": "#666666", "linewidth": 1.1},
-        boxprops={"edgecolor": "#666666", "linewidth": 1.1},
+        medianprops={"color": "#222222", "linewidth": 1.45},
+        whiskerprops={"color": "#6d7378", "linewidth": 1.0},
+        capprops={"color": "#6d7378", "linewidth": 1.0},
+        boxprops={"edgecolor": "#6d7378", "linewidth": 1.0},
     )
     for patch, color in zip(artists["boxes"], colors):
         patch.set_facecolor(color)
-        patch.set_alpha(0.78)
+        patch.set_alpha(0.72)
     return artists
 
 
@@ -975,6 +1015,14 @@ def _overlay_boxplot_points(
             alpha=0.95,
             zorder=3.5,
         )
+
+
+def _record_group_label(row: dict[str, Any]) -> str:
+    if "label" in row and row["label"] is not None:
+        return str(row["label"])
+    if "method" in row and row["method"] is not None:
+        return str(row["method"])
+    raise KeyError("record must contain either 'label' or 'method'.")
 
 
 def _stat_label(problem: PermutationTestProblem) -> str:
@@ -3677,28 +3725,38 @@ def run_cross_method_study(
     }
 
 
-def plot_cross_method_max_budget(
+def plot_named_method_max_budget(
     records: list[dict[str, Any]],
     *,
     scenario_name: str,
-    scenario_key: str | None = None,
     exact_p: float,
     max_budget: int,
+    method_order: list[str] | tuple[str, ...],
+    method_labels: dict[str, str] | None = None,
+    method_colors: dict[str, str] | None = None,
+    scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
-    beta_workflow: dict[str, Any] | None = None,
     save_path: Path | None = None,
 ) -> None:
     rows = [row for row in records if int(row["checkpoint"]) == int(max_budget)]
-    methods = ["iid", "mcmc_is", "samc"]
-    labels = [_CROSS_METHOD_LABELS[method] for method in methods]
-    colors = [_CROSS_METHOD_COLORS[method] for method in methods]
+    methods = [str(method) for method in method_order]
+    if method_labels is None:
+        method_labels = {}
+    if method_colors is None:
+        method_colors = {}
+    fallback_colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(methods), 1)))
+    labels = [str(method_labels.get(method, method)) for method in methods]
+    colors = [
+        str(method_colors.get(method, matplotlib.colors.to_hex(fallback_colors[idx])))
+        for idx, method in enumerate(methods)
+    ]
 
     est_data = []
     abs_error_data = []
     omission_notes: list[str] = []
     for method in methods:
-        sub = [row for row in rows if row["method"] == method]
+        sub = [row for row in rows if _record_group_label(row) == method]
         est = np.asarray([row["estimate"] for row in sub], dtype=float)
         rse = np.asarray([row["root_squared_error"] for row in sub], dtype=float)
         if method == "iid":
@@ -3722,7 +3780,7 @@ def plot_cross_method_max_budget(
     _set_log_ylim(axes[0], est_data)
     axes[0].set_title("Estimate", fontsize=12, pad=10)
     axes[0].set_ylabel(r"$\hat{p}$")
-    axes[0].legend(frameon=False, fontsize=10, loc="upper right")
+    axes[0].legend(frameon=False, fontsize=9.5, loc="upper right")
     _style_article_axis(axes[0], grid_axis="y")
 
     _styled_boxplot(axes[1], abs_error_data, labels=labels, colors=colors)
@@ -3763,47 +3821,100 @@ def plot_cross_method_max_budget(
     plt.close(fig)
 
 
-def plot_cross_method_convergence(
-    summary: list[dict[str, Any]],
+def plot_cross_method_max_budget(
+    records: list[dict[str, Any]],
     *,
     scenario_name: str,
     scenario_key: str | None = None,
     exact_p: float,
+    max_budget: int,
+    n_control: int | None = None,
+    n_treated: int | None = None,
+    beta_workflow: dict[str, Any] | None = None,
+    save_path: Path | None = None,
+) -> None:
+    plot_named_method_max_budget(
+        records,
+        scenario_name=scenario_name,
+        scenario_key=scenario_key,
+        exact_p=exact_p,
+        max_budget=max_budget,
+        method_order=["iid", "mcmc_is", "samc"],
+        method_labels=_CROSS_METHOD_LABELS,
+        method_colors=_CROSS_METHOD_COLORS,
+        n_control=n_control,
+        n_treated=n_treated,
+        save_path=save_path,
+    )
+
+
+def plot_named_method_convergence(
+    summary: list[dict[str, Any]],
+    *,
+    scenario_name: str,
+    exact_p: float,
+    method_order: list[str] | tuple[str, ...],
+    method_labels: dict[str, str] | None = None,
+    method_colors: dict[str, str] | None = None,
+    scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
     mcmc_beta_selection_budget: int = 0,
+    x_label: str = "Total budget",
+    x_scale: str = "linear",
+    estimate_field: str = "mean_estimate",
+    estimate_title: str = "Mean estimate",
+    estimate_ylabel: str = r"mean $\hat{p}$",
     save_path: Path | None = None,
 ) -> None:
-    methods = ["iid", "mcmc_is", "samc"]
+    methods = [str(method) for method in method_order]
+    if method_labels is None:
+        method_labels = {}
+    if method_colors is None:
+        method_colors = {}
     budgets = sorted({int(row["checkpoint"]) for row in summary})
+    fallback_colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(methods), 1)))
+    marker_cycle = ["o", "s", "D", "^", "P", "v"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4))
-    for method in methods:
-        sub = sorted([row for row in summary if row["method"] == method], key=lambda row: row["checkpoint"])
+    fig, axes = plt.subplots(1, 2, figsize=(14.2, 5.8))
+    for idx, method in enumerate(methods):
+        sub = sorted([row for row in summary if _record_group_label(row) == method], key=lambda row: row["checkpoint"])
         x = np.asarray([row["checkpoint"] for row in sub], dtype=float)
-        mean_est = np.asarray([row["mean_estimate"] for row in sub], dtype=float)
+        estimate_values = np.asarray([row[estimate_field] for row in sub], dtype=float)
         rmse = np.asarray([row["rmse"] for row in sub], dtype=float)
+        color = str(method_colors.get(method, matplotlib.colors.to_hex(fallback_colors[idx])))
 
         plot_kwargs = {
-            "marker": "o",
-            "markersize": 5.5,
-            "linewidth": 2.2,
+            "marker": marker_cycle[idx % len(marker_cycle)],
+            "linestyle": "-",
+            "markersize": 5.9,
+            "linewidth": 2.15,
             "markeredgecolor": "white",
-            "markeredgewidth": 0.8,
-            "label": _CROSS_METHOD_LABELS[method],
-            "color": _CROSS_METHOD_COLORS[method],
+            "markeredgewidth": 0.85,
+            "label": str(method_labels.get(method, method)),
+            "color": color,
+            "alpha": 0.98,
+            "zorder": 3.0 + 0.1 * idx,
         }
-        axes[0].plot(x, mean_est, **plot_kwargs)
+        axes[0].plot(x, estimate_values, **plot_kwargs)
         axes[1].plot(x, rmse, **plot_kwargs)
 
     axes[0].axhline(exact_p, color="#444444", linestyle="--", linewidth=1.2, label="Exact p")
-    est_arrays = [np.asarray([row["mean_estimate"] for row in summary if row["method"] == method], dtype=float) for method in methods]
-    rmse_arrays = [np.asarray([row["rmse"] for row in summary if row["method"] == method], dtype=float) for method in methods]
+    est_arrays = [np.asarray([row[estimate_field] for row in summary if _record_group_label(row) == method], dtype=float) for method in methods]
+    rmse_arrays = [np.asarray([row["rmse"] for row in summary if _record_group_label(row) == method], dtype=float) for method in methods]
+    x_span = float(max(budgets) - min(budgets)) if len(budgets) > 1 else float(max(budgets[0], 1))
     for ax in axes:
-        ax.set_xscale("log")
-        _set_budget_ticks(ax, budgets)
-        ax.set_xlabel("Total budget")
-        _style_article_axis(ax, grid_axis="y")
+        ax.set_xscale(str(x_scale))
+        _set_budget_ticks(
+            ax,
+            budgets,
+            max_labels=6 if str(x_scale) == "linear" else 4,
+            formatter=_format_budget_tick_compact if str(x_scale) == "linear" else _format_scientific_tick,
+        )
+        if str(x_scale) == "linear" and budgets:
+            pad = 0.025 * x_span if x_span > 0.0 else 0.15 * float(budgets[0])
+            ax.set_xlim(float(min(budgets)) - pad, float(max(budgets)) + pad)
+        ax.set_xlabel(str(x_label))
         ax.margins(x=0.05)
     if _has_positive_finite(est_arrays):
         axes[0].set_yscale("log")
@@ -3811,11 +3922,13 @@ def plot_cross_method_convergence(
     if _has_positive_finite(rmse_arrays):
         axes[1].set_yscale("log")
         _set_log_ylim(axes[1], rmse_arrays)
-    axes[0].set_title("Estimate", fontsize=12, pad=10)
-    axes[0].set_ylabel(r"mean $\hat{p}$")
+    axes[0].set_title(str(estimate_title), fontsize=12.5, pad=10)
+    axes[0].set_ylabel(str(estimate_ylabel))
     axes[1].set_title("RMSE", fontsize=12, pad=10)
     axes[1].set_ylabel("RMSE")
-    axes[0].legend(frameon=False, fontsize=10, loc="upper right")
+    for ax in axes:
+        _style_article_axis(ax, grid_axis="both" if str(x_scale) == "linear" else "y")
+    axes[0].legend(frameon=False, fontsize=9.6, loc="upper right")
     fig.suptitle(
         _compact_plot_title(
             scenario_name,
@@ -3832,6 +3945,33 @@ def plot_cross_method_convergence(
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_cross_method_convergence(
+    summary: list[dict[str, Any]],
+    *,
+    scenario_name: str,
+    scenario_key: str | None = None,
+    exact_p: float,
+    n_control: int | None = None,
+    n_treated: int | None = None,
+    mcmc_beta_selection_budget: int = 0,
+    save_path: Path | None = None,
+) -> None:
+    plot_named_method_convergence(
+        summary,
+        scenario_name=scenario_name,
+        scenario_key=scenario_key,
+        exact_p=exact_p,
+        method_order=["iid", "mcmc_is", "samc"],
+        method_labels=_CROSS_METHOD_LABELS,
+        method_colors=_CROSS_METHOD_COLORS,
+        n_control=n_control,
+        n_treated=n_treated,
+        mcmc_beta_selection_budget=mcmc_beta_selection_budget,
+        x_label="Total budget",
+        save_path=save_path,
+    )
 
 
 def plot_cross_method_diagnostics(

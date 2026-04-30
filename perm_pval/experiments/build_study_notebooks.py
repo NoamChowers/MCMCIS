@@ -82,10 +82,13 @@ def _common_setup_code() -> str:
         build_beta_initialization,
         build_beta_workflow,
         create_timestamped_run_dir,
-        load_beta_sweep_saved_output,
         load_cross_method_saved_output,
+        load_beta_sweep_saved_output,
         load_mcmc_objective_grid_saved_output,
         load_selected_scenarios,
+        plot_named_method_convergence,
+        plot_named_method_max_budget,
+        read_json,
         run_named_mcmc_checkpoint_study,
         run_mcmc_objective_grid_study,
         save_mcmc_objective_grid_outputs,
@@ -96,6 +99,13 @@ def _common_setup_code() -> str:
         save_beta_sweep_outputs,
         save_cross_method_outputs,
         summarize_records,
+        tune_samc_setup,
+        write_json,
+        write_jsonl,
+        _effective_n_jobs,
+        _iid_replicate_worker,
+        _samc_replicate_worker,
+        _try_make_process_pool,
     )
 
     pd.set_option("display.max_columns", 100)
@@ -103,7 +113,7 @@ def _common_setup_code() -> str:
     """
 
 
-def build_cross_method_notebook() -> dict:
+def _build_cross_method_notebook_legacy() -> dict:
     cells = [
         markdown_cell(
             """
@@ -504,7 +514,633 @@ def build_cross_method_notebook() -> dict:
     return notebook(cells)
 
 
-def build_beta_notebook() -> dict:
+def build_cross_method_notebook() -> dict:
+    cells = [
+        markdown_cell(
+            """
+            # Experiment: Cross-Method Oracle vs Baselines
+
+            Objective:
+            - Use the same six threshold-suite scenarios as the oracle-beta notebook.
+            - Compare `oracle_mcmcis`, `simple_mcmcis`, `samc`, and `iid`.
+            - Reuse the saved simple/oracle MCMC-IS settings from the completed beta-oracle run.
+            - Track every method at dense checkpoints from `0.5M` through `5M` budget per run.
+            """
+        ),
+        code_cell(_common_setup_code()),
+        markdown_cell(
+            """
+            ## Configuration
+
+            This notebook reuses the saved simple/oracle initialization values from the beta notebook and does **not** run any pilot.  
+            Each method is evaluated with `12` independent one-chain runs, so the full `5M` is the actual chain budget and is not reduced by any tuning overhead.
+            """
+        ),
+        code_cell(
+            """
+            FAST_MODE = False
+            SAVE_OUTPUTS = True
+
+            CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
+            BETA_RESULTS_ROOT = project_root / "results" / "mcmcis_beta_notebook"
+
+
+            def latest_oracle_beta_run_dir(root: Path) -> Path:
+                candidates = sorted(
+                    [
+                        path for path in Path(root).iterdir()
+                        if path.is_dir() and path.name.endswith("_oracle_beta_search")
+                    ]
+                )
+                if not candidates:
+                    raise FileNotFoundError(
+                        "No oracle-beta-search run found under results/mcmcis_beta_notebook. "
+                        "Run mcmcis_oracle_beta_search.ipynb first, or set BETA_RUN_DIR manually."
+                    )
+                return candidates[-1]
+
+
+            BETA_RUN_DIR = latest_oracle_beta_run_dir(BETA_RESULTS_ROOT)
+            OUTPUT_ROOT = project_root / "results" / "cross_method_notebook"
+
+            SCENARIO_KEYS_OVERRIDE = [
+                "gwas_additive_score_ultra_n60",
+                "poisson_diffmeans_hep_ultra_n200",
+                "gwas_additive_score_sig_n60",
+                "poisson_diffmeans_hep_sig_n200",
+                "gwas_additive_score_above_n60",
+                "poisson_diffmeans_hep_above_n200",
+            ]
+
+            MIN_TAIL_STATES = 2
+            BASE_SEED = 12_345
+            N_METHOD_RUNS = 12 if not FAST_MODE else 3
+            N_JOBS = min(6, os.cpu_count() or 1)
+            CHAIN_BUDGET = 5_000_000 if not FAST_MODE else 1_000_000
+            CHECKPOINT_STEP = 500_000 if not FAST_MODE else 250_000
+            ESTIMATION_POINTS = tuple(range(CHECKPOINT_STEP, CHAIN_BUDGET + CHECKPOINT_STEP, CHECKPOINT_STEP))
+
+            METHOD_ORDER = ["iid", "samc", "simple_mcmcis", "oracle_mcmcis"]
+            METHOD_LABELS = {
+                "iid": "IID",
+                "samc": "SAMC",
+                "simple_mcmcis": "Simple-init MCMC-IS",
+                "oracle_mcmcis": "Oracle MCMC-IS",
+            }
+            METHOD_COLORS = {
+                "iid": "#5b6c8f",
+                "samc": "#4c8c77",
+                "simple_mcmcis": "#c48a3a",
+                "oracle_mcmcis": "#b04a5a",
+            }
+
+            cross_cfg = CrossMethodStudyConfig(
+                estimation_points=ESTIMATION_POINTS,
+                repeats=N_METHOD_RUNS,
+                base_seed=BASE_SEED,
+                iid_density_samples=150_000 if not FAST_MODE else 20_000,
+                min_tail_states=MIN_TAIL_STATES,
+                n_jobs=N_JOBS,
+            )
+            mcmc_template_cfg = MCMCWorkflowConfig(
+                pilot_samples=0,
+                tune_steps=0,
+                chains=1,
+                burn_in_fraction=0.20,
+                thin=1,
+                estimate_variance=True,
+                obm_batch_size=None,
+                chain_n_jobs=1,
+                tilt_mode="smooth_hinge",
+                proposal_size=1,
+                local_scan_enabled=False,
+            )
+            samc_base_cfg = SAMCWorkflowConfig(
+                n_bins=100,
+                t0=1_000.0,
+                trace_every=200 if not FAST_MODE else 50,
+                lambda_min_pilot=10_000 if not FAST_MODE else 1_000,
+                proposal_size=0.1,
+            )
+
+            NOTEBOOK_CONFIG = {
+                "FAST_MODE": FAST_MODE,
+                "SAVE_OUTPUTS": SAVE_OUTPUTS,
+                "BETA_RUN_DIR": str(BETA_RUN_DIR),
+                "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
+                "MIN_TAIL_STATES": MIN_TAIL_STATES,
+                "BASE_SEED": BASE_SEED,
+                "N_METHOD_RUNS": N_METHOD_RUNS,
+                "N_JOBS": N_JOBS,
+                "CHAIN_BUDGET": CHAIN_BUDGET,
+                "CHECKPOINT_STEP": CHECKPOINT_STEP,
+                "N_CHECKPOINTS": len(ESTIMATION_POINTS),
+                "METHOD_ORDER": METHOD_ORDER,
+                "USES_SAVED_INIT_ONLY": True,
+                "COUNTS_INCLUDE_PILOT_BUDGET": False,
+                "PLOT_X_SCALE": "linear",
+                "CONVERGENCE_FIGURES": ["mean_estimate", "median_estimate"],
+            }
+
+            print(json.dumps(NOTEBOOK_CONFIG, indent=2))
+            """
+        ),
+        markdown_cell("## Notebook Helpers"),
+        code_cell(
+            """
+            def proposal_size_for_scenario(scenario) -> int:
+                setting_key = str(scenario.extra.get("application_setting_key", ""))
+                if setting_key == "gwas_threshold_suite":
+                    return 2
+                if setting_key == "hep_threshold_suite":
+                    return 6
+                band = str(scenario.portfolio.get("sample_size_band", "medium"))
+                if band == "small":
+                    return 1
+                if band == "large":
+                    return 2
+                return 1
+
+
+            def samc_cfg_for_scenario(scenario):
+                return replace(
+                    samc_base_cfg,
+                    proposal_size=int(proposal_size_for_scenario(scenario)),
+                )
+
+
+            def load_beta_reference(beta_run_dir: Path, scenario_key: str) -> dict:
+                scenario_dir = Path(beta_run_dir) / scenario_key
+                best_config = read_json(scenario_dir / "best_config.json")
+                simple_summary = read_json(scenario_dir / "simple_init_summary.json")
+                oracle_summary = read_json(scenario_dir / "oracle_best_trial.json")
+                metadata = read_json(scenario_dir / "metadata.json")
+                return {
+                    "scenario": scenario_key,
+                    "beta_run_dir": str(scenario_dir),
+                    "sigma_t": float(best_config["sigma_t"]),
+                    "reference_p0": float(best_config["reference_p0"]),
+                    "simple_beta": float(best_config["beta_init"]),
+                    "simple_proposal_size": int(simple_summary["proposal_size"]),
+                    "oracle_beta": float(best_config["best_beta"]),
+                    "oracle_proposal_size": int(best_config["best_proposal_size"]),
+                    "oracle_trial_number": int(best_config["best_trial_number"]),
+                    "oracle_objective_value": float(best_config["best_objective_value"]),
+                    "selection_source": str(best_config.get("selection_source", "unknown")),
+                    "application_setting_key": metadata.get("application_setting_key"),
+                    "known_significance_threshold": metadata.get("known_significance_threshold"),
+                    "simple_summary": simple_summary,
+                    "oracle_summary": oracle_summary,
+                }
+
+
+            def build_mcmc_config_specs(beta_reference: dict) -> list[dict]:
+                return [
+                    {
+                        "label": "simple_mcmcis",
+                        "config_id": "simple_mcmcis",
+                        "beta": float(beta_reference["simple_beta"]),
+                        "proposal_size": int(beta_reference["simple_proposal_size"]),
+                        "source": "oracle_beta_search_simple",
+                    },
+                    {
+                        "label": "oracle_mcmcis",
+                        "config_id": f"oracle_trial_{int(beta_reference['oracle_trial_number']):02d}",
+                        "beta": float(beta_reference["oracle_beta"]),
+                        "proposal_size": int(beta_reference["oracle_proposal_size"]),
+                        "source": "oracle_beta_search_oracle",
+                    },
+                ]
+
+
+            def run_parallel_worker_jobs(worker_fn, jobs: list[dict], *, n_jobs: int) -> list[dict]:
+                n_workers = _effective_n_jobs(int(n_jobs), len(jobs))
+                executor = _try_make_process_pool(n_workers) if n_workers > 1 else None
+                rows: list[dict] = []
+                if executor is None:
+                    for job in jobs:
+                        rows.extend(worker_fn(**job))
+                    return rows
+
+                with executor:
+                    futures = [executor.submit(worker_fn, **job) for job in jobs]
+                    for future in futures:
+                        rows.extend(future.result())
+                return rows
+
+
+            def run_iid_and_samc_baselines(scenario, *, base_seed: int, samc_cfg) -> tuple[list[dict], list[dict], dict]:
+                checkpoints = tuple(int(v) for v in cross_cfg.estimation_points)
+                iid_jobs = [
+                    {
+                        "scenario_key": scenario.key,
+                        "scenario_display": scenario.description,
+                        "problem": scenario.problem,
+                        "exact_p": scenario.exact_p,
+                        "checkpoints": checkpoints,
+                        "rep": int(rep),
+                        "rep_seed": int(base_seed + 1_000 * rep),
+                        "confidence_level": float(cross_cfg.confidence_level),
+                    }
+                    for rep in range(int(cross_cfg.repeats))
+                ]
+                iid_rows = run_parallel_worker_jobs(_iid_replicate_worker, iid_jobs, n_jobs=int(cross_cfg.n_jobs))
+                for row in iid_rows:
+                    row["label"] = "iid"
+
+                samc_setup = tune_samc_setup(
+                    scenario.problem,
+                    samc_cfg,
+                    seed=int(base_seed + 50_000),
+                )
+                samc_jobs = [
+                    {
+                        "scenario_key": scenario.key,
+                        "scenario_display": scenario.description,
+                        "problem": scenario.problem,
+                        "exact_p": scenario.exact_p,
+                        "checkpoints": checkpoints,
+                        "samc_setup": samc_setup,
+                        "samc_cfg": samc_cfg,
+                        "rep": int(rep),
+                        "rep_seed": int(base_seed + 100_000 + 1_000 * rep),
+                    }
+                    for rep in range(int(cross_cfg.repeats))
+                ]
+                samc_rows = run_parallel_worker_jobs(_samc_replicate_worker, samc_jobs, n_jobs=int(cross_cfg.n_jobs))
+                for row in samc_rows:
+                    row["label"] = "samc"
+
+                return iid_rows, samc_rows, samc_setup
+
+
+            def save_oracle_cross_method_outputs(
+                scenario,
+                study: dict,
+                *,
+                output_dir: Path,
+                beta_reference: dict,
+                samc_cfg,
+            ) -> None:
+                output_dir = Path(output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                plot_named_method_max_budget(
+                    study["records"],
+                    scenario_name=study["scenario_display"],
+                    scenario_key=study["scenario"],
+                    exact_p=float(study["exact_p"]),
+                    max_budget=max(int(v) for v in study["estimation_points"]),
+                    method_order=METHOD_ORDER,
+                    method_labels=METHOD_LABELS,
+                    method_colors=METHOD_COLORS,
+                    n_control=int(scenario.problem.n_control),
+                    n_treated=int(scenario.problem.n_treated),
+                    save_path=output_dir / "cross_method_max_budget.png",
+                )
+                plot_named_method_convergence(
+                    study["summary"],
+                    scenario_name=study["scenario_display"],
+                    scenario_key=study["scenario"],
+                    exact_p=float(study["exact_p"]),
+                    method_order=METHOD_ORDER,
+                    method_labels=METHOD_LABELS,
+                    method_colors=METHOD_COLORS,
+                    n_control=int(scenario.problem.n_control),
+                    n_treated=int(scenario.problem.n_treated),
+                    x_label="Budget per run",
+                    save_path=output_dir / "cross_method_convergence.png",
+                )
+                plot_named_method_convergence(
+                    study["summary"],
+                    scenario_name=study["scenario_display"],
+                    scenario_key=study["scenario"],
+                    exact_p=float(study["exact_p"]),
+                    method_order=METHOD_ORDER,
+                    method_labels=METHOD_LABELS,
+                    method_colors=METHOD_COLORS,
+                    n_control=int(scenario.problem.n_control),
+                    n_treated=int(scenario.problem.n_treated),
+                    x_label="Budget per run",
+                    estimate_field="median_estimate",
+                    estimate_title="Median estimate",
+                    estimate_ylabel=r"median $\\hat{p}$",
+                    save_path=output_dir / "cross_method_convergence_median.png",
+                )
+                write_jsonl(output_dir / "run_records.jsonl", study["records"])
+                write_json(output_dir / "summary.json", study["summary"])
+                write_json(
+                    output_dir / "metadata.json",
+                    {
+                        "scenario": study["scenario"],
+                        "scenario_display": study["scenario_display"],
+                        "scenario_portfolio": study["scenario_portfolio"],
+                        "exact_p": study["exact_p"],
+                        "exact_method": study["exact_method"],
+                        "exact_tail_hits": study["exact_tail_hits"],
+                        "exact_n_perm": study["exact_n_perm"],
+                        "n_treated": int(scenario.problem.n_treated),
+                        "n_control": int(scenario.problem.n_control),
+                        "n_total": int(scenario.problem.n),
+                        "estimation_points": study["estimation_points"],
+                        "method_order": METHOD_ORDER,
+                        "method_labels": METHOD_LABELS,
+                        "method_colors": METHOD_COLORS,
+                        "x_label": "Budget per run",
+                        "x_scale": "linear",
+                        "convergence_plot_fields": {
+                            "mean": "mean_estimate",
+                            "median": "median_estimate",
+                        },
+                        "cross_config": cross_cfg,
+                        "mcmc_template_config": mcmc_template_cfg,
+                        "samc_config": samc_cfg,
+                        "beta_reference": beta_reference,
+                        "samc_setup": study["samc_setup"],
+                        "notebook_config": NOTEBOOK_CONFIG,
+                    },
+                )
+
+
+            def regenerate_oracle_cross_method_plots(
+                scenario_dir: Path,
+                *,
+                save_dir: Path | None = None,
+            ) -> dict[str, Path]:
+                saved = load_cross_method_saved_output(scenario_dir)
+                metadata = saved["metadata"]
+                save_dir = Path(save_dir) if save_dir is not None else Path(scenario_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                max_budget = max(int(v) for v in metadata["estimation_points"])
+                out = {
+                    "cross_method_max_budget": save_dir / "cross_method_max_budget.png",
+                    "cross_method_convergence": save_dir / "cross_method_convergence.png",
+                    "cross_method_convergence_median": save_dir / "cross_method_convergence_median.png",
+                }
+                plot_named_method_max_budget(
+                    saved["records"],
+                    scenario_name=str(metadata["scenario_display"]),
+                    scenario_key=str(metadata["scenario"]),
+                    exact_p=float(metadata["exact_p"]),
+                    max_budget=max_budget,
+                    method_order=list(metadata.get("method_order", METHOD_ORDER)),
+                    method_labels=dict(METHOD_LABELS),
+                    method_colors=dict(METHOD_COLORS),
+                    n_control=int(metadata["n_control"]),
+                    n_treated=int(metadata["n_treated"]),
+                    save_path=out["cross_method_max_budget"],
+                )
+                plot_named_method_convergence(
+                    saved["summary"],
+                    scenario_name=str(metadata["scenario_display"]),
+                    scenario_key=str(metadata["scenario"]),
+                    exact_p=float(metadata["exact_p"]),
+                    method_order=list(metadata.get("method_order", METHOD_ORDER)),
+                    method_labels=dict(METHOD_LABELS),
+                    method_colors=dict(METHOD_COLORS),
+                    n_control=int(metadata["n_control"]),
+                    n_treated=int(metadata["n_treated"]),
+                    x_label=str(metadata.get("x_label", "Budget per run")),
+                    save_path=out["cross_method_convergence"],
+                )
+                plot_named_method_convergence(
+                    saved["summary"],
+                    scenario_name=str(metadata["scenario_display"]),
+                    scenario_key=str(metadata["scenario"]),
+                    exact_p=float(metadata["exact_p"]),
+                    method_order=list(metadata.get("method_order", METHOD_ORDER)),
+                    method_labels=dict(METHOD_LABELS),
+                    method_colors=dict(METHOD_COLORS),
+                    n_control=int(metadata["n_control"]),
+                    n_treated=int(metadata["n_treated"]),
+                    x_label=str(metadata.get("x_label", "Budget per run")),
+                    estimate_field="median_estimate",
+                    estimate_title="Median estimate",
+                    estimate_ylabel=r"median $\\hat{p}$",
+                    save_path=out["cross_method_convergence_median"],
+                )
+                return out
+            """
+        ),
+        markdown_cell("## Load Scenarios and Oracle References"),
+        code_cell(
+            """
+            scenarios = load_selected_scenarios(
+                catalog_path=CATALOG_PATH,
+                scenario_keys=SCENARIO_KEYS_OVERRIDE,
+                portfolio_group=None,
+                min_tail_states=MIN_TAIL_STATES,
+            )
+
+            beta_references = {
+                scenario.key: load_beta_reference(BETA_RUN_DIR, scenario.key)
+                for scenario in scenarios
+            }
+            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "cross_method_oracle_compare") if SAVE_OUTPUTS else None
+
+            pd.DataFrame(
+                [
+                    {
+                        "scenario": scenario.key,
+                        "exact_p": scenario.exact_p,
+                        "tail_hits": scenario.exact_tail_hits,
+                        "n_perm": scenario.exact_n_perm,
+                        "family": scenario.portfolio.get("family"),
+                        "rarity_band": scenario.portfolio.get("rarity_band"),
+                        "simple_beta": beta_references[scenario.key]["simple_beta"],
+                        "simple_prop": beta_references[scenario.key]["simple_proposal_size"],
+                        "oracle_beta": beta_references[scenario.key]["oracle_beta"],
+                        "oracle_prop": beta_references[scenario.key]["oracle_proposal_size"],
+                        "reference_p0": beta_references[scenario.key]["reference_p0"],
+                    }
+                    for scenario in scenarios
+                ]
+            )
+            """
+        ),
+        markdown_cell(
+            """
+            ## Run Cross-Method Study
+
+            For each scenario:
+            - load the saved simple/oracle MCMC-IS settings from `BETA_RUN_DIR`,
+            - run `12` independent one-chain replicates for each method,
+            - save the article-facing max-budget plot plus both mean- and median-based convergence plots.
+            """
+        ),
+        code_cell(
+            """
+            cross_results = {}
+
+            for scenario_idx, scenario in enumerate(scenarios):
+                beta_reference = beta_references[scenario.key]
+                scenario_seed = int(BASE_SEED + 1_000_000 * (scenario_idx + 1))
+                scenario_samc_cfg = samc_cfg_for_scenario(scenario)
+                mcmc_specs = build_mcmc_config_specs(beta_reference)
+
+                print(f"Running {scenario.key} | exact p={scenario.exact_p:.3e}")
+                print(json.dumps({
+                    "scenario": scenario.key,
+                    "n_method_runs": int(cross_cfg.repeats),
+                    "n_jobs": int(cross_cfg.n_jobs),
+                    "chain_budget": CHAIN_BUDGET,
+                    "first_checkpoints": [int(v) for v in ESTIMATION_POINTS[:4]],
+                    "last_checkpoint": int(ESTIMATION_POINTS[-1]),
+                    "simple_beta": beta_reference["simple_beta"],
+                    "simple_proposal_size": beta_reference["simple_proposal_size"],
+                    "oracle_beta": beta_reference["oracle_beta"],
+                    "oracle_proposal_size": beta_reference["oracle_proposal_size"],
+                    "sigma_t": beta_reference["sigma_t"],
+                    "samc_proposal_size": scenario_samc_cfg.proposal_size,
+                }, indent=2))
+
+                mcmc_study = run_named_mcmc_checkpoint_study(
+                    scenario.problem,
+                    scenario.exact_p,
+                    config_specs=mcmc_specs,
+                    sigma_t=float(beta_reference["sigma_t"]),
+                    estimation_points=tuple(int(v) for v in cross_cfg.estimation_points),
+                    repeats=int(cross_cfg.repeats),
+                    base_seed=scenario_seed,
+                    template_cfg=mcmc_template_cfg,
+                    n_jobs=int(cross_cfg.n_jobs),
+                )
+                iid_rows, samc_rows, samc_setup = run_iid_and_samc_baselines(
+                    scenario,
+                    base_seed=scenario_seed + 300_000,
+                    samc_cfg=scenario_samc_cfg,
+                )
+
+                records = list(mcmc_study["records"]) + list(iid_rows) + list(samc_rows)
+                records = sorted(
+                    records,
+                    key=lambda row: (
+                        str(row.get("label", row.get("method", ""))),
+                        int(row["replicate"]),
+                        int(row["checkpoint"]),
+                    ),
+                )
+                summary = summarize_records(records, group_fields=("checkpoint", "label"))
+
+                study = {
+                    "scenario": scenario.key,
+                    "scenario_display": scenario.description,
+                    "scenario_portfolio": dict(scenario.portfolio),
+                    "exact_p": float(scenario.exact_p),
+                    "exact_method": scenario.exact_method,
+                    "exact_tail_hits": int(scenario.exact_tail_hits),
+                    "exact_n_perm": int(scenario.exact_n_perm),
+                    "estimation_points": [int(v) for v in cross_cfg.estimation_points],
+                    "records": records,
+                    "summary": summary,
+                    "beta_reference": beta_reference,
+                    "samc_setup": {
+                        "lambda_min": float(samc_setup["lambda_min"]),
+                        "bin_edges": samc_setup["bin_edges"],
+                    },
+                }
+                cross_results[scenario.key] = study
+
+                if SAVE_OUTPUTS and run_dir is not None:
+                    save_oracle_cross_method_outputs(
+                        scenario,
+                        study,
+                        output_dir=run_dir / scenario.key,
+                        beta_reference=beta_reference,
+                        samc_cfg=scenario_samc_cfg,
+                    )
+
+                summary_df = pd.DataFrame(summary).sort_values(["checkpoint", "label"])
+                display(
+                    summary_df[
+                        [
+                            "checkpoint",
+                            "label",
+                            "mean_estimate",
+                            "median_estimate",
+                            "rmse",
+                            "mean_abs_log10_error",
+                            "mean_eval_excl_tuning",
+                            "mean_q_tilt_tail_share",
+                            "mean_ess",
+                            "mean_acceptance_rate",
+                            "mean_zero_rate",
+                            "mean_samc_max_rel_freq_error",
+                        ]
+                    ]
+                )
+
+            family_rows = []
+            for scenario in scenarios:
+                meta = scenario.portfolio
+                for row in cross_results[scenario.key]["summary"]:
+                    family_rows.append(
+                        {
+                            "scenario": scenario.key,
+                            "family": meta.get("family"),
+                            "rarity_band": meta.get("rarity_band"),
+                            "difficulty": meta.get("expected_difficulty"),
+                            **row,
+                        }
+                    )
+
+            family_df = pd.DataFrame(family_rows)
+            display(
+                family_df.groupby(["family", "rarity_band", "label", "checkpoint"], as_index=False)
+                .agg(
+                    mean_rmse=("rmse", "mean"),
+                    mean_estimate=("mean_estimate", "mean"),
+                    mean_abs_log10_error=("mean_abs_log10_error", "mean"),
+                    mean_q_tilt_tail_share=("mean_q_tilt_tail_share", "mean"),
+                    mean_ess=("mean_ess", "mean"),
+                    mean_acceptance_rate=("mean_acceptance_rate", "mean"),
+                )
+                .sort_values(["family", "rarity_band", "checkpoint", "label"])
+            )
+            """
+        ),
+        markdown_cell("## Review Saved Figures"),
+        code_cell(
+            """
+            if SAVE_OUTPUTS and run_dir is not None:
+                print(f"Saved outputs under: {run_dir}")
+                for scenario in scenarios:
+                    scenario_dir = run_dir / scenario.key
+                    print(f"\\n{scenario.key}")
+                    display(Image(filename=str(scenario_dir / "cross_method_max_budget.png")))
+                    display(Image(filename=str(scenario_dir / "cross_method_convergence.png")))
+                    display(Image(filename=str(scenario_dir / "cross_method_convergence_median.png")))
+            else:
+                print("SAVE_OUTPUTS=False, so no saved figures to display.")
+            """
+        ),
+        markdown_cell("## Reload Saved Results Without Rerunning"),
+        code_cell(
+            """
+            # RELOAD_SCENARIO_DIR = None
+            # # Example:
+            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260429_120000_cross_method_oracle_compare" / "gwas_additive_score_sig_n60"
+
+            # if RELOAD_SCENARIO_DIR is not None:
+            #     saved = load_cross_method_saved_output(RELOAD_SCENARIO_DIR)
+            #     print(json.dumps({
+            #         "scenario": saved["metadata"]["scenario"],
+            #         "exact_p": saved["metadata"]["exact_p"],
+            #         "methods": saved["metadata"]["method_order"],
+            #     }, indent=2))
+            #     regen = regenerate_oracle_cross_method_plots(RELOAD_SCENARIO_DIR)
+            #     for name, path in regen.items():
+            #         print(name, path)
+            #         display(Image(filename=str(path)))
+            # else:
+            #     print("Set RELOAD_SCENARIO_DIR to a saved scenario directory to regenerate the three article-facing plots.")
+            """
+        ),
+    ]
+    return notebook(cells)
+
+
+def build_oracle_beta_search_notebook() -> dict:
     cells = [
         markdown_cell(
             """
@@ -513,8 +1149,10 @@ def build_beta_notebook() -> dict:
             Objective:
             - Use the same six application-style scenarios as the cross-method notebook.
             - Initialize beta from a pilot-only rule, without the discrete scan.
-            - Run Optuna HPO over beta multiplier and swap size to obtain an oracle scenario-specific beta.
-            - Save the best oracle beta and compare it against the pilot-only initialization.
+            - Run Optuna HPO over the q-target power `gamma` and swap size, deriving beta from the shared IID pilot for each trial.
+            - Evaluate each trial as multiple independent one-chain MCMC-IS runs at the HPO checkpoint.
+            - Minimize the per-chain RMSE relative to the exact permutation p-value.
+            - Compare the best oracle trial directly against the simple pilot initialization under that same per-chain objective.
             """
         ),
         code_cell(_common_setup_code()),
@@ -524,14 +1162,18 @@ def build_beta_notebook() -> dict:
             import numpy as np
             import optuna
             from optuna.samplers import TPESampler
+            from perm_pval.methods.beta_tuning import init_beta_from_iid_pilot
             """
         ),
         markdown_cell(
             """
             ## Configuration
 
-            `ESTIMATION_POINTS` are the final evaluation checkpoints for the pilot-initialized and oracle-selected configurations.  
-            The Optuna objective itself is evaluated at `HPO_CHECKPOINT`, which is treated as an extra pre-production calibration budget and is not part of the article x-axis budget.
+            This notebook evaluates one final HPO budget per scenario, while saving intermediate checkpoints every `250k`.
+            Each Optuna trial consists of multiple independent one-chain MCMC-IS runs at that checkpoint.
+            The objective is the RMSE across those one-chain estimates.
+            `HPO_CHAIN_BUDGET` is the budget of each one-chain estimator.
+            There is no separate recheck stage and no separate final rerun of the winning configuration.
             """
         ),
         code_cell(
@@ -551,15 +1193,15 @@ def build_beta_notebook() -> dict:
                 "gwas_additive_score_above_n60",
                 "poisson_diffmeans_hep_above_n200",
             ]
-            ESTIMATION_POINTS = (500_000, 1_000_000, 2_500_000, 5_000_000) if not FAST_MODE else (200_000,)
-            HPO_CHECKPOINT = max(ESTIMATION_POINTS)
+            HPO_CHAIN_COUNT = 10
+            HPO_N_JOBS = 6
+            HPO_CHAIN_BUDGET = 5_000_000 if not FAST_MODE else 200_000
+            HPO_CHECKPOINT_STEP = 250_000 if not FAST_MODE else 50_000
+            HPO_ESTIMATION_POINTS = tuple(range(HPO_CHECKPOINT_STEP, HPO_CHAIN_BUDGET + HPO_CHECKPOINT_STEP, HPO_CHECKPOINT_STEP))
+            HPO_OBJECTIVE_CHECKPOINT = HPO_CHAIN_BUDGET
             HPO_N_TRIALS = 10 if not FAST_MODE else 5
-            HPO_TRIAL_REPEATS = 3 if not FAST_MODE else 1
-            HPO_RECHECK_TOP_K = 3
-            HPO_RECHECK_REPEATS = 10 if not FAST_MODE else 2
             HPO_OBJECTIVE_METRIC = "rmse"
-            HPO_BETA_MULTIPLIER_LOW = 0.001
-            HPO_BETA_MULTIPLIER_HIGH = 4.0
+            HPO_GAMMA_LADDER = (0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60)
             HPO_SWAP_CHOICES_DEFAULT = (1, 2, 3)
             HPO_SWAP_CHOICES_BY_SETTING = {
                 "gwas_threshold_suite": (1, 2),
@@ -569,15 +1211,13 @@ def build_beta_notebook() -> dict:
                 "gwas_threshold_suite": 2,
                 "hep_threshold_suite": 6,
             }
-            FINAL_EVAL_REPEATS = 5 if not FAST_MODE else 2
-            FINAL_EVAL_N_JOBS = min(FINAL_EVAL_REPEATS, os.cpu_count() or 1)
             MIN_TAIL_STATES = 2
             BASE_SEED = 54_321
 
             init_cfg = MCMCWorkflowConfig(
                 use_true_p0_for_q_target=False,
                 p0_guess=1e-8,
-                pilot_samples=20_000 if not FAST_MODE else 1_000,
+                pilot_samples=200_000 if not FAST_MODE else 1_000,
                 scale_method="sd",
                 beta_max_init=1e6,
                 chains=2,
@@ -587,28 +1227,16 @@ def build_beta_notebook() -> dict:
             )
 
             hpo_eval_cfg = BetaSweepStudyConfig(
-                estimation_points=(HPO_CHECKPOINT,),
-                repeats=HPO_TRIAL_REPEATS,
+                estimation_points=HPO_ESTIMATION_POINTS,
+                repeats=HPO_CHAIN_COUNT,
                 beta_multipliers=(1.0,),
-                chains=3,
+                chains=1,
                 thin=1,
                 estimate_variance=False,
-                chain_n_jobs=3,
+                chain_n_jobs=1,
                 proposal_size=1,
                 base_seed=BASE_SEED,
-                n_jobs=1,
-            )
-
-            final_eval_cfg = BetaSweepStudyConfig(
-                estimation_points=ESTIMATION_POINTS,
-                repeats=FINAL_EVAL_REPEATS,
-                beta_multipliers=(1.0,),
-                chains=2,
-                thin=1,
-                estimate_variance=True,
-                proposal_size=1,
-                base_seed=BASE_SEED + 500_000,
-                n_jobs=FINAL_EVAL_N_JOBS,
+                n_jobs=HPO_N_JOBS,
             )
 
             def reference_p0_for_scenario(scenario) -> float:
@@ -645,20 +1273,18 @@ def build_beta_notebook() -> dict:
                 "FAST_MODE": FAST_MODE,
                 "SCENARIO_GROUP": SCENARIO_GROUP,
                 "SCENARIO_KEYS_OVERRIDE": SCENARIO_KEYS_OVERRIDE,
-                "ESTIMATION_POINTS": ESTIMATION_POINTS,
-                "HPO_CHECKPOINT": HPO_CHECKPOINT,
+                "HPO_CHAIN_BUDGET": HPO_CHAIN_BUDGET,
+                "HPO_CHECKPOINT_STEP": HPO_CHECKPOINT_STEP,
+                "HPO_OBJECTIVE_CHECKPOINT": HPO_OBJECTIVE_CHECKPOINT,
+                "HPO_N_CHECKPOINTS": len(HPO_ESTIMATION_POINTS),
                 "HPO_N_TRIALS": HPO_N_TRIALS,
-                "HPO_TRIAL_REPEATS": HPO_TRIAL_REPEATS,
-                "HPO_RECHECK_TOP_K": HPO_RECHECK_TOP_K,
-                "HPO_RECHECK_REPEATS": HPO_RECHECK_REPEATS,
                 "HPO_OBJECTIVE_METRIC": HPO_OBJECTIVE_METRIC,
-                "HPO_BETA_MULTIPLIER_LOW": HPO_BETA_MULTIPLIER_LOW,
-                "HPO_BETA_MULTIPLIER_HIGH": HPO_BETA_MULTIPLIER_HIGH,
+                "HPO_GAMMA_LADDER": list(HPO_GAMMA_LADDER),
                 "HPO_SWAP_CHOICES_BY_SETTING": HPO_SWAP_CHOICES_BY_SETTING,
-                "HPO_CHAINS_PER_TRIAL": int(hpo_eval_cfg.chains),
+                "HPO_ONE_CHAIN_RUNS_PER_TRIAL": int(hpo_eval_cfg.repeats),
+                "HPO_CHAIN_BUDGET_PER_RUN": int(HPO_CHAIN_BUDGET),
+                "HPO_TOP_LEVEL_N_JOBS": int(hpo_eval_cfg.n_jobs),
                 "HPO_CHAIN_N_JOBS": int(hpo_eval_cfg.chain_n_jobs),
-                "FINAL_EVAL_REPEATS": FINAL_EVAL_REPEATS,
-                "FINAL_EVAL_N_JOBS": FINAL_EVAL_N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
                 "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
             }, indent=2))
@@ -674,7 +1300,7 @@ def build_beta_notebook() -> dict:
                 min_tail_states=MIN_TAIL_STATES,
             )
 
-            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "beta_diag") if SAVE_OUTPUTS else None
+            run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "oracle_beta_search") if SAVE_OUTPUTS else None
 
             pd.DataFrame([
                 {
@@ -708,9 +1334,13 @@ def build_beta_notebook() -> dict:
                 )
                 beta_init = float(init_payload["beta0_laplace"])
                 sigma_t = float(init_payload["sigma_t"])
+                pilot_t_shared = np.asarray(init_payload["pilot_t"], dtype=float)
+                simple_gamma = float(init_cfg.d_alpha)
                 swap_choices = swap_choices_for_scenario(scenario)
                 baseline_swap = baseline_swap_for_scenario(scenario)
                 trial_rows = []
+                trial_checkpoint_rows = []
+                trial_record_rows = []
                 scenario_dir = (run_dir / scenario.key) if (SAVE_OUTPUTS and run_dir is not None) else None
                 if scenario_dir is not None:
                     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -723,23 +1353,57 @@ def build_beta_notebook() -> dict:
                     "reference_p0": p0_reference,
                     "beta0_formula": init_payload["beta0_formula"],
                     "beta0_laplace": beta_init,
+                    "simple_gamma": simple_gamma,
                     "q_target": init_payload["q_target"],
                     "sigma_t": sigma_t,
+                    "pilot_samples": int(init_cfg.pilot_samples),
                     "swap_choices": swap_choices,
                     "baseline_swap": baseline_swap,
                 }, indent=2))
 
+                init_eval = run_named_mcmc_checkpoint_study(
+                    scenario.problem,
+                    scenario.exact_p,
+                    config_specs=[
+                        {
+                            "label": "simple_init",
+                            "config_id": "simple_init",
+                            "beta": float(beta_init),
+                            "proposal_size": int(baseline_swap),
+                            "source": "pilot_init",
+                        }
+                    ],
+                    sigma_t=sigma_t,
+                    estimation_points=HPO_ESTIMATION_POINTS,
+                    repeats=int(hpo_eval_cfg.repeats),
+                    base_seed=BASE_SEED + 250_000 + 25_000 * scenario_idx,
+                    template_cfg=hpo_eval_cfg,
+                    n_jobs=int(hpo_eval_cfg.n_jobs),
+                )
+                init_summary_rows = [dict(row) for row in init_eval["summary"]]
+                init_summary = next(row for row in init_summary_rows if int(row["checkpoint"]) == int(HPO_OBJECTIVE_CHECKPOINT))
+                init_summary["label"] = "simple_init"
+                init_summary["beta"] = float(beta_init)
+                init_summary["gamma"] = float(simple_gamma)
+                init_summary["q_target"] = float(p0_reference ** simple_gamma)
+                init_summary["proposal_size"] = int(baseline_swap)
+                init_summary["source"] = "pilot_init"
+                init_summary_json = json.loads(pd.DataFrame([init_summary]).to_json(orient="records"))[0]
+
                 def objective(trial):
-                    beta_multiplier = float(
-                        trial.suggest_float(
-                            "beta_multiplier",
-                            HPO_BETA_MULTIPLIER_LOW,
-                            HPO_BETA_MULTIPLIER_HIGH,
-                            log=True,
+                    gamma = float(trial.suggest_categorical("gamma", list(HPO_GAMMA_LADDER)))
+                    proposal_size = int(trial.suggest_categorical("proposal_size", list(swap_choices)))
+                    q_target = float(p0_reference ** gamma)
+                    beta = float(
+                        init_beta_from_iid_pilot(
+                            pilot_T=pilot_t_shared,
+                            T_obs=scenario.problem.t_obs,
+                            sigma_T=sigma_t,
+                            p0=p0_reference,
+                            q_target=q_target,
+                            beta_max=float(init_cfg.beta_max_init),
                         )
                     )
-                    proposal_size = int(trial.suggest_categorical("proposal_size", list(swap_choices)))
-                    beta = float(beta_init * beta_multiplier)
                     trial_eval = run_named_mcmc_checkpoint_study(
                         scenario.problem,
                         scenario.exact_p,
@@ -753,21 +1417,48 @@ def build_beta_notebook() -> dict:
                             }
                         ],
                         sigma_t=sigma_t,
-                        estimation_points=(HPO_CHECKPOINT,),
-                        repeats=HPO_TRIAL_REPEATS,
+                        estimation_points=HPO_ESTIMATION_POINTS,
+                        repeats=int(hpo_eval_cfg.repeats),
                         base_seed=BASE_SEED + 1_000_000 * scenario_idx + 10_000 * trial.number,
                         template_cfg=hpo_eval_cfg,
                         n_jobs=int(hpo_eval_cfg.n_jobs),
                     )
-                    summary_row = dict(pd.DataFrame(trial_eval["summary"]).iloc[0])
+                    summary_rows = [dict(row) for row in trial_eval["summary"]]
+                    summary_row = next(row for row in summary_rows if int(row["checkpoint"]) == int(HPO_OBJECTIVE_CHECKPOINT))
                     objective_value = trial_objective_value(summary_row, HPO_OBJECTIVE_METRIC)
+                    for checkpoint_row in summary_rows:
+                        trial_checkpoint_rows.append(
+                            {
+                                "trial_number": int(trial.number),
+                                "scenario": scenario.key,
+                                "gamma": gamma,
+                                "q_target": q_target,
+                                "beta": beta,
+                                "proposal_size": proposal_size,
+                                **checkpoint_row,
+                            }
+                        )
+                    for record_row in trial_eval["records"]:
+                        trial_record_rows.append(
+                            {
+                                "trial_number": int(trial.number),
+                                "scenario": scenario.key,
+                                "gamma": gamma,
+                                "q_target": q_target,
+                                "beta": beta,
+                                "proposal_size": proposal_size,
+                                **dict(record_row),
+                            }
+                        )
                     trial_payload = {
                         "trial_number": int(trial.number),
                         "scenario": scenario.key,
-                        "beta_multiplier": beta_multiplier,
+                        "gamma": gamma,
+                        "q_target": q_target,
                         "beta": beta,
                         "proposal_size": proposal_size,
                         "objective_metric": HPO_OBJECTIVE_METRIC,
+                        "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
                         "objective_value": float(objective_value),
                         "reference_p0": float(p0_reference),
                         **summary_row,
@@ -779,6 +1470,16 @@ def build_beta_notebook() -> dict:
                             orient="records",
                             lines=True,
                         )
+                        pd.DataFrame(trial_checkpoint_rows).to_json(
+                            scenario_dir / "hpo_trial_checkpoint_summaries.jsonl",
+                            orient="records",
+                            lines=True,
+                        )
+                        pd.DataFrame(trial_record_rows).to_json(
+                            scenario_dir / "hpo_trial_records.jsonl",
+                            orient="records",
+                            lines=True,
+                        )
                         (scenario_dir / "hpo_status.json").write_text(
                             json.dumps(
                                 {
@@ -786,6 +1487,8 @@ def build_beta_notebook() -> dict:
                                     "completed_trials": len(trial_rows),
                                     "target_trials": int(HPO_N_TRIALS),
                                     "latest_trial_number": int(trial.number),
+                                    "objective": "per_chain_rmse",
+                                    "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
                                 },
                                 indent=2,
                             ),
@@ -800,6 +1503,9 @@ def build_beta_notebook() -> dict:
                     if scenario_dir is None or len(study.trials) == 0:
                         return
                     best_trial = study.best_trial
+                    best_gamma = float(best_trial.params["gamma"])
+                    best_q_target = float(p0_reference ** best_gamma)
+                    best_beta = float(best_trial.user_attrs["beta"])
                     best_payload = {
                         "scenario": scenario.key,
                         "reference_p0": float(p0_reference),
@@ -807,8 +1513,9 @@ def build_beta_notebook() -> dict:
                         "beta0_formula": float(init_payload["beta0_formula"]),
                         "beta0_laplace": float(init_payload["beta0_laplace"]),
                         "sigma_t": float(sigma_t),
-                        "best_beta_multiplier": float(best_trial.params["beta_multiplier"]),
-                        "best_beta": float(beta_init * float(best_trial.params["beta_multiplier"])),
+                        "best_gamma": best_gamma,
+                        "best_q_target": best_q_target,
+                        "best_beta": best_beta,
                         "best_proposal_size": int(best_trial.params["proposal_size"]),
                         "best_objective_value": float(study.best_value),
                         "best_trial_number": int(best_trial.number),
@@ -843,122 +1550,57 @@ def build_beta_notebook() -> dict:
                     objective,
                     n_trials=HPO_N_TRIALS,
                     show_progress_bar=False,
-                    callbacks=[persist_hpo_state],
-                )
-
-                top_trial_rows = (
-                    pd.DataFrame(trial_rows)
-                    .sort_values("objective_value")
-                    .drop_duplicates(subset=["beta", "proposal_size"])
-                    .head(HPO_RECHECK_TOP_K)
-                )
-                recheck_specs = [
-                    {
-                        "label": "init_recheck",
-                        "config_id": "init_recheck",
-                        "beta": float(beta_init),
-                        "proposal_size": int(baseline_swap),
-                        "source": "pilot_init",
-                    }
-                ]
-                for _, top_row in top_trial_rows.iterrows():
-                    recheck_specs.append(
-                        {
-                            "label": f"oracle_trial_{int(top_row['trial_number'])}",
-                            "config_id": f"oracle_trial_{int(top_row['trial_number'])}",
-                            "beta": float(top_row["beta"]),
-                            "proposal_size": int(top_row["proposal_size"]),
-                            "source": "oracle_hpo",
-                        }
+                        callbacks=[persist_hpo_state],
                     )
 
-                recheck_cfg = replace(
-                    hpo_eval_cfg,
-                    repeats=HPO_RECHECK_REPEATS,
-                    base_seed=BASE_SEED + 2_000_000 + 100_000 * scenario_idx,
-                    n_jobs=min(HPO_RECHECK_REPEATS, os.cpu_count() or 1),
+                best_trial = study.best_trial
+                best_gamma = float(best_trial.params["gamma"])
+                best_q_target = float(p0_reference ** best_gamma)
+                best_beta = float(best_trial.user_attrs["beta"])
+                best_proposal_size = int(best_trial.params["proposal_size"])
+                best_source = "oracle_hpo"
+                best_trial_number = int(best_trial.number)
+                best_trial_payload = dict(best_trial.user_attrs)
+                best_trial_payload.update(
+                    {
+                        "trial_number": int(best_trial.number),
+                        "gamma": best_gamma,
+                        "q_target": best_q_target,
+                        "beta": float(best_beta),
+                        "proposal_size": int(best_proposal_size),
+                        "objective_metric": HPO_OBJECTIVE_METRIC,
+                        "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
+                        "objective_value": float(study.best_value),
+                        "label": "oracle",
+                    }
                 )
-                recheck_eval = run_named_mcmc_checkpoint_study(
-                    scenario.problem,
-                    scenario.exact_p,
-                    config_specs=recheck_specs,
-                    sigma_t=sigma_t,
-                    estimation_points=(HPO_CHECKPOINT,),
-                    repeats=HPO_RECHECK_REPEATS,
-                    base_seed=int(recheck_cfg.base_seed),
-                    template_cfg=recheck_cfg,
-                    n_jobs=int(recheck_cfg.n_jobs),
-                )
-                recheck_summary_df = pd.DataFrame(recheck_eval["summary"]).sort_values(HPO_OBJECTIVE_METRIC)
-                recheck_best = dict(recheck_summary_df.iloc[0])
-                if str(recheck_best["label"]) == "init_recheck":
-                    best_multiplier = 1.0
-                    best_proposal_size = int(baseline_swap)
-                    best_beta = float(beta_init)
-                    best_source = "pilot_init_recheck"
-                    best_trial_number = -1
-                else:
-                    best_beta = float(recheck_best["beta"])
-                    best_multiplier = float(best_beta / beta_init) if beta_init > 0 else float("nan")
-                    best_proposal_size = int(recheck_best["proposal_size"])
-                    best_source = "oracle_hpo_recheck"
-                    matched_trial = top_trial_rows[
-                        (top_trial_rows["proposal_size"] == best_proposal_size)
-                        & np.isclose(top_trial_rows["beta"], best_beta)
-                    ]
-                    best_trial_number = int(matched_trial.iloc[0]["trial_number"]) if not matched_trial.empty else int(study.best_trial.number)
+                best_trial_payload_json = json.loads(pd.DataFrame([best_trial_payload]).to_json(orient="records"))[0]
 
                 best_config = {
                     "scenario": scenario.key,
                     "reference_p0": float(p0_reference),
                     "beta_init": float(beta_init),
+                    "simple_gamma": float(simple_gamma),
                     "beta0_formula": float(init_payload["beta0_formula"]),
                     "beta0_laplace": float(init_payload["beta0_laplace"]),
                     "sigma_t": float(sigma_t),
-                    "best_beta_multiplier": float(best_beta / beta_init) if beta_init > 0 else float("nan"),
+                    "best_gamma": best_gamma,
+                    "best_q_target": best_q_target,
                     "best_beta": best_beta,
                     "best_proposal_size": int(best_proposal_size),
-                    "best_objective_value": float(recheck_best[HPO_OBJECTIVE_METRIC]),
+                    "best_objective_value": float(study.best_value),
                     "best_trial_number": int(best_trial_number),
                     "n_trials": int(len(study.trials)),
                     "selection_source": best_source,
-                    "recheck_top_k": int(HPO_RECHECK_TOP_K),
-                    "recheck_repeats": int(HPO_RECHECK_REPEATS),
                 }
-
-                final_eval = run_named_mcmc_checkpoint_study(
-                    scenario.problem,
-                    scenario.exact_p,
-                    config_specs=[
-                        {
-                            "label": "init",
-                            "config_id": "init",
-                            "beta": float(beta_init),
-                            "proposal_size": int(baseline_swap),
-                            "source": "pilot_init",
-                        },
-                        {
-                            "label": "oracle",
-                            "config_id": "oracle",
-                            "beta": float(best_beta),
-                            "proposal_size": int(best_proposal_size),
-                            "source": "oracle_hpo",
-                            "selected_by_objectives": ["optuna"],
-                        },
-                    ],
-                    sigma_t=sigma_t,
-                    estimation_points=ESTIMATION_POINTS,
-                    repeats=FINAL_EVAL_REPEATS,
-                    base_seed=BASE_SEED + 5_000_000 + 100_000 * scenario_idx,
-                    template_cfg=final_eval_cfg,
-                    n_jobs=FINAL_EVAL_N_JOBS,
-                )
 
                 oracle_results[scenario.key] = {
                     "best_config": best_config,
                     "trial_rows": list(trial_rows),
-                    "recheck_eval": recheck_eval,
-                    "final_eval": final_eval,
+                    "trial_checkpoint_rows": list(trial_checkpoint_rows),
+                    "trial_record_rows": list(trial_record_rows),
+                    "init_summary": dict(init_summary_json),
+                    "best_trial_summary": dict(best_trial_payload_json),
                     "init_payload": {
                         key: value
                         for key, value in init_payload.items()
@@ -972,25 +1614,33 @@ def build_beta_notebook() -> dict:
                         orient="records",
                         lines=True,
                     )
-                    pd.DataFrame(final_eval["records"]).to_json(
-                        scenario_dir / "final_eval_records.jsonl",
+                    pd.DataFrame(trial_checkpoint_rows).to_json(
+                        scenario_dir / "hpo_trial_checkpoint_summaries.jsonl",
                         orient="records",
                         lines=True,
                     )
-                    pd.DataFrame(final_eval["summary"]).to_json(
-                        scenario_dir / "final_eval_summary.json",
-                        orient="records",
-                        indent=2,
-                    )
-                    pd.DataFrame(recheck_eval["records"]).to_json(
-                        scenario_dir / "recheck_eval_records.jsonl",
+                    pd.DataFrame(trial_record_rows).to_json(
+                        scenario_dir / "hpo_trial_records.jsonl",
                         orient="records",
                         lines=True,
                     )
-                    pd.DataFrame(recheck_eval["summary"]).to_json(
-                        scenario_dir / "recheck_eval_summary.json",
+                    pd.DataFrame(init_eval["records"]).to_json(
+                        scenario_dir / "simple_init_records.jsonl",
+                        orient="records",
+                        lines=True,
+                    )
+                    pd.DataFrame(init_summary_rows).to_json(
+                        scenario_dir / "simple_init_checkpoint_summaries.json",
                         orient="records",
                         indent=2,
+                    )
+                    (scenario_dir / "simple_init_summary.json").write_text(
+                        json.dumps(init_summary_json, indent=2),
+                        encoding="utf-8",
+                    )
+                    (scenario_dir / "oracle_best_trial.json").write_text(
+                        json.dumps(best_trial_payload_json, indent=2),
+                        encoding="utf-8",
                     )
                     (scenario_dir / "best_config.json").write_text(
                         json.dumps(best_config, indent=2),
@@ -1008,16 +1658,19 @@ def build_beta_notebook() -> dict:
                                 "init_payload": oracle_results[scenario.key]["init_payload"],
                                 "hpo_settings": {
                                     "n_trials": int(HPO_N_TRIALS),
-                                    "trial_repeats": int(HPO_TRIAL_REPEATS),
-                                    "recheck_top_k": int(HPO_RECHECK_TOP_K),
-                                    "recheck_repeats": int(HPO_RECHECK_REPEATS),
+                                    "objective_definition": "rmse_across_one_chain_estimates",
                                     "objective_metric": str(HPO_OBJECTIVE_METRIC),
-                                    "beta_multiplier_low": float(HPO_BETA_MULTIPLIER_LOW),
-                                    "beta_multiplier_high": float(HPO_BETA_MULTIPLIER_HIGH),
+                                    "gamma_ladder": [float(v) for v in HPO_GAMMA_LADDER],
                                     "swap_choices": [int(v) for v in swap_choices],
-                                    "checkpoint": int(HPO_CHECKPOINT),
+                                    "one_chain_runs_per_trial": int(hpo_eval_cfg.repeats),
+                                    "chain_budget": int(HPO_CHAIN_BUDGET),
+                                    "checkpoint_step": int(HPO_CHECKPOINT_STEP),
+                                    "estimation_points": [int(v) for v in HPO_ESTIMATION_POINTS],
+                                    "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
+                                    "chain_n_jobs": int(hpo_eval_cfg.chain_n_jobs),
+                                    "top_level_n_jobs": int(hpo_eval_cfg.n_jobs),
+                                    "default_gamma": float(simple_gamma),
                                 },
-                                "final_eval_settings": final_eval["settings"],
                             },
                             indent=2,
                         ),
@@ -1025,9 +1678,12 @@ def build_beta_notebook() -> dict:
                     )
 
                 best_row = pd.DataFrame([best_config])
-                final_summary_df = pd.DataFrame(final_eval["summary"]).sort_values(["checkpoint", "label"])
+                comparison_df = pd.DataFrame([
+                    dict(init_summary_json),
+                    dict(best_trial_payload_json),
+                ]).sort_values("label")
                 display(best_row)
-                display(final_summary_df[[
+                display(comparison_df[[
                     "checkpoint",
                     "label",
                     "mean_estimate",
@@ -1049,9 +1705,13 @@ def build_beta_notebook() -> dict:
                 display(pd.DataFrame([
                     {
                         "scenario": key,
+                        "simple_gamma": payload["best_config"]["simple_gamma"],
+                        "simple_beta": payload["best_config"]["beta_init"],
+                        "best_gamma": payload["best_config"]["best_gamma"],
                         "best_beta": payload["best_config"]["best_beta"],
-                        "best_multiplier": payload["best_config"]["best_beta_multiplier"],
                         "best_proposal_size": payload["best_config"]["best_proposal_size"],
+                        "simple_rmse": payload["init_summary"]["rmse"],
+                        "oracle_rmse": payload["best_trial_summary"]["rmse"],
                         "best_objective_value": payload["best_config"]["best_objective_value"],
                     }
                     for key, payload in oracle_results.items()
@@ -1065,11 +1725,14 @@ def build_beta_notebook() -> dict:
             """
             # RELOAD_BETA_DIR = None
             # # Example:
-            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260411_120000_beta_diag" / "gwas_additive_score_sig_n60"
+            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260411_120000_oracle_beta_search" / "gwas_additive_score_sig_n60"
 
             # if RELOAD_BETA_DIR is not None:
             #     print(json.loads((RELOAD_BETA_DIR / "best_config.json").read_text()))
-            #     display(pd.read_json(RELOAD_BETA_DIR / "final_eval_summary.json"))
+            #     display(pd.DataFrame([
+            #         json.loads((RELOAD_BETA_DIR / "simple_init_summary.json").read_text()),
+            #         json.loads((RELOAD_BETA_DIR / "oracle_best_trial.json").read_text()),
+            #     ]))
             #     display(pd.read_json(RELOAD_BETA_DIR / "hpo_trials.jsonl", lines=True).sort_values("objective_value").head())
             # else:
             #     print("Set RELOAD_BETA_DIR to a saved oracle-beta directory to inspect saved results from disk only.")
@@ -2555,6 +3218,10 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
     return nb
 
 
+def build_beta_notebook() -> dict:
+    return build_oracle_beta_search_notebook()
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     notebooks_dir = repo_root / "notebooks"
@@ -2562,7 +3229,7 @@ def main() -> None:
 
     outputs = {
         notebooks_dir / "cross_method_simulation.ipynb": build_cross_method_notebook(),
-        notebooks_dir / "mcmcis_beta_diagnostics.ipynb": build_beta_notebook(),
+        notebooks_dir / "mcmcis_oracle_beta_search.ipynb": build_oracle_beta_search_notebook(),
         notebooks_dir / "mcmcis_offline_objective_grid.ipynb": build_mcmc_objective_grid_notebook(),
         notebooks_dir / "mcmcis_scan_budget_policy.ipynb": build_mcmc_scan_budget_policy_notebook(),
         notebooks_dir / "mcmcis_scan_budget_grid.ipynb": build_mcmc_scan_budget_grid_notebook(),

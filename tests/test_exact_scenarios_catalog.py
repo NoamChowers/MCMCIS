@@ -37,6 +37,23 @@ def test_gwas_additive_score_sig_scenario_is_null_rejecting_and_exact():
     assert float(scenario.extra["observed_score"]) < float(scenario.extra["extreme_score"])
 
 
+def test_gwas_additive_score_ultra_scenario_is_smaller_than_five_e_minus_nine():
+    scenario = _make_gwas_additive_score_scenario(
+        key="gwas_additive_score_ultra_n60",
+        description="GWAS-like additive score with ultra-small exact p-value.",
+        n=60,
+        n_treated=30,
+        maf=0.25,
+        seed=132,
+        downgrade_swaps=4,
+    )
+    assert scenario.key == "gwas_additive_score_ultra_n60"
+    assert np.isclose(scenario.exact_p_value, 2.1751391464478095e-09, atol=0.0, rtol=1e-15)
+    assert scenario.exact_p_value < 5e-9
+    assert scenario.exact_p_value > 1e-9
+    assert float(scenario.extra["observed_score"]) < float(scenario.extra["extreme_score"])
+
+
 def test_zip_diffmeans_scenario_is_nonextreme_and_exact():
     scenario = _make_zero_inflated_poisson_diffmeans_scenario()
     assert scenario.key == "zip_diffmeans_righttail_n40"

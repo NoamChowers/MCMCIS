@@ -860,8 +860,8 @@ def build_exact_scenarios() -> list[ExactScenario]:
             n=60,
             n_treated=30,
             maf=0.25,
-            seed=173,
-            downgrade_swaps=3,
+            seed=132,
+            downgrade_swaps=4,
         ),
         _make_gwas_additive_score_scenario(
             key="gwas_additive_score_above_n60",
