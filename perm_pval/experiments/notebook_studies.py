@@ -837,9 +837,9 @@ _CROSS_METHOD_COLORS: dict[str, str] = {
 _CROSS_METHOD_TITLES: dict[str, str] = {
     "bruteforce_welch_nonextreme_n22": "Welch t-statistic",
     "gwas_additive_score_n40": "GWAS-like additive score",
-    "gwas_additive_score_ultra_n60": "GWAS-like additive score\nBelow threshold",
-    "gwas_additive_score_sig_n60": "GWAS-like additive score\nNear threshold",
-    "gwas_additive_score_above_n60": "GWAS-like additive score\nAbove threshold",
+    "gwas_additive_score_ultra_n100": "GWAS-like additive score\nBelow threshold",
+    "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear threshold",
+    "gwas_additive_score_above_n100": "GWAS-like additive score\nAbove threshold",
     "hypergeom_1e7": "Hypergeometric count",
     "linear_stat_dp_n40": "Difference in means",
     "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nBelow threshold",

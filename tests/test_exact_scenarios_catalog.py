@@ -20,37 +20,37 @@ def test_gwas_additive_score_scenario_is_nonextreme_and_exact():
 
 def test_gwas_additive_score_sig_scenario_is_null_rejecting_and_exact():
     scenario = _make_gwas_additive_score_scenario(
-        key="gwas_additive_score_sig_n60",
+        key="gwas_additive_score_sig_n100",
         description="GWAS-like additive score with null-rejecting exact p-value.",
-        n=60,
-        n_treated=30,
+        n=100,
+        n_treated=50,
         maf=0.25,
-        seed=132,
-        downgrade_swaps=5,
+        seed=386,
+        downgrade_swaps=4,
     )
-    assert scenario.key == "gwas_additive_score_sig_n60"
+    assert scenario.key == "gwas_additive_score_sig_n100"
     assert scenario.statistic_name == "treated_sum"
-    assert np.isclose(scenario.exact_p_value, 4.561067234691586e-08, atol=0.0, rtol=1e-15)
-    assert scenario.tail_hits == 5394127080
+    assert np.isclose(scenario.exact_p_value, 4.3704692764348404e-08, atol=0.0, rtol=1e-15)
+    assert scenario.tail_hits == 4409425215945901258536
     assert scenario.exact_p_value < 5e-8
     assert scenario.tail_hits > 1_000_000_000
     assert float(scenario.extra["observed_score"]) < float(scenario.extra["extreme_score"])
 
 
-def test_gwas_additive_score_ultra_scenario_is_smaller_than_five_e_minus_nine():
+def test_gwas_additive_score_ultra_scenario_is_near_one_e_minus_ten():
     scenario = _make_gwas_additive_score_scenario(
-        key="gwas_additive_score_ultra_n60",
+        key="gwas_additive_score_ultra_n100",
         description="GWAS-like additive score with ultra-small exact p-value.",
-        n=60,
-        n_treated=30,
+        n=100,
+        n_treated=50,
         maf=0.25,
-        seed=132,
-        downgrade_swaps=4,
+        seed=386,
+        downgrade_swaps=2,
     )
-    assert scenario.key == "gwas_additive_score_ultra_n60"
-    assert np.isclose(scenario.exact_p_value, 2.1751391464478095e-09, atol=0.0, rtol=1e-15)
-    assert scenario.exact_p_value < 5e-9
-    assert scenario.exact_p_value > 1e-9
+    assert scenario.key == "gwas_additive_score_ultra_n100"
+    assert np.isclose(scenario.exact_p_value, 1.1440920625102207e-10, atol=0.0, rtol=1e-15)
+    assert scenario.exact_p_value < 2e-10
+    assert scenario.exact_p_value > 5e-11
     assert float(scenario.extra["observed_score"]) < float(scenario.extra["extreme_score"])
 
 
@@ -85,10 +85,10 @@ def test_build_exact_scenarios_emits_portfolio_groups():
     scenarios = build_exact_scenarios()
     by_key = {scenario.key: scenario for scenario in scenarios}
 
-    assert "gwas_additive_score_sig_n60" in by_key
+    assert "gwas_additive_score_sig_n100" in by_key
     assert "hypergeom_1e7" in by_key
     assert "linear_stat_dp_cube_n40" in by_key
-    assert "core_claim" in by_key["gwas_additive_score_sig_n60"].portfolio["groups"]
+    assert "core_claim" in by_key["gwas_additive_score_sig_n100"].portfolio["groups"]
     assert "exploratory_exact" in by_key["hypergeom_1e7"].portfolio["groups"]
     assert "core_claim" in by_key["linear_stat_dp_n40"].portfolio["groups"]
     assert by_key["bruteforce_welch_nonextreme_n22"].portfolio["family"] == "welch_bruteforce"

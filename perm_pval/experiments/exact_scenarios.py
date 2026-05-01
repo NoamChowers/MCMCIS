@@ -537,7 +537,7 @@ def _make_gwas_additive_score_scenario(
         data_family="discrete_score",
         difficulty="hard" if downgrade_swaps == 1 else "moderate",
         groups=("exploratory_exact",)
-        + (("core_claim",) if key in {"gwas_additive_score_n40", "gwas_additive_score_sig_n60"} else tuple())
+        + (("core_claim",) if key in {"gwas_additive_score_n40", "gwas_additive_score_sig_n100"} else tuple())
         + (("stress_test",) if downgrade_swaps == 1 else tuple()),
         has_ties=True,
         is_discrete=True,
@@ -840,40 +840,40 @@ def build_exact_scenarios() -> list[ExactScenario]:
         ),
         _make_gwas_additive_score_scenario(),
         _make_gwas_additive_score_scenario(
-            key="gwas_additive_score_sig_n60",
+            key="gwas_additive_score_sig_n100",
             description=(
-                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=100, "
                 "right-tail treated dosage sum with a larger permutation space and null-rejecting exact p-value."
             ),
-            n=60,
-            n_treated=30,
+            n=100,
+            n_treated=50,
             maf=0.25,
-            seed=132,
-            downgrade_swaps=5,
-        ),
-        _make_gwas_additive_score_scenario(
-            key="gwas_additive_score_ultra_n60",
-            description=(
-                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
-                "right-tail treated dosage sum with p-value far below the genome-wide threshold."
-            ),
-            n=60,
-            n_treated=30,
-            maf=0.25,
-            seed=132,
+            seed=386,
             downgrade_swaps=4,
         ),
         _make_gwas_additive_score_scenario(
-            key="gwas_additive_score_above_n60",
+            key="gwas_additive_score_ultra_n100",
             description=(
-                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=60, "
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=100, "
+                "right-tail treated dosage sum with p-value far below the genome-wide threshold."
+            ),
+            n=100,
+            n_treated=50,
+            maf=0.25,
+            seed=386,
+            downgrade_swaps=2,
+        ),
+        _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_above_n100",
+            description=(
+                "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=100, "
                 "right-tail treated dosage sum with p-value above the genome-wide threshold."
             ),
-            n=60,
-            n_treated=30,
+            n=100,
+            n_treated=50,
             maf=0.25,
-            seed=132,
-            downgrade_swaps=6,
+            seed=386,
+            downgrade_swaps=5,
         ),
         _make_gwas_additive_score_scenario(
             key="gwas_additive_score_swap2_n40",
@@ -991,9 +991,9 @@ def build_exact_scenarios() -> list[ExactScenario]:
         ),
     ]
     threshold_tags = {
-        "gwas_additive_score_ultra_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "ultra"),
-        "gwas_additive_score_sig_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "near"),
-        "gwas_additive_score_above_n60": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "above"),
+        "gwas_additive_score_ultra_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "ultra"),
+        "gwas_additive_score_sig_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "near"),
+        "gwas_additive_score_above_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "above"),
         "poisson_diffmeans_hep_ultra_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "ultra"),
         "poisson_diffmeans_hep_sig_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "near"),
         "poisson_diffmeans_hep_above_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "above"),

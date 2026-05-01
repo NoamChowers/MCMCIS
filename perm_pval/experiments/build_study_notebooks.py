@@ -144,11 +144,11 @@ def _build_cross_method_notebook_legacy() -> dict:
 
             SCENARIO_GROUP = "core_claim"
             SCENARIO_KEYS_OVERRIDE = [
-                "gwas_additive_score_ultra_n60",
+                "gwas_additive_score_ultra_n100",
                 "poisson_diffmeans_hep_ultra_n200",
-                "gwas_additive_score_sig_n60",
+                "gwas_additive_score_sig_n100",
                 "poisson_diffmeans_hep_sig_n200",
-                "gwas_additive_score_above_n60",
+                "gwas_additive_score_above_n100",
                 "poisson_diffmeans_hep_above_n200",
             ]
 
@@ -493,7 +493,7 @@ def _build_cross_method_notebook_legacy() -> dict:
             """
             # RELOAD_SCENARIO_DIR = None
             # # Example:
-            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260306_120000_cross_method" / "gwas_additive_score_sig_n60"
+            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260306_120000_cross_method" / "gwas_additive_score_sig_n100"
 
             # if RELOAD_SCENARIO_DIR is not None:
             #     saved = load_cross_method_saved_output(RELOAD_SCENARIO_DIR)
@@ -564,11 +564,11 @@ def build_cross_method_notebook() -> dict:
             OUTPUT_ROOT = project_root / "results" / "cross_method_notebook"
 
             SCENARIO_KEYS_OVERRIDE = [
-                "gwas_additive_score_ultra_n60",
+                "gwas_additive_score_ultra_n100",
                 "poisson_diffmeans_hep_ultra_n200",
-                "gwas_additive_score_sig_n60",
+                "gwas_additive_score_sig_n100",
                 "poisson_diffmeans_hep_sig_n200",
-                "gwas_additive_score_above_n60",
+                "gwas_additive_score_above_n100",
                 "poisson_diffmeans_hep_above_n200",
             ]
 
@@ -680,6 +680,8 @@ def build_cross_method_notebook() -> dict:
                     "beta_run_dir": str(scenario_dir),
                     "sigma_t": float(best_config["sigma_t"]),
                     "reference_p0": float(best_config["reference_p0"]),
+                    "simple_reference_p0": float(best_config.get("simple_reference_p0", best_config["reference_p0"])),
+                    "canonical_threshold_p0": best_config.get("canonical_threshold_p0"),
                     "simple_beta": float(best_config["beta_init"]),
                     "simple_proposal_size": int(simple_summary["proposal_size"]),
                     "oracle_beta": float(best_config["best_beta"]),
@@ -1119,7 +1121,7 @@ def build_cross_method_notebook() -> dict:
             """
             # RELOAD_SCENARIO_DIR = None
             # # Example:
-            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260429_120000_cross_method_oracle_compare" / "gwas_additive_score_sig_n60"
+            # # RELOAD_SCENARIO_DIR = project_root / "results" / "cross_method_notebook" / "20260429_120000_cross_method_oracle_compare" / "gwas_additive_score_sig_n100"
 
             # if RELOAD_SCENARIO_DIR is not None:
             #     saved = load_cross_method_saved_output(RELOAD_SCENARIO_DIR)
@@ -1186,14 +1188,14 @@ def build_oracle_beta_search_notebook() -> dict:
 
             SCENARIO_GROUP = "threshold_suite"
             SCENARIO_KEYS_OVERRIDE = [
-                "gwas_additive_score_ultra_n60",
+                "gwas_additive_score_ultra_n100",
                 "poisson_diffmeans_hep_ultra_n200",
-                "gwas_additive_score_sig_n60",
+                "gwas_additive_score_sig_n100",
                 "poisson_diffmeans_hep_sig_n200",
-                "gwas_additive_score_above_n60",
+                "gwas_additive_score_above_n100",
                 "poisson_diffmeans_hep_above_n200",
             ]
-            HPO_CHAIN_COUNT = 10
+            HPO_CHAIN_COUNT = 18
             HPO_N_JOBS = 6
             HPO_CHAIN_BUDGET = 5_000_000 if not FAST_MODE else 200_000
             HPO_CHECKPOINT_STEP = 250_000 if not FAST_MODE else 50_000
@@ -1201,7 +1203,12 @@ def build_oracle_beta_search_notebook() -> dict:
             HPO_OBJECTIVE_CHECKPOINT = HPO_CHAIN_BUDGET
             HPO_N_TRIALS = 10 if not FAST_MODE else 5
             HPO_OBJECTIVE_METRIC = "rmse"
-            HPO_GAMMA_LADDER = (0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60)
+            HPO_GAMMA_LADDER = (
+                0.001, 0.003, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075,
+                0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50,
+                0.60, 0.75, 0.90, 1.00,
+            )
+            CANONICAL_GAMMA_SCAN = tuple(round(float(v), 4) for v in np.linspace(0.001, 1.0, 1000))
             HPO_SWAP_CHOICES_DEFAULT = (1, 2, 3)
             HPO_SWAP_CHOICES_BY_SETTING = {
                 "gwas_threshold_suite": (1, 2),
@@ -1239,13 +1246,92 @@ def build_oracle_beta_search_notebook() -> dict:
                 n_jobs=HPO_N_JOBS,
             )
 
-            def reference_p0_for_scenario(scenario) -> float:
+            def search_reference_p0_for_scenario(scenario) -> float:
+                return float(scenario.exact_p)
+
+
+            def canonical_threshold_for_scenario(scenario) -> float | None:
                 threshold = scenario.extra.get("known_significance_threshold")
                 if threshold is not None:
                     threshold_f = float(threshold)
                     if threshold_f == threshold_f and threshold_f > 0.0:
                         return threshold_f
-                return float(scenario.exact_p)
+                return None
+
+
+            def beta_from_gamma_reference(
+                *,
+                gamma: float,
+                p0_reference: float,
+                pilot_t: np.ndarray,
+                sigma_t: float,
+                problem,
+                beta_max: float,
+            ) -> dict[str, float]:
+                gamma_f = float(gamma)
+                q_target = float(p0_reference ** gamma_f)
+                beta = float(
+                    init_beta_from_iid_pilot(
+                        pilot_T=pilot_t,
+                        T_obs=problem.t_obs,
+                        sigma_T=sigma_t,
+                        p0=float(p0_reference),
+                        q_target=q_target,
+                        beta_max=float(beta_max),
+                    )
+                )
+                return {
+                    "gamma": gamma_f,
+                    "q_target": q_target,
+                    "beta": beta,
+                }
+
+
+            def implied_gamma_for_beta_under_reference(
+                *,
+                target_beta: float,
+                p0_reference: float | None,
+                pilot_t: np.ndarray,
+                sigma_t: float,
+                problem,
+                beta_max: float,
+                gamma_grid: tuple[float, ...],
+            ) -> dict[str, float | int | None]:
+                if p0_reference is None or not np.isfinite(float(p0_reference)) or float(p0_reference) <= 0.0:
+                    return {
+                        "gamma": None,
+                        "q_target": None,
+                        "beta": None,
+                        "beta_abs_error": None,
+                        "beta_log_error": None,
+                        "grid_size": int(len(gamma_grid)),
+                    }
+                rows = [
+                    beta_from_gamma_reference(
+                        gamma=float(gamma),
+                        p0_reference=float(p0_reference),
+                        pilot_t=pilot_t,
+                        sigma_t=float(sigma_t),
+                        problem=problem,
+                        beta_max=float(beta_max),
+                    )
+                    for gamma in gamma_grid
+                ]
+                target_beta_f = float(target_beta)
+                eps = 1e-12
+                best = min(
+                    rows,
+                    key=lambda row: abs(np.log(max(float(row["beta"]), eps)) - np.log(max(target_beta_f, eps))),
+                )
+                best_beta = float(best["beta"])
+                return {
+                    "gamma": float(best["gamma"]),
+                    "q_target": float(best["q_target"]),
+                    "beta": best_beta,
+                    "beta_abs_error": float(abs(best_beta - target_beta_f)),
+                    "beta_log_error": float(abs(np.log(max(best_beta, eps)) - np.log(max(target_beta_f, eps)))),
+                    "grid_size": int(len(gamma_grid)),
+                }
 
 
             def swap_choices_for_scenario(scenario) -> tuple[int, ...]:
@@ -1286,7 +1372,8 @@ def build_oracle_beta_search_notebook() -> dict:
                 "HPO_TOP_LEVEL_N_JOBS": int(hpo_eval_cfg.n_jobs),
                 "HPO_CHAIN_N_JOBS": int(hpo_eval_cfg.chain_n_jobs),
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
-                "REFERENCE_P0_MODE": "known_significance_threshold_else_exact_p",
+                "REFERENCE_P0_MODE": "oracle_exact_p__simple_known_threshold_else_exact_p",
+                "CANONICAL_GAMMA_SCAN_POINTS": int(len(CANONICAL_GAMMA_SCAN)),
             }, indent=2))
             """
         ),
@@ -1324,13 +1411,19 @@ def build_oracle_beta_search_notebook() -> dict:
 
             for scenario_idx, scenario in enumerate(scenarios):
                 scenario_seed = BASE_SEED + 50_000 * scenario_idx
-                p0_reference = reference_p0_for_scenario(scenario)
+                search_reference_p0 = search_reference_p0_for_scenario(scenario)
+                canonical_threshold_p0 = canonical_threshold_for_scenario(scenario)
+                simple_reference_p0 = (
+                    float(canonical_threshold_p0)
+                    if canonical_threshold_p0 is not None
+                    else float(search_reference_p0)
+                )
                 init_payload = build_beta_initialization(
                     scenario.problem,
                     scenario.exact_p,
                     init_cfg,
                     seed=scenario_seed,
-                    p0_reference=p0_reference,
+                    p0_reference=simple_reference_p0,
                 )
                 beta_init = float(init_payload["beta0_laplace"])
                 sigma_t = float(init_payload["sigma_t"])
@@ -1350,7 +1443,9 @@ def build_oracle_beta_search_notebook() -> dict:
                     "exact_p": scenario.exact_p,
                     "application_setting_key": scenario.extra.get("application_setting_key"),
                     "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
-                    "reference_p0": p0_reference,
+                    "search_reference_p0": search_reference_p0,
+                    "simple_reference_p0": simple_reference_p0,
+                    "canonical_threshold_p0": canonical_threshold_p0,
                     "beta0_formula": init_payload["beta0_formula"],
                     "beta0_laplace": beta_init,
                     "simple_gamma": simple_gamma,
@@ -1385,7 +1480,8 @@ def build_oracle_beta_search_notebook() -> dict:
                 init_summary["label"] = "simple_init"
                 init_summary["beta"] = float(beta_init)
                 init_summary["gamma"] = float(simple_gamma)
-                init_summary["q_target"] = float(p0_reference ** simple_gamma)
+                init_summary["q_target"] = float(simple_reference_p0 ** simple_gamma)
+                init_summary["reference_p0"] = float(simple_reference_p0)
                 init_summary["proposal_size"] = int(baseline_swap)
                 init_summary["source"] = "pilot_init"
                 init_summary_json = json.loads(pd.DataFrame([init_summary]).to_json(orient="records"))[0]
@@ -1393,17 +1489,16 @@ def build_oracle_beta_search_notebook() -> dict:
                 def objective(trial):
                     gamma = float(trial.suggest_categorical("gamma", list(HPO_GAMMA_LADDER)))
                     proposal_size = int(trial.suggest_categorical("proposal_size", list(swap_choices)))
-                    q_target = float(p0_reference ** gamma)
-                    beta = float(
-                        init_beta_from_iid_pilot(
-                            pilot_T=pilot_t_shared,
-                            T_obs=scenario.problem.t_obs,
-                            sigma_T=sigma_t,
-                            p0=p0_reference,
-                            q_target=q_target,
-                            beta_max=float(init_cfg.beta_max_init),
-                        )
+                    beta_payload = beta_from_gamma_reference(
+                        gamma=gamma,
+                        p0_reference=float(search_reference_p0),
+                        pilot_t=pilot_t_shared,
+                        sigma_t=float(sigma_t),
+                        problem=scenario.problem,
+                        beta_max=float(init_cfg.beta_max_init),
                     )
+                    q_target = float(beta_payload["q_target"])
+                    beta = float(beta_payload["beta"])
                     trial_eval = run_named_mcmc_checkpoint_study(
                         scenario.problem,
                         scenario.exact_p,
@@ -1460,7 +1555,7 @@ def build_oracle_beta_search_notebook() -> dict:
                         "objective_metric": HPO_OBJECTIVE_METRIC,
                         "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
                         "objective_value": float(objective_value),
-                        "reference_p0": float(p0_reference),
+                        "reference_p0": float(search_reference_p0),
                         **summary_row,
                     }
                     trial_rows.append(trial_payload)
@@ -1504,11 +1599,26 @@ def build_oracle_beta_search_notebook() -> dict:
                         return
                     best_trial = study.best_trial
                     best_gamma = float(best_trial.params["gamma"])
-                    best_q_target = float(p0_reference ** best_gamma)
+                    best_q_target = float(search_reference_p0 ** best_gamma)
                     best_beta = float(best_trial.user_attrs["beta"])
+                    implied_canonical = implied_gamma_for_beta_under_reference(
+                        target_beta=best_beta,
+                        p0_reference=canonical_threshold_p0,
+                        pilot_t=pilot_t_shared,
+                        sigma_t=float(sigma_t),
+                        problem=scenario.problem,
+                        beta_max=float(init_cfg.beta_max_init),
+                        gamma_grid=CANONICAL_GAMMA_SCAN,
+                    )
                     best_payload = {
                         "scenario": scenario.key,
-                        "reference_p0": float(p0_reference),
+                        "reference_p0": float(search_reference_p0),
+                        "simple_reference_p0": float(simple_reference_p0),
+                        "canonical_threshold_p0": (
+                            float(canonical_threshold_p0)
+                            if canonical_threshold_p0 is not None
+                            else None
+                        ),
                         "beta_init": float(beta_init),
                         "beta0_formula": float(init_payload["beta0_formula"]),
                         "beta0_laplace": float(init_payload["beta0_laplace"]),
@@ -1516,6 +1626,11 @@ def build_oracle_beta_search_notebook() -> dict:
                         "best_gamma": best_gamma,
                         "best_q_target": best_q_target,
                         "best_beta": best_beta,
+                        "implied_gamma_canonical": implied_canonical["gamma"],
+                        "implied_q_target_canonical": implied_canonical["q_target"],
+                        "implied_beta_canonical": implied_canonical["beta"],
+                        "implied_beta_abs_error_canonical": implied_canonical["beta_abs_error"],
+                        "implied_beta_log_error_canonical": implied_canonical["beta_log_error"],
                         "best_proposal_size": int(best_trial.params["proposal_size"]),
                         "best_objective_value": float(study.best_value),
                         "best_trial_number": int(best_trial.number),
@@ -1555,11 +1670,20 @@ def build_oracle_beta_search_notebook() -> dict:
 
                 best_trial = study.best_trial
                 best_gamma = float(best_trial.params["gamma"])
-                best_q_target = float(p0_reference ** best_gamma)
+                best_q_target = float(search_reference_p0 ** best_gamma)
                 best_beta = float(best_trial.user_attrs["beta"])
                 best_proposal_size = int(best_trial.params["proposal_size"])
                 best_source = "oracle_hpo"
                 best_trial_number = int(best_trial.number)
+                implied_canonical = implied_gamma_for_beta_under_reference(
+                    target_beta=best_beta,
+                    p0_reference=canonical_threshold_p0,
+                    pilot_t=pilot_t_shared,
+                    sigma_t=float(sigma_t),
+                    problem=scenario.problem,
+                    beta_max=float(init_cfg.beta_max_init),
+                    gamma_grid=CANONICAL_GAMMA_SCAN,
+                )
                 best_trial_payload = dict(best_trial.user_attrs)
                 best_trial_payload.update(
                     {
@@ -1571,6 +1695,15 @@ def build_oracle_beta_search_notebook() -> dict:
                         "objective_metric": HPO_OBJECTIVE_METRIC,
                         "objective_checkpoint": int(HPO_OBJECTIVE_CHECKPOINT),
                         "objective_value": float(study.best_value),
+                        "reference_p0": float(search_reference_p0),
+                        "canonical_threshold_p0": (
+                            float(canonical_threshold_p0)
+                            if canonical_threshold_p0 is not None
+                            else None
+                        ),
+                        "implied_gamma_canonical": implied_canonical["gamma"],
+                        "implied_q_target_canonical": implied_canonical["q_target"],
+                        "implied_beta_canonical": implied_canonical["beta"],
                         "label": "oracle",
                     }
                 )
@@ -1578,7 +1711,13 @@ def build_oracle_beta_search_notebook() -> dict:
 
                 best_config = {
                     "scenario": scenario.key,
-                    "reference_p0": float(p0_reference),
+                    "reference_p0": float(search_reference_p0),
+                    "simple_reference_p0": float(simple_reference_p0),
+                    "canonical_threshold_p0": (
+                        float(canonical_threshold_p0)
+                        if canonical_threshold_p0 is not None
+                        else None
+                    ),
                     "beta_init": float(beta_init),
                     "simple_gamma": float(simple_gamma),
                     "beta0_formula": float(init_payload["beta0_formula"]),
@@ -1587,6 +1726,11 @@ def build_oracle_beta_search_notebook() -> dict:
                     "best_gamma": best_gamma,
                     "best_q_target": best_q_target,
                     "best_beta": best_beta,
+                    "implied_gamma_canonical": implied_canonical["gamma"],
+                    "implied_q_target_canonical": implied_canonical["q_target"],
+                    "implied_beta_canonical": implied_canonical["beta"],
+                    "implied_beta_abs_error_canonical": implied_canonical["beta_abs_error"],
+                    "implied_beta_log_error_canonical": implied_canonical["beta_log_error"],
                     "best_proposal_size": int(best_proposal_size),
                     "best_objective_value": float(study.best_value),
                     "best_trial_number": int(best_trial_number),
@@ -1654,13 +1798,30 @@ def build_oracle_beta_search_notebook() -> dict:
                                 "exact_p": float(scenario.exact_p),
                                 "known_significance_threshold": scenario.extra.get("known_significance_threshold"),
                                 "application_setting_key": scenario.extra.get("application_setting_key"),
-                                "reference_p0": float(p0_reference),
+                                "reference_p0": float(search_reference_p0),
+                                "reference_p0_mode": "exact_p",
+                                "simple_reference_p0": float(simple_reference_p0),
+                                "simple_reference_p0_mode": (
+                                    "known_significance_threshold"
+                                    if canonical_threshold_p0 is not None
+                                    else "exact_p"
+                                ),
+                                "canonical_threshold_p0": (
+                                    float(canonical_threshold_p0)
+                                    if canonical_threshold_p0 is not None
+                                    else None
+                                ),
                                 "init_payload": oracle_results[scenario.key]["init_payload"],
                                 "hpo_settings": {
                                     "n_trials": int(HPO_N_TRIALS),
                                     "objective_definition": "rmse_across_one_chain_estimates",
                                     "objective_metric": str(HPO_OBJECTIVE_METRIC),
                                     "gamma_ladder": [float(v) for v in HPO_GAMMA_LADDER],
+                                    "canonical_gamma_scan": {
+                                        "min": float(CANONICAL_GAMMA_SCAN[0]),
+                                        "max": float(CANONICAL_GAMMA_SCAN[-1]),
+                                        "n_points": int(len(CANONICAL_GAMMA_SCAN)),
+                                    },
                                     "swap_choices": [int(v) for v in swap_choices],
                                     "one_chain_runs_per_trial": int(hpo_eval_cfg.repeats),
                                     "chain_budget": int(HPO_CHAIN_BUDGET),
@@ -1725,7 +1886,7 @@ def build_oracle_beta_search_notebook() -> dict:
             """
             # RELOAD_BETA_DIR = None
             # # Example:
-            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260411_120000_oracle_beta_search" / "gwas_additive_score_sig_n60"
+            # # RELOAD_BETA_DIR = project_root / "results" / "mcmcis_beta_notebook" / "20260411_120000_oracle_beta_search" / "gwas_additive_score_sig_n100"
 
             # if RELOAD_BETA_DIR is not None:
             #     print(json.loads((RELOAD_BETA_DIR / "best_config.json").read_text()))
@@ -2232,7 +2393,7 @@ def build_mcmc_scan_budget_policy_notebook() -> dict:
 
             SCENARIO_KEYS_OVERRIDE = [
                 "bruteforce_welch_nonextreme_n22",
-                "gwas_additive_score_sig_n60",
+                "gwas_additive_score_sig_n100",
                 "hypergeom_1e7",
                 "linear_stat_dp_n40",
                 "rank_sum_dp_n40",
@@ -2930,7 +3091,7 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
         OUTPUT_ROOT = project_root / "results" / "mcmcis_scan_budget_grid"
 
         SCENARIO_KEYS_OVERRIDE = [
-            "gwas_additive_score_sig_n60",
+            "gwas_additive_score_sig_n100",
             "linear_stat_dp_n40",
             "rank_sum_dp_n40",
         ]
