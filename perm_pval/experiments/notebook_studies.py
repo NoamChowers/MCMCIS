@@ -44,7 +44,7 @@ from perm_pval.methods.samc import (
 class MCMCWorkflowConfig:
     use_true_p0_for_q_target: bool = True
     p0_guess: float = 1e-8
-    d_alpha: float = 0.25
+    d_alpha: float = 1.0 / 3.0
     pilot_samples: int = 20_000
     scale_method: str = "sd"
     beta_max_init: float = 1e6

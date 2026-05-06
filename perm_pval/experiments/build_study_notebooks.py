@@ -522,9 +522,9 @@ def build_cross_method_notebook() -> dict:
 
             Objective:
             - Use the same six threshold-suite scenarios as the oracle-beta notebook.
-            - Compare `oracle_mcmcis`, `simple_mcmcis`, `samc`, and `iid`.
+            - Compare `oracle_mcmcis`, `simple_mcmcis`, and `samc`.
             - Reuse the saved simple/oracle MCMC-IS settings from the completed beta-oracle run.
-            - Track every method at dense checkpoints from `0.5M` through `5M` budget per run.
+            - Track every method at dense checkpoints from `0.25M` through `5M` budget per run.
             """
         ),
         code_cell(_common_setup_code()),
@@ -533,7 +533,7 @@ def build_cross_method_notebook() -> dict:
             ## Configuration
 
             This notebook reuses the saved simple/oracle initialization values from the beta notebook and does **not** run any pilot.  
-            Each method is evaluated with `12` independent one-chain runs, so the full `5M` is the actual chain budget and is not reduced by any tuning overhead.
+            Each method is evaluated with `20` independent one-chain runs, so the full `5M` is the actual chain budget and is not reduced by any initialization or tuning overhead.
             """
         ),
         code_cell(
@@ -574,21 +574,19 @@ def build_cross_method_notebook() -> dict:
 
             MIN_TAIL_STATES = 2
             BASE_SEED = 12_345
-            N_METHOD_RUNS = 12 if not FAST_MODE else 3
+            N_METHOD_RUNS = 20 if not FAST_MODE else 3
             N_JOBS = min(6, os.cpu_count() or 1)
             CHAIN_BUDGET = 5_000_000 if not FAST_MODE else 1_000_000
-            CHECKPOINT_STEP = 500_000 if not FAST_MODE else 250_000
+            CHECKPOINT_STEP = 250_000 if not FAST_MODE else 250_000
             ESTIMATION_POINTS = tuple(range(CHECKPOINT_STEP, CHAIN_BUDGET + CHECKPOINT_STEP, CHECKPOINT_STEP))
 
-            METHOD_ORDER = ["iid", "samc", "simple_mcmcis", "oracle_mcmcis"]
+            METHOD_ORDER = ["samc", "simple_mcmcis", "oracle_mcmcis"]
             METHOD_LABELS = {
-                "iid": "IID",
                 "samc": "SAMC",
                 "simple_mcmcis": "Simple-init MCMC-IS",
                 "oracle_mcmcis": "Oracle MCMC-IS",
             }
             METHOD_COLORS = {
-                "iid": "#5b6c8f",
                 "samc": "#4c8c77",
                 "simple_mcmcis": "#c48a3a",
                 "oracle_mcmcis": "#b04a5a",
@@ -731,25 +729,8 @@ def build_cross_method_notebook() -> dict:
                 return rows
 
 
-            def run_iid_and_samc_baselines(scenario, *, base_seed: int, samc_cfg) -> tuple[list[dict], list[dict], dict]:
+            def run_samc_baseline(scenario, *, base_seed: int, samc_cfg) -> tuple[list[dict], dict]:
                 checkpoints = tuple(int(v) for v in cross_cfg.estimation_points)
-                iid_jobs = [
-                    {
-                        "scenario_key": scenario.key,
-                        "scenario_display": scenario.description,
-                        "problem": scenario.problem,
-                        "exact_p": scenario.exact_p,
-                        "checkpoints": checkpoints,
-                        "rep": int(rep),
-                        "rep_seed": int(base_seed + 1_000 * rep),
-                        "confidence_level": float(cross_cfg.confidence_level),
-                    }
-                    for rep in range(int(cross_cfg.repeats))
-                ]
-                iid_rows = run_parallel_worker_jobs(_iid_replicate_worker, iid_jobs, n_jobs=int(cross_cfg.n_jobs))
-                for row in iid_rows:
-                    row["label"] = "iid"
-
                 samc_setup = tune_samc_setup(
                     scenario.problem,
                     samc_cfg,
@@ -773,7 +754,7 @@ def build_cross_method_notebook() -> dict:
                 for row in samc_rows:
                     row["label"] = "samc"
 
-                return iid_rows, samc_rows, samc_setup
+                return samc_rows, samc_setup
 
 
             def save_oracle_cross_method_outputs(
@@ -966,7 +947,7 @@ def build_cross_method_notebook() -> dict:
 
             For each scenario:
             - load the saved simple/oracle MCMC-IS settings from `BETA_RUN_DIR`,
-            - run `12` independent one-chain replicates for each method,
+            - run `20` independent one-chain replicates for each method,
             - save the article-facing max-budget plot plus both mean- and median-based convergence plots.
             """
         ),
@@ -1007,13 +988,13 @@ def build_cross_method_notebook() -> dict:
                     template_cfg=mcmc_template_cfg,
                     n_jobs=int(cross_cfg.n_jobs),
                 )
-                iid_rows, samc_rows, samc_setup = run_iid_and_samc_baselines(
+                samc_rows, samc_setup = run_samc_baseline(
                     scenario,
                     base_seed=scenario_seed + 300_000,
                     samc_cfg=scenario_samc_cfg,
                 )
 
-                records = list(mcmc_study["records"]) + list(iid_rows) + list(samc_rows)
+                records = list(mcmc_study["records"]) + list(samc_rows)
                 records = sorted(
                     records,
                     key=lambda row: (
@@ -2378,7 +2359,7 @@ def build_mcmc_scan_budget_policy_notebook() -> dict:
 
             The `tail_hit_cap` policies use
             \\[
-            q_{\\mathrm{ref}} = p_0^{1/4} m_{\\mathrm{ref}},
+            q_{\\mathrm{ref}} = p_0^{1/3} m_{\\mathrm{ref}},
             \\]
             then choose a per-candidate screen length that would deliver a target number of expected tilted-tail hits at \\(q_{\\mathrm{ref}}\\), capped by a fixed fraction of the total budget.
             """
