@@ -532,8 +532,9 @@ def build_cross_method_notebook() -> dict:
             """
             ## Configuration
 
-            This notebook reuses the saved simple/oracle initialization values from the beta notebook and does **not** run any pilot.  
-            Each method is evaluated with `20` independent one-chain runs, so the full `5M` is the actual chain budget and is not reduced by any initialization or tuning overhead.
+            This notebook reuses the saved **oracle** MCMC-IS settings from the latest oracle-beta-search run.  
+            The **naive/simple** MCMC-IS setting is rebuilt once per scenario from the current `gamma = 1/3` rule using a shared pilot that is **not** charged to the production `5M` chain budget.  
+            Each method is evaluated with `20` independent one-chain runs, so the full `5M` is the actual chain budget for every reported run.
             """
         ),
         code_cell(
@@ -600,6 +601,23 @@ def build_cross_method_notebook() -> dict:
                 min_tail_states=MIN_TAIL_STATES,
                 n_jobs=N_JOBS,
             )
+            simple_init_cfg = MCMCWorkflowConfig(
+                use_true_p0_for_q_target=False,
+                d_alpha=MCMCWorkflowConfig().d_alpha,
+                pilot_samples=200_000 if not FAST_MODE else 1_000,
+                scale_method="sd",
+                beta_max_init=1e6,
+                tune_steps=0,
+                chains=1,
+                burn_in_fraction=0.20,
+                thin=1,
+                estimate_variance=True,
+                obm_batch_size=None,
+                chain_n_jobs=1,
+                tilt_mode="smooth_hinge",
+                proposal_size=1,
+                local_scan_enabled=False,
+            )
             mcmc_template_cfg = MCMCWorkflowConfig(
                 pilot_samples=0,
                 tune_steps=0,
@@ -634,7 +652,9 @@ def build_cross_method_notebook() -> dict:
                 "CHECKPOINT_STEP": CHECKPOINT_STEP,
                 "N_CHECKPOINTS": len(ESTIMATION_POINTS),
                 "METHOD_ORDER": METHOD_ORDER,
-                "USES_SAVED_INIT_ONLY": True,
+                "USES_SAVED_ORACLE_ONLY": True,
+                "SIMPLE_INIT_GAMMA": float(simple_init_cfg.d_alpha),
+                "SIMPLE_INIT_PILOT_SAMPLES": int(simple_init_cfg.pilot_samples),
                 "COUNTS_INCLUDE_PILOT_BUDGET": False,
                 "PLOT_X_SCALE": "linear",
                 "CONVERGENCE_FIGURES": ["mean_estimate", "median_estimate"],
@@ -670,18 +690,15 @@ def build_cross_method_notebook() -> dict:
             def load_beta_reference(beta_run_dir: Path, scenario_key: str) -> dict:
                 scenario_dir = Path(beta_run_dir) / scenario_key
                 best_config = read_json(scenario_dir / "best_config.json")
-                simple_summary = read_json(scenario_dir / "simple_init_summary.json")
                 oracle_summary = read_json(scenario_dir / "oracle_best_trial.json")
                 metadata = read_json(scenario_dir / "metadata.json")
                 return {
                     "scenario": scenario_key,
                     "beta_run_dir": str(scenario_dir),
-                    "sigma_t": float(best_config["sigma_t"]),
+                    "oracle_sigma_t": float(best_config["sigma_t"]),
                     "reference_p0": float(best_config["reference_p0"]),
                     "simple_reference_p0": float(best_config.get("simple_reference_p0", best_config["reference_p0"])),
                     "canonical_threshold_p0": best_config.get("canonical_threshold_p0"),
-                    "simple_beta": float(best_config["beta_init"]),
-                    "simple_proposal_size": int(simple_summary["proposal_size"]),
                     "oracle_beta": float(best_config["best_beta"]),
                     "oracle_proposal_size": int(best_config["best_proposal_size"]),
                     "oracle_trial_number": int(best_config["best_trial_number"]),
@@ -689,19 +706,41 @@ def build_cross_method_notebook() -> dict:
                     "selection_source": str(best_config.get("selection_source", "unknown")),
                     "application_setting_key": metadata.get("application_setting_key"),
                     "known_significance_threshold": metadata.get("known_significance_threshold"),
-                    "simple_summary": simple_summary,
                     "oracle_summary": oracle_summary,
                 }
 
 
-            def build_mcmc_config_specs(beta_reference: dict) -> list[dict]:
+            def build_simple_reference(scenario, beta_reference: dict, *, seed: int) -> dict:
+                p0_reference = float(beta_reference["simple_reference_p0"])
+                init_payload = build_beta_initialization(
+                    scenario.problem,
+                    scenario.exact_p,
+                    simple_init_cfg,
+                    seed=int(seed),
+                    p0_reference=p0_reference,
+                )
+                proposal_size = int(proposal_size_for_scenario(scenario))
+                return {
+                    "scenario": scenario.key,
+                    "simple_gamma": float(simple_init_cfg.d_alpha),
+                    "simple_reference_p0": p0_reference,
+                    "simple_q_target": float(init_payload["q_target"]),
+                    "simple_beta": float(init_payload["beta0_laplace"]),
+                    "simple_sigma_t": float(init_payload["sigma_t"]),
+                    "simple_proposal_size": proposal_size,
+                    "pilot_eval_total": int(init_payload["pilot_eval_total"]),
+                    "pilot_wall_time_sec": float(init_payload["pilot_wall_time_sec"]),
+                }
+
+
+            def build_mcmc_config_specs(simple_reference: dict, beta_reference: dict) -> list[dict]:
                 return [
                     {
                         "label": "simple_mcmcis",
                         "config_id": "simple_mcmcis",
-                        "beta": float(beta_reference["simple_beta"]),
-                        "proposal_size": int(beta_reference["simple_proposal_size"]),
-                        "source": "oracle_beta_search_simple",
+                        "beta": float(simple_reference["simple_beta"]),
+                        "proposal_size": int(simple_reference["simple_proposal_size"]),
+                        "source": "current_simple_rule",
                     },
                     {
                         "label": "oracle_mcmcis",
@@ -836,8 +875,10 @@ def build_cross_method_notebook() -> dict:
                             "median": "median_estimate",
                         },
                         "cross_config": cross_cfg,
+                        "simple_init_config": simple_init_cfg,
                         "mcmc_template_config": mcmc_template_cfg,
                         "samc_config": samc_cfg,
+                        "simple_reference": study["simple_reference"],
                         "beta_reference": beta_reference,
                         "samc_setup": study["samc_setup"],
                         "notebook_config": NOTEBOOK_CONFIG,
@@ -919,6 +960,14 @@ def build_cross_method_notebook() -> dict:
                 scenario.key: load_beta_reference(BETA_RUN_DIR, scenario.key)
                 for scenario in scenarios
             }
+            simple_references = {
+                scenario.key: build_simple_reference(
+                    scenario,
+                    beta_references[scenario.key],
+                    seed=int(BASE_SEED + 50_000 * (scenario_idx + 1)),
+                )
+                for scenario_idx, scenario in enumerate(scenarios)
+            }
             run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "cross_method_oracle_compare") if SAVE_OUTPUTS else None
 
             pd.DataFrame(
@@ -930,8 +979,9 @@ def build_cross_method_notebook() -> dict:
                         "n_perm": scenario.exact_n_perm,
                         "family": scenario.portfolio.get("family"),
                         "rarity_band": scenario.portfolio.get("rarity_band"),
-                        "simple_beta": beta_references[scenario.key]["simple_beta"],
-                        "simple_prop": beta_references[scenario.key]["simple_proposal_size"],
+                        "simple_beta": simple_references[scenario.key]["simple_beta"],
+                        "simple_prop": simple_references[scenario.key]["simple_proposal_size"],
+                        "simple_gamma": simple_references[scenario.key]["simple_gamma"],
                         "oracle_beta": beta_references[scenario.key]["oracle_beta"],
                         "oracle_prop": beta_references[scenario.key]["oracle_proposal_size"],
                         "reference_p0": beta_references[scenario.key]["reference_p0"],
@@ -946,7 +996,8 @@ def build_cross_method_notebook() -> dict:
             ## Run Cross-Method Study
 
             For each scenario:
-            - load the saved simple/oracle MCMC-IS settings from `BETA_RUN_DIR`,
+            - load the saved **oracle** MCMC-IS setting from `BETA_RUN_DIR`,
+            - rebuild the **simple-init** MCMC-IS setting from the current `gamma = 1/3` rule without charging that pilot to the production budget,
             - run `20` independent one-chain replicates for each method,
             - save the article-facing max-budget plot plus both mean- and median-based convergence plots.
             """
@@ -957,9 +1008,11 @@ def build_cross_method_notebook() -> dict:
 
             for scenario_idx, scenario in enumerate(scenarios):
                 beta_reference = beta_references[scenario.key]
+                simple_reference = simple_references[scenario.key]
                 scenario_seed = int(BASE_SEED + 1_000_000 * (scenario_idx + 1))
                 scenario_samc_cfg = samc_cfg_for_scenario(scenario)
-                mcmc_specs = build_mcmc_config_specs(beta_reference)
+                simple_specs = build_mcmc_config_specs(simple_reference, beta_reference)[:1]
+                oracle_specs = build_mcmc_config_specs(simple_reference, beta_reference)[1:]
 
                 print(f"Running {scenario.key} | exact p={scenario.exact_p:.3e}")
                 print(json.dumps({
@@ -969,32 +1022,46 @@ def build_cross_method_notebook() -> dict:
                     "chain_budget": CHAIN_BUDGET,
                     "first_checkpoints": [int(v) for v in ESTIMATION_POINTS[:4]],
                     "last_checkpoint": int(ESTIMATION_POINTS[-1]),
-                    "simple_beta": beta_reference["simple_beta"],
-                    "simple_proposal_size": beta_reference["simple_proposal_size"],
+                    "simple_beta": simple_reference["simple_beta"],
+                    "simple_proposal_size": simple_reference["simple_proposal_size"],
+                    "simple_gamma": simple_reference["simple_gamma"],
+                    "simple_sigma_t": simple_reference["simple_sigma_t"],
+                    "simple_pilot_eval_total": simple_reference["pilot_eval_total"],
                     "oracle_beta": beta_reference["oracle_beta"],
                     "oracle_proposal_size": beta_reference["oracle_proposal_size"],
-                    "sigma_t": beta_reference["sigma_t"],
+                    "oracle_sigma_t": beta_reference["oracle_sigma_t"],
                     "samc_proposal_size": scenario_samc_cfg.proposal_size,
                 }, indent=2))
 
-                mcmc_study = run_named_mcmc_checkpoint_study(
+                simple_study = run_named_mcmc_checkpoint_study(
                     scenario.problem,
                     scenario.exact_p,
-                    config_specs=mcmc_specs,
-                    sigma_t=float(beta_reference["sigma_t"]),
+                    config_specs=simple_specs,
+                    sigma_t=float(simple_reference["simple_sigma_t"]),
                     estimation_points=tuple(int(v) for v in cross_cfg.estimation_points),
                     repeats=int(cross_cfg.repeats),
                     base_seed=scenario_seed,
                     template_cfg=mcmc_template_cfg,
                     n_jobs=int(cross_cfg.n_jobs),
                 )
+                oracle_study = run_named_mcmc_checkpoint_study(
+                    scenario.problem,
+                    scenario.exact_p,
+                    config_specs=oracle_specs,
+                    sigma_t=float(beta_reference["oracle_sigma_t"]),
+                    estimation_points=tuple(int(v) for v in cross_cfg.estimation_points),
+                    repeats=int(cross_cfg.repeats),
+                    base_seed=scenario_seed + 200_000,
+                    template_cfg=mcmc_template_cfg,
+                    n_jobs=int(cross_cfg.n_jobs),
+                )
                 samc_rows, samc_setup = run_samc_baseline(
                     scenario,
-                    base_seed=scenario_seed + 300_000,
+                    base_seed=scenario_seed + 400_000,
                     samc_cfg=scenario_samc_cfg,
                 )
 
-                records = list(mcmc_study["records"]) + list(samc_rows)
+                records = list(simple_study["records"]) + list(oracle_study["records"]) + list(samc_rows)
                 records = sorted(
                     records,
                     key=lambda row: (
@@ -1017,6 +1084,7 @@ def build_cross_method_notebook() -> dict:
                     "records": records,
                     "summary": summary,
                     "beta_reference": beta_reference,
+                    "simple_reference": simple_reference,
                     "samc_setup": {
                         "lambda_min": float(samc_setup["lambda_min"]),
                         "bin_edges": samc_setup["bin_edges"],
