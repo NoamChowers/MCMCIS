@@ -806,6 +806,7 @@ def build_cross_method_notebook() -> dict:
             ) -> None:
                 output_dir = Path(output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
+                known_threshold = beta_reference.get("known_significance_threshold")
 
                 plot_named_method_max_budget(
                     study["records"],
@@ -818,6 +819,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=METHOD_COLORS,
                     n_control=int(scenario.problem.n_control),
                     n_treated=int(scenario.problem.n_treated),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     save_path=output_dir / "cross_method_max_budget.png",
                 )
                 plot_named_method_convergence(
@@ -830,6 +836,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=METHOD_COLORS,
                     n_control=int(scenario.problem.n_control),
                     n_treated=int(scenario.problem.n_treated),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     x_label="Budget per run",
                     save_path=output_dir / "cross_method_convergence.png",
                 )
@@ -843,6 +854,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=METHOD_COLORS,
                     n_control=int(scenario.problem.n_control),
                     n_treated=int(scenario.problem.n_treated),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     x_label="Budget per run",
                     estimate_field="median_estimate",
                     estimate_title="Median estimate",
@@ -893,9 +909,11 @@ def build_cross_method_notebook() -> dict:
             ) -> dict[str, Path]:
                 saved = load_cross_method_saved_output(scenario_dir)
                 metadata = saved["metadata"]
+                beta_reference = dict(metadata.get("beta_reference", {}))
                 save_dir = Path(save_dir) if save_dir is not None else Path(scenario_dir)
                 save_dir.mkdir(parents=True, exist_ok=True)
                 max_budget = max(int(v) for v in metadata["estimation_points"])
+                known_threshold = beta_reference.get("known_significance_threshold")
                 out = {
                     "cross_method_max_budget": save_dir / "cross_method_max_budget.png",
                     "cross_method_convergence": save_dir / "cross_method_convergence.png",
@@ -912,6 +930,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=dict(METHOD_COLORS),
                     n_control=int(metadata["n_control"]),
                     n_treated=int(metadata["n_treated"]),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     save_path=out["cross_method_max_budget"],
                 )
                 plot_named_method_convergence(
@@ -924,6 +947,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=dict(METHOD_COLORS),
                     n_control=int(metadata["n_control"]),
                     n_treated=int(metadata["n_treated"]),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     x_label=str(metadata.get("x_label", "Budget per run")),
                     save_path=out["cross_method_convergence"],
                 )
@@ -937,6 +965,11 @@ def build_cross_method_notebook() -> dict:
                     method_colors=dict(METHOD_COLORS),
                     n_control=int(metadata["n_control"]),
                     n_treated=int(metadata["n_treated"]),
+                    known_significance_threshold=(
+                        float(known_threshold)
+                        if known_threshold is not None
+                        else None
+                    ),
                     x_label=str(metadata.get("x_label", "Budget per run")),
                     estimate_field="median_estimate",
                     estimate_title="Median estimate",

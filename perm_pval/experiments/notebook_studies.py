@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
@@ -792,6 +793,14 @@ def _positive_for_plot(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _finite_for_plot(values: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=float).copy()
+    out[~np.isfinite(out)] = np.nan
+    if np.all(np.isnan(out)):
+        return np.asarray([np.nan], dtype=float)
+    return out
+
+
 def _set_log_ylim(ax, arrays: list[np.ndarray], q_lo: float = 0.05, q_hi: float = 0.95, pad: float = 1.35) -> None:
     vals = []
     for arr in arrays:
@@ -814,12 +823,57 @@ def _set_log_ylim(ax, arrays: list[np.ndarray], q_lo: float = 0.05, q_hi: float 
         ax.set_ylim(lo, hi)
 
 
+def _set_linear_ylim(
+    ax,
+    arrays: list[np.ndarray],
+    *,
+    include_values: Iterable[float] = (),
+    pad: float = 0.08,
+    anchor_zero: bool = False,
+) -> None:
+    vals = []
+    for arr in arrays:
+        a = np.asarray(arr, dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size:
+            vals.append(a)
+    extras = np.asarray([float(v) for v in include_values if np.isfinite(float(v))], dtype=float)
+    if extras.size:
+        vals.append(extras)
+    if not vals:
+        return
+    flat = np.concatenate(vals)
+    lo = float(np.min(flat))
+    hi = float(np.max(flat))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+    span = abs(hi - lo)
+    scale = max(abs(lo), abs(hi), span, 1e-12)
+    if anchor_zero and lo >= 0.0:
+        lo = 0.0
+    else:
+        lo = lo - pad * scale
+    if hi <= lo:
+        hi = lo + max(scale, 1e-12)
+    else:
+        hi = hi + pad * scale
+    ax.set_ylim(lo, hi)
+
+
 def _has_positive_finite(arrays: list[np.ndarray]) -> bool:
     for arr in arrays:
         a = np.asarray(arr, dtype=float)
         if np.any(np.isfinite(a) & (a > 0.0)):
             return True
     return False
+
+
+def _value_in_ylim(ax, value: float) -> bool:
+    if not np.isfinite(float(value)):
+        return False
+    ymin, ymax = ax.get_ylim()
+    lo, hi = (ymin, ymax) if ymin <= ymax else (ymax, ymin)
+    return lo <= float(value) <= hi
 
 
 _CROSS_METHOD_LABELS: dict[str, str] = {
@@ -837,14 +891,14 @@ _CROSS_METHOD_COLORS: dict[str, str] = {
 _CROSS_METHOD_TITLES: dict[str, str] = {
     "bruteforce_welch_nonextreme_n22": "Welch t-statistic",
     "gwas_additive_score_n40": "GWAS-like additive score",
-    "gwas_additive_score_ultra_n100": "GWAS-like additive score\nBelow threshold",
-    "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear threshold",
-    "gwas_additive_score_above_n100": "GWAS-like additive score\nAbove threshold",
+    "gwas_additive_score_ultra_n100": "GWAS-like additive score\nSignificant",
+    "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear-threshold",
+    "gwas_additive_score_above_n100": "GWAS-like additive score\nNon-significant",
     "hypergeom_1e7": "Hypergeometric count",
     "linear_stat_dp_n40": "Difference in means",
-    "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nBelow threshold",
-    "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear threshold",
-    "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nAbove threshold",
+    "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nSignificant",
+    "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear-threshold",
+    "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nNon-significant",
     "rank_sum_dp_n40": "Mann-Whitney U",
 }
 
@@ -855,10 +909,26 @@ def _compact_plot_title(
     scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
+    exact_p: float | None = None,
+    known_significance_threshold: float | None = None,
+    n_runs: int | None = None,
 ) -> str:
+    base = None
     if scenario_key is not None and scenario_key in _CROSS_METHOD_TITLES:
-        return _CROSS_METHOD_TITLES[str(scenario_key)]
-    return " ".join(str(scenario_name).split()).rstrip(".")
+        base = _CROSS_METHOD_TITLES[str(scenario_key)]
+    if base is None:
+        base = " ".join(str(scenario_name).split()).rstrip(".")
+    base = str(base).replace("\n", " - ")
+    subtitle_parts: list[str] = []
+    if known_significance_threshold is not None and np.isfinite(float(known_significance_threshold)) and float(known_significance_threshold) > 0.0:
+        subtitle_parts.append(f"Significance threshold = {float(known_significance_threshold):.1e}")
+    if exact_p is not None and np.isfinite(float(exact_p)) and float(exact_p) > 0.0:
+        subtitle_parts.append(f"True p-value = {float(exact_p):.3e}")
+    if n_runs is not None and int(n_runs) > 0:
+        subtitle_parts.append(f"{int(n_runs)} runs/method")
+    if subtitle_parts:
+        return f"{base}\n" + " | ".join(subtitle_parts)
+    return base
 
 
 def _format_scientific_tick(value: int | float) -> str:
@@ -880,7 +950,7 @@ def _format_budget_tick_compact(value: int | float) -> str:
     if not np.isfinite(val):
         return str(value)
     abs_val = abs(val)
-    if abs_val >= 1_000_000:
+    if abs_val >= 500_000:
         scaled = val / 1_000_000.0
         suffix = "M"
     elif abs_val >= 1_000:
@@ -924,6 +994,7 @@ def _set_budget_ticks(
     *,
     max_labels: int = 6,
     formatter: Callable[[int | float], str] | None = None,
+    label_every: int | None = None,
 ) -> None:
     ticks = sorted({int(v) for v in budgets if int(v) > 0})
     if not ticks:
@@ -931,12 +1002,21 @@ def _set_budget_ticks(
     if formatter is None:
         formatter = _format_scientific_tick
     label_ticks = ticks
-    if max_labels > 0 and len(ticks) > max_labels:
-        step = max(int(np.ceil((len(ticks) - 1) / max(max_labels - 1, 1))), 1)
-        label_ticks = ticks[::step]
-        if label_ticks[-1] != ticks[-1]:
+    if label_every is not None and int(label_every) > 0:
+        step = int(label_every)
+        label_ticks = [tick for tick in ticks if tick % step == 0]
+        if not label_ticks:
+            label_ticks = ticks
+        elif ticks[-1] not in label_ticks:
             label_ticks.append(ticks[-1])
         label_ticks = sorted(set(label_ticks))
+    if max_labels > 0 and len(ticks) > max_labels:
+        if label_every is None:
+            step = max(int(np.ceil((len(ticks) - 1) / max(max_labels - 1, 1))), 1)
+            label_ticks = ticks[::step]
+            if label_ticks[-1] != ticks[-1]:
+                label_ticks.append(ticks[-1])
+            label_ticks = sorted(set(label_ticks))
     ax.set_xticks(label_ticks)
     ax.set_xticklabels([formatter(tick) for tick in label_ticks], fontsize=9)
     ax.minorticks_off()
@@ -997,7 +1077,7 @@ def _overlay_boxplot_points(
 ) -> None:
     for idx, (arr, color) in enumerate(zip(data, colors), start=1):
         vals = np.asarray(arr, dtype=float)
-        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        vals = vals[np.isfinite(vals)]
         if vals.size == 0:
             continue
         vals = np.sort(vals)
@@ -3737,10 +3817,12 @@ def plot_named_method_max_budget(
     scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
+    known_significance_threshold: float | None = None,
     save_path: Path | None = None,
 ) -> None:
     rows = [row for row in records if int(row["checkpoint"]) == int(max_budget)]
     methods = [str(method) for method in method_order]
+    n_runs = max((sum(1 for row in rows if _record_group_label(row) == method) for method in methods), default=0)
     if method_labels is None:
         method_labels = {}
     if method_colors is None:
@@ -3754,40 +3836,32 @@ def plot_named_method_max_budget(
 
     est_data = []
     abs_error_data = []
-    omission_notes: list[str] = []
     for method in methods:
         sub = [row for row in rows if _record_group_label(row) == method]
         est = np.asarray([row["estimate"] for row in sub], dtype=float)
         rse = np.asarray([row["root_squared_error"] for row in sub], dtype=float)
-        if method == "iid":
-            tail_hits = np.asarray([row.get("tail_hits", 0) for row in sub], dtype=int)
-            zero_hit_count = int(np.sum(tail_hits <= 0))
-            if zero_hit_count > 0:
-                omission_notes.append(
-                    f"IID: {zero_hit_count}/{tail_hits.size} runs did not hit the tail once; omitted on the log scale."
-                )
-            est[tail_hits <= 0] = np.nan
-            rse[tail_hits <= 0] = np.nan
-        est_data.append(_positive_for_plot(est))
-        abs_error_data.append(_positive_for_plot(rse))
+        est_data.append(_finite_for_plot(est))
+        abs_error_data.append(_finite_for_plot(rse))
 
     fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4))
     _styled_boxplot(axes[0], est_data, labels=labels, colors=colors)
     _overlay_boxplot_points(axes[0], est_data, colors=colors)
-    if _has_positive_finite(est_data):
-        axes[0].set_yscale("log")
-    axes[0].axhline(exact_p, color="#444444", linestyle="--", linewidth=1.2, label="Exact p")
-    _set_log_ylim(axes[0], est_data)
+    axes[0].axhline(exact_p, color="#000000", linestyle="--", linewidth=1.25, zorder=2.0)
+    _set_linear_ylim(axes[0], est_data, include_values=[exact_p], anchor_zero=False)
     axes[0].set_title("Estimate", fontsize=12, pad=10)
     axes[0].set_ylabel(r"$\hat{p}$")
-    axes[0].legend(frameon=False, fontsize=9.5, loc="upper right")
+    if _value_in_ylim(axes[0], exact_p):
+        axes[0].legend(
+            handles=[Line2D([0], [0], color="#000000", linestyle="--", linewidth=1.25, label="Exact p")],
+            frameon=False,
+            fontsize=9.5,
+            loc="upper right",
+        )
     _style_article_axis(axes[0], grid_axis="y")
 
     _styled_boxplot(axes[1], abs_error_data, labels=labels, colors=colors)
     _overlay_boxplot_points(axes[1], abs_error_data, colors=colors)
-    if _has_positive_finite(abs_error_data):
-        axes[1].set_yscale("log")
-    _set_log_ylim(axes[1], abs_error_data)
+    _set_linear_ylim(axes[1], abs_error_data, anchor_zero=True)
     axes[1].set_title("Absolute error", fontsize=12, pad=10)
     axes[1].set_ylabel(r"$|\hat{p} - p|$")
     _style_article_axis(axes[1], grid_axis="y")
@@ -3798,23 +3872,15 @@ def plot_named_method_max_budget(
             scenario_key=scenario_key,
             n_control=n_control,
             n_treated=n_treated,
+            exact_p=exact_p,
+            known_significance_threshold=known_significance_threshold,
+            n_runs=n_runs,
         ),
         fontsize=14,
         fontweight="semibold",
         y=0.99,
     )
-    layout_rect = (0.0, 0.05, 1.0, 0.95) if omission_notes else (0.0, 0.0, 1.0, 0.95)
-    if omission_notes:
-        fig.text(
-            0.5,
-            0.015,
-            "\n".join(omission_notes),
-            ha="center",
-            va="bottom",
-            fontsize=9,
-            color="#555555",
-        )
-    plt.tight_layout(rect=layout_rect)
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=170, bbox_inches="tight")
@@ -3859,6 +3925,7 @@ def plot_named_method_convergence(
     scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
+    known_significance_threshold: float | None = None,
     mcmc_beta_selection_budget: int = 0,
     x_label: str = "Total budget",
     x_scale: str = "linear",
@@ -3868,6 +3935,16 @@ def plot_named_method_convergence(
     save_path: Path | None = None,
 ) -> None:
     methods = [str(method) for method in method_order]
+    n_runs = max(
+        (
+            max(
+                (int(row.get("n_runs", 0)) for row in summary if _record_group_label(row) == method),
+                default=0,
+            )
+            for method in methods
+        ),
+        default=0,
+    )
     if method_labels is None:
         method_labels = {}
     if method_colors is None:
@@ -3883,6 +3960,7 @@ def plot_named_method_convergence(
         estimate_values = np.asarray([row[estimate_field] for row in sub], dtype=float)
         rmse = np.asarray([row["rmse"] for row in sub], dtype=float)
         color = str(method_colors.get(method, matplotlib.colors.to_hex(fallback_colors[idx])))
+        label = str(method_labels.get(method, method))
 
         plot_kwargs = {
             "marker": marker_cycle[idx % len(marker_cycle)],
@@ -3891,15 +3969,22 @@ def plot_named_method_convergence(
             "linewidth": 2.15,
             "markeredgecolor": "white",
             "markeredgewidth": 0.85,
-            "label": str(method_labels.get(method, method)),
             "color": color,
             "alpha": 0.98,
             "zorder": 3.0 + 0.1 * idx,
         }
-        axes[0].plot(x, estimate_values, **plot_kwargs)
+        axes[0].plot(x, estimate_values, label=label, **plot_kwargs)
         axes[1].plot(x, rmse, **plot_kwargs)
 
-    axes[0].axhline(exact_p, color="#444444", linestyle="--", linewidth=1.2, label="Exact p")
+    axes[0].axhline(exact_p, color="#000000", linestyle="--", linewidth=1.25, zorder=2.0)
+    if np.isfinite(float(exact_p)) and float(exact_p) > 0.0:
+        rmse_ref_10 = 0.10 * float(exact_p)
+        rmse_ref_05 = 0.05 * float(exact_p)
+        axes[1].axhline(rmse_ref_10, color="#7a6f8f", linestyle=(0, (5.0, 2.8)), linewidth=1.05, zorder=1.8)
+        axes[1].axhline(rmse_ref_05, color="#3f4459", linestyle=(0, (5.0, 2.8)), linewidth=1.35, zorder=1.9)
+    else:
+        rmse_ref_10 = np.nan
+        rmse_ref_05 = np.nan
     est_arrays = [np.asarray([row[estimate_field] for row in summary if _record_group_label(row) == method], dtype=float) for method in methods]
     rmse_arrays = [np.asarray([row["rmse"] for row in summary if _record_group_label(row) == method], dtype=float) for method in methods]
     x_span = float(max(budgets) - min(budgets)) if len(budgets) > 1 else float(max(budgets[0], 1))
@@ -3910,31 +3995,45 @@ def plot_named_method_convergence(
             budgets,
             max_labels=6 if str(x_scale) == "linear" else 4,
             formatter=_format_budget_tick_compact if str(x_scale) == "linear" else _format_scientific_tick,
+            label_every=500_000 if str(x_scale) == "linear" else None,
         )
         if str(x_scale) == "linear" and budgets:
             pad = 0.025 * x_span if x_span > 0.0 else 0.15 * float(budgets[0])
             ax.set_xlim(float(min(budgets)) - pad, float(max(budgets)) + pad)
         ax.set_xlabel(str(x_label))
         ax.margins(x=0.05)
-    if _has_positive_finite(est_arrays):
-        axes[0].set_yscale("log")
-        _set_log_ylim(axes[0], [*est_arrays, np.asarray([exact_p], dtype=float)])
-    if _has_positive_finite(rmse_arrays):
-        axes[1].set_yscale("log")
-        _set_log_ylim(axes[1], rmse_arrays)
+    _set_linear_ylim(axes[0], est_arrays, include_values=[exact_p], anchor_zero=False)
+    _set_linear_ylim(axes[1], rmse_arrays, include_values=[rmse_ref_10, rmse_ref_05], anchor_zero=True)
     axes[0].set_title(str(estimate_title), fontsize=12.5, pad=10)
     axes[0].set_ylabel(str(estimate_ylabel))
     axes[1].set_title("RMSE", fontsize=12, pad=10)
     axes[1].set_ylabel("RMSE")
     for ax in axes:
         _style_article_axis(ax, grid_axis="both" if str(x_scale) == "linear" else "y")
-    axes[0].legend(frameon=False, fontsize=9.6, loc="upper right")
+    est_handles, est_labels = axes[0].get_legend_handles_labels()
+    if _value_in_ylim(axes[0], exact_p):
+        est_handles.append(Line2D([0], [0], color="#000000", linestyle="--", linewidth=1.25))
+        est_labels.append("Exact p")
+    axes[0].legend(est_handles, est_labels, frameon=False, fontsize=9.6, loc="upper right")
+    rmse_handles: list[Line2D] = []
+    rmse_labels: list[str] = []
+    if _value_in_ylim(axes[1], rmse_ref_10):
+        rmse_handles.append(Line2D([0], [0], color="#7a6f8f", linestyle=(0, (5.0, 2.8)), linewidth=1.05))
+        rmse_labels.append("10% of true p")
+    if _value_in_ylim(axes[1], rmse_ref_05):
+        rmse_handles.append(Line2D([0], [0], color="#3f4459", linestyle=(0, (5.0, 2.8)), linewidth=1.35))
+        rmse_labels.append("5% of true p")
+    if rmse_handles:
+        axes[1].legend(rmse_handles, rmse_labels, frameon=False, fontsize=9.2, loc="upper right")
     fig.suptitle(
         _compact_plot_title(
             scenario_name,
             scenario_key=scenario_key,
             n_control=n_control,
             n_treated=n_treated,
+            exact_p=exact_p,
+            known_significance_threshold=known_significance_threshold,
+            n_runs=n_runs,
         ),
         fontsize=14,
         fontweight="semibold",
