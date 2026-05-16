@@ -891,14 +891,14 @@ _CROSS_METHOD_COLORS: dict[str, str] = {
 _CROSS_METHOD_TITLES: dict[str, str] = {
     "bruteforce_welch_nonextreme_n22": "Welch t-statistic",
     "gwas_additive_score_n40": "GWAS-like additive score",
-    "gwas_additive_score_ultra_n100": "GWAS-like additive score\nSignificant",
-    "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear-threshold",
-    "gwas_additive_score_above_n100": "GWAS-like additive score\nNon-significant",
+    "gwas_additive_score_ultra_n100": "GWAS-like additive score\nClearly Significant",
+    "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear-Threshold",
+    "gwas_additive_score_above_n100": "GWAS-like additive score\nClearly Non-Significant",
     "hypergeom_1e7": "Hypergeometric count",
     "linear_stat_dp_n40": "Difference in means",
-    "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nSignificant",
-    "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear-threshold",
-    "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nNon-significant",
+    "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nClearly Significant",
+    "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear-Threshold",
+    "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nClearly Non-Significant",
     "rank_sum_dp_n40": "Mann-Whitney U",
 }
 

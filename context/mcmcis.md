@@ -182,11 +182,9 @@ Uniform \(f\) + symmetric proposal:
 
 Current implementation uses the **same localized-swap proposal family** in MCMC-IS and SAMC.
 
-- A proposal is built by applying `n_swap_pairs` treated/control swaps sequentially.
-- Each swap picks:
-  - one treated index uniformly from \(\{i:y_i=1\}\),
-  - one control index uniformly from \(\{j:y_j=0\}\),
-  - then swaps their labels.
+- A proposal swaps exactly `n_swap_pairs` treated/control pairs.
+- The treated indices and control indices are sampled uniformly without replacement.
+- The selected treated labels become controls, and the selected control labels become treated.
 - Group sizes are preserved exactly.
 
 Parameterization:

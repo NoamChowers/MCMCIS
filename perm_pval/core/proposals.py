@@ -86,12 +86,27 @@ def propose_localized_swaps(
     n_swap_pairs: int,
 ) -> np.ndarray:
     """
-    Propose a new labeling by applying ``n_swap_pairs`` random treated/control swaps.
+    Propose a new labeling by swapping exactly ``n_swap_pairs`` treated/control pairs.
+
+    The swapped treated and control indices are sampled without replacement, so
+    ``n_swap_pairs`` has the same block-swap interpretation as Shuli's original
+    implementation: an ``L``-swap proposal changes exactly ``L`` labels from
+    each group.
     """
     if n_swap_pairs <= 0:
         raise ValueError("n_swap_pairs must be positive.")
-    y_prop = np.asarray(y, dtype=np.int8).copy()
-    for _ in range(n_swap_pairs):
-        move = random_swap_move(y_prop, rng)
-        y_prop = apply_swap(y_prop, move, in_place=True)
+    y_arr = np.asarray(y, dtype=np.int8)
+    ones = np.flatnonzero(y_arr == 1)
+    zeros = np.flatnonzero(y_arr == 0)
+    if ones.size == 0 or zeros.size == 0:
+        raise ValueError("Both groups must be non-empty to propose swaps.")
+    max_pairs = min(ones.size, zeros.size)
+    if n_swap_pairs > max_pairs:
+        raise ValueError("n_swap_pairs must be no larger than the smaller group size.")
+
+    swap_ones = rng.choice(ones, size=int(n_swap_pairs), replace=False)
+    swap_zeros = rng.choice(zeros, size=int(n_swap_pairs), replace=False)
+    y_prop = y_arr.copy()
+    y_prop[swap_ones] = 0
+    y_prop[swap_zeros] = 1
     return y_prop

@@ -118,11 +118,9 @@ SAMC still depends on a *good* proposal. The paper recommends changing only a sm
 
 SAMC and MCMC-IS now use the same localized-swap proposal family:
 
-- One proposal applies `n_swap_pairs` sequential treated/control swaps.
-- Each swap:
-  - chooses one treated index uniformly,
-  - chooses one control index uniformly,
-  - swaps the two labels.
+- One proposal swaps exactly `n_swap_pairs` treated/control pairs.
+- The treated indices and control indices are sampled uniformly without replacement.
+- The selected treated labels are changed to control and the selected control labels are changed to treated.
 
 Parameterization:
 
