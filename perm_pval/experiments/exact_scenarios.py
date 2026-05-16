@@ -49,6 +49,15 @@ def treated_sum(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.dot(x_arr, y_arr))
 
 
+def absolute_sum_difference(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Absolute difference between fixed-size group sums.
+    """
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=np.int8)
+    return float(abs(np.sum(x_arr[y_arr == 1]) - np.sum(x_arr[y_arr == 0])))
+
+
 def exact_hypergeom_right_tail(
     n: int,
     n_treated: int,
@@ -1076,6 +1085,7 @@ def save_exact_scenarios(
 
 
 STATISTIC_REGISTRY = {
+    "absolute_sum_difference": absolute_sum_difference,
     "treated_successes": treated_successes,
     "treated_sum": treated_sum,
     "mann_whitney_u": mann_whitney_u,
