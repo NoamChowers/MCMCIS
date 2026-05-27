@@ -104,7 +104,15 @@ After \(T\) iterations, estimate the tail probability using \(\theta(T)\), with 
 \frac{e^{\theta_m(T)}(\pi_m+\pi_0)}{\sum_{j=1}^m e^{\theta_j(T)}(\pi_j+\pi_0)}
 \]
 This is the Eq. (3.2)-style form used in the implementation.
-The implementation also computes empty-bin handling and frequency diagnostics from **post-burn-in** visit counts.
+The implementation keeps this corrected value as the primary estimate and also records
+the corresponding no-correction estimate,
+\[
+\widehat p_{\mathrm{raw}}
+=
+\frac{e^{\theta_m(T)}\pi_m}{\sum_{j=1}^m e^{\theta_j(T)}\pi_j},
+\]
+so the impact of the empty-bin adjustment can be inspected. Empty-bin handling and
+frequency diagnostics are computed from **post-burn-in** visit counts.
 
 **Implementation shortcut.** If you skip \(\pi_0\) initially, choose bins so all bins get visited, or merge empty bins.
 

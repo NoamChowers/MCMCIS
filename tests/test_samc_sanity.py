@@ -38,6 +38,12 @@ def test_samc_visitation_is_approximately_flat():
     assert samc.pvalue_estimator == "samc_paper_eq_3_2"
     assert samc.tail_bin_index == samc.visit_counts.size - 1
     assert samc.convergence_reached is True
+    assert np.isfinite(samc.estimate_no_empty_bin_correction)
+    assert np.isfinite(samc.empty_bin_correction_delta)
+    if samc.empty_bin_indices.size == 0:
+        assert np.isclose(samc.estimate, samc.estimate_no_empty_bin_correction)
+        assert np.isclose(samc.empty_bin_correction_delta, 0.0)
+        assert np.isclose(samc.empty_bin_correction_ratio, 1.0)
 
     exact = BruteForceExactSolver(problem, max_permutations=1_000).compute()
     assert abs(samc.estimate - exact.p_value) < 0.08

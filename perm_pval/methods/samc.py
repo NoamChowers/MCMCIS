@@ -13,6 +13,9 @@ from perm_pval.diagnostics.samc import visitation_frequency
 @dataclass
 class SAMCResult:
     estimate: float
+    estimate_no_empty_bin_correction: float
+    empty_bin_correction_delta: float
+    empty_bin_correction_ratio: float
     acceptance_rate: float
     n_steps: int
     burn_in: int
@@ -148,6 +151,38 @@ def _paper_pvalue_estimate(
     else:
         numer = float(np.exp(log_terms[tail_bin_index] - shift))
     return float(numer / denom), pi0, empty_idx
+
+
+def _pvalue_estimate_no_empty_bin_correction(
+    theta: np.ndarray,
+    target: np.ndarray,
+    tail_bin_index: int,
+) -> float:
+    """
+    Estimate p-value from theta without Yu et al.'s empty-bin pi0 correction.
+    """
+    theta_arr = np.asarray(theta, dtype=float)
+    target_arr = np.asarray(target, dtype=float)
+    valid = target_arr > 0.0
+    if not np.any(valid):
+        return 0.0
+
+    log_terms = np.full(theta_arr.size, -np.inf, dtype=float)
+    log_terms[valid] = theta_arr[valid] + np.log(target_arr[valid])
+    shift = float(np.max(log_terms[valid]))
+    denom = float(np.sum(np.exp(log_terms[valid] - shift)))
+    if denom <= 0.0 or not valid[tail_bin_index]:
+        return 0.0
+    numer = float(np.exp(log_terms[tail_bin_index] - shift))
+    return float(numer / denom)
+
+
+def _correction_ratio(corrected: float, uncorrected: float) -> float:
+    if uncorrected > 0.0:
+        return float(corrected / uncorrected)
+    if corrected > 0.0:
+        return float("inf")
+    return float("nan")
 
 
 def run_samc(
@@ -294,10 +329,21 @@ def run_samc(
         visit_counts=visit_counts,
         tail_bin_index=tail_bin_index,
     )
+    estimate_no_correction = _pvalue_estimate_no_empty_bin_correction(
+        theta=theta,
+        target=target,
+        tail_bin_index=tail_bin_index,
+    )
     pvalue_estimator = "samc_paper_eq_3_2"
 
     return SAMCResult(
         estimate=estimate,
+        estimate_no_empty_bin_correction=float(estimate_no_correction),
+        empty_bin_correction_delta=float(estimate - estimate_no_correction),
+        empty_bin_correction_ratio=_correction_ratio(
+            corrected=float(estimate),
+            uncorrected=float(estimate_no_correction),
+        ),
         acceptance_rate=float(acceptance_rate),
         n_steps=int(n_steps),
         burn_in=int(burn_in),

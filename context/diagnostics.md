@@ -87,6 +87,9 @@ Required:
 - `n_steps`, `burn_in`, `n_retained_after_burn_in`
 - `acceptance_rate`
 - `pvalue_estimator`
+- `estimate_no_empty_bin_correction`
+- `empty_bin_correction_delta`
+- `empty_bin_correction_ratio`
 - `tail_bin_index`
 - `pi0_adjustment`
 - `empty_bin_indices`

@@ -131,6 +131,10 @@ def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     if study["beta_workflow"].get("production_init_states") is not None:
         assert all(int(row["state_reused_init"]) == 1 for row in mcmc_rows)
         assert all(int(row["burn_in"]) == 0 for row in mcmc_rows)
+    samc_rows = [row for row in study["records"] if row["method"] == "samc"]
+    assert all("samc_estimate_no_empty_bin_correction" in row for row in samc_rows)
+    assert all("samc_empty_bin_correction_delta" in row for row in samc_rows)
+    assert all("samc_empty_bin_correction_ratio" in row for row in samc_rows)
 
 
 def test_run_beta_checkpoint_study_emits_rows_for_each_checkpoint():

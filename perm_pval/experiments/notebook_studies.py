@@ -34,8 +34,10 @@ from perm_pval.methods.mcmc_is import (
 from perm_pval.methods.random_sampling import run_random_sampling, wilson_interval
 from perm_pval.methods.samc import (
     _bin_index,
+    _correction_ratio,
     _default_stepsize,
     _paper_pvalue_estimate,
+    _pvalue_estimate_no_empty_bin_correction,
     _relative_sampling_frequency_error,
     run_samc,
 )
@@ -3400,12 +3402,23 @@ def _run_samc_cumulative_checkpoints(
             visit_counts=visit_counts,
             tail_bin_index=tail_bin_index,
         )
+        estimate_no_correction = _pvalue_estimate_no_empty_bin_correction(
+            theta=theta_at_checkpoint[int(checkpoint)],
+            target=target,
+            tail_bin_index=tail_bin_index,
+        )
         rows.append(
             _annotate_error_fields(
                 {
                     "method": "samc",
                     "checkpoint": int(checkpoint),
                     "estimate": float(estimate),
+                    "samc_estimate_no_empty_bin_correction": float(estimate_no_correction),
+                    "samc_empty_bin_correction_delta": float(estimate - estimate_no_correction),
+                    "samc_empty_bin_correction_ratio": _correction_ratio(
+                        corrected=float(estimate),
+                        uncorrected=float(estimate_no_correction),
+                    ),
                     "variance_estimate": samc_variance_proxy(float(estimate), int(checkpoint), burn_in),
                     "acceptance_rate": float(accepted_by_checkpoint[int(checkpoint)] / int(checkpoint)),
                     "samc_max_rel_freq_error": max_abs_rel_freq_error,
