@@ -873,6 +873,18 @@ def build_exact_scenarios() -> list[ExactScenario]:
             downgrade_swaps=2,
         ),
         _make_gwas_additive_score_scenario(
+            key="gwas_additive_score_slight_above_n100",
+            description=(
+                "GWAS-like additive score: Binomial(2, maf=0.08) dosages, n=100, "
+                "right-tail treated dosage sum with p-value slightly above the genome-wide threshold."
+            ),
+            n=100,
+            n_treated=50,
+            maf=0.08,
+            seed=1065,
+            downgrade_swaps=1,
+        ),
+        _make_gwas_additive_score_scenario(
             key="gwas_additive_score_above_n100",
             description=(
                 "GWAS-like additive score: Binomial(2, maf=0.25) dosages, n=100, "
@@ -964,6 +976,18 @@ def build_exact_scenarios() -> list[ExactScenario]:
             seed=5,
         ),
         _make_poisson_diffmeans_righttail_scenario(
+            key="poisson_diffmeans_hep_slight_above_n200",
+            description=(
+                "Poisson count benchmark resembling a high-energy-physics counting test: "
+                "treated~Pois(3), control~Pois(2), n1=n2=100, with p-value slightly above the 3e-7 discovery threshold."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=80,
+        ),
+        _make_poisson_diffmeans_righttail_scenario(
             key="poisson_diffmeans_hep_above_n200",
             description=(
                 "Poisson count benchmark resembling a high-energy-physics counting test: "
@@ -1002,9 +1026,11 @@ def build_exact_scenarios() -> list[ExactScenario]:
     threshold_tags = {
         "gwas_additive_score_ultra_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "ultra"),
         "gwas_additive_score_sig_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "near"),
+        "gwas_additive_score_slight_above_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "slightly_above"),
         "gwas_additive_score_above_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "above"),
         "poisson_diffmeans_hep_ultra_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "ultra"),
         "poisson_diffmeans_hep_sig_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "near"),
+        "poisson_diffmeans_hep_slight_above_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "slightly_above"),
         "poisson_diffmeans_hep_above_n200": (3e-7, "hep_threshold_suite", "HEP-like Poisson count test", "above"),
     }
     for scenario in scenarios:

@@ -19,6 +19,7 @@ from perm_pval.experiments.notebook_studies import (
     build_mcmc_objective_grid_candidates,
     load_beta_sweep_saved_output,
     load_cross_method_saved_output,
+    plot_near_threshold_checkpoint_boxplots,
     regenerate_beta_sweep_plots_from_saved,
     regenerate_cross_method_plots_from_saved,
     run_beta_checkpoint_study,
@@ -28,6 +29,7 @@ from perm_pval.experiments.notebook_studies import (
     save_cross_method_outputs,
     score_mcmc_objective_grid_repeat_row,
     select_mcmc_objective_grid_winners,
+    summarize_threshold_crossings,
     summarize_mcmc_objective_grid_configs,
     load_selected_scenarios,
 )
@@ -240,6 +242,72 @@ def test_saved_beta_outputs_can_be_reloaded_and_replotted(tmp_path):
     assert all(path.exists() for path in regen.values())
     _assert_same_png_pixels(out_dir / "beta_max_budget.png", regen["beta_max_budget"])
     _assert_same_png_pixels(out_dir / "beta_convergence.png", regen["beta_convergence"])
+
+
+def test_threshold_crossing_summary_counts_downward_events():
+    records = [
+        {"label": "a", "replicate": 0, "checkpoint": 1, "estimate": 1.2},
+        {"label": "a", "replicate": 0, "checkpoint": 2, "estimate": 0.8},
+        {"label": "a", "replicate": 0, "checkpoint": 3, "estimate": 1.1},
+        {"label": "a", "replicate": 0, "checkpoint": 4, "estimate": 0.7},
+        {"label": "a", "replicate": 1, "checkpoint": 1, "estimate": 0.9},
+        {"label": "a", "replicate": 1, "checkpoint": 2, "estimate": 0.6},
+        {"label": "a", "replicate": 1, "checkpoint": 4, "estimate": 0.5},
+        {"label": "b", "replicate": 0, "checkpoint": 1, "estimate": 1.2},
+        {"label": "b", "replicate": 0, "checkpoint": 2, "estimate": 1.1},
+        {"label": "b", "replicate": 0, "checkpoint": 4, "estimate": 0.9},
+    ]
+
+    rows = summarize_threshold_crossings(
+        records,
+        known_significance_threshold=1.0,
+        checkpoints=(2, 4),
+        method_order=("a", "b"),
+    )
+    lookup = {(row["method"], row["checkpoint"]): row for row in rows}
+
+    assert lookup[("a", 2)]["below_threshold_at_checkpoint"] == 2
+    assert lookup[("a", 2)]["above_threshold_at_checkpoint"] == 0
+    assert lookup[("a", 2)]["down_crossing_events_into_checkpoint"] == 1
+    assert lookup[("a", 4)]["cumulative_down_crossing_events"] == 2
+    assert lookup[("a", 4)]["runs_ever_down_crossed_by_checkpoint"] == 1
+    assert lookup[("b", 2)]["above_threshold_at_checkpoint"] == 1
+    assert lookup[("b", 2)]["runs_ever_down_crossed_by_checkpoint"] == 0
+    assert lookup[("b", 4)]["down_crossing_events_into_checkpoint"] == 1
+
+
+def test_near_threshold_checkpoint_boxplot_writes_png(tmp_path):
+    records = [
+        {"label": "a", "replicate": 0, "checkpoint": 1, "estimate": 1.2},
+        {"label": "a", "replicate": 0, "checkpoint": 2, "estimate": 0.8},
+        {"label": "a", "replicate": 1, "checkpoint": 1, "estimate": 0.9},
+        {"label": "a", "replicate": 1, "checkpoint": 2, "estimate": 0.6},
+        {"label": "b", "replicate": 0, "checkpoint": 1, "estimate": 1.2},
+        {"label": "b", "replicate": 0, "checkpoint": 2, "estimate": 1.1},
+        {"label": "b", "replicate": 1, "checkpoint": 1, "estimate": 1.3},
+        {"label": "b", "replicate": 1, "checkpoint": 2, "estimate": 0.7},
+    ]
+    plot_path = tmp_path / "near_threshold.png"
+
+    rows = plot_near_threshold_checkpoint_boxplots(
+        records,
+        scenario_name="Toy near-threshold",
+        scenario_key="toy",
+        exact_p=0.85,
+        known_significance_threshold=1.0,
+        checkpoints=(1, 2),
+        method_order=("a", "b"),
+        method_labels={"a": "Method A", "b": "Method B"},
+        method_colors={"a": "#4c8c77", "b": "#b04a5a"},
+        save_path=plot_path,
+    )
+
+    assert plot_path.exists()
+    assert any(row["runs_ever_down_crossed_by_checkpoint"] == 1 for row in rows)
+    assert all("relative_rmse_at_checkpoint" in row for row in rows)
+    img = mpimg.imread(plot_path)
+    assert img.shape[0] > 0
+    assert img.shape[1] > 0
 
 
 def test_cross_method_parallel_matches_serial():

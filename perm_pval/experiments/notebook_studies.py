@@ -1107,6 +1107,20 @@ def _record_group_label(row: dict[str, Any]) -> str:
     raise KeyError("record must contain either 'label' or 'method'.")
 
 
+def _method_order_from_records(
+    records: list[dict[str, Any]],
+    method_order: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    if method_order is not None:
+        return [str(method) for method in method_order]
+    seen: list[str] = []
+    for row in records:
+        label = _record_group_label(row)
+        if label not in seen:
+            seen.append(label)
+    return seen
+
+
 def _stat_label(problem: PermutationTestProblem) -> str:
     return str(getattr(problem.statistic, "__name__", "statistic"))
 
@@ -4086,6 +4100,304 @@ def plot_cross_method_convergence(
     )
 
 
+def summarize_threshold_crossings(
+    records: list[dict[str, Any]],
+    *,
+    known_significance_threshold: float,
+    checkpoints: list[int] | tuple[int, ...],
+    method_order: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize down-crossings of a fixed threshold in saved trajectories."""
+    threshold = float(known_significance_threshold)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("known_significance_threshold must be a positive finite value.")
+    target_checkpoints = _sorted_unique_points(checkpoints)
+    methods = _method_order_from_records(records, method_order)
+    traces: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for idx, row in enumerate(records):
+        method = _record_group_label(row)
+        if method not in methods:
+            continue
+        run_id = row.get("replicate", row.get("seed", idx))
+        traces.setdefault((method, str(run_id)), []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for method in methods:
+        method_traces = [
+            sorted(rows, key=lambda item: int(item["checkpoint"]))
+            for (trace_method, _), rows in traces.items()
+            if trace_method == method
+        ]
+        for checkpoint in target_checkpoints:
+            n_at_checkpoint = 0
+            below_at_checkpoint = 0
+            down_into_checkpoint = 0
+            cumulative_down_events = 0
+            runs_ever_down = 0
+
+            for trace in method_traces:
+                finite_points: list[tuple[int, float]] = []
+                estimate_at_checkpoint: float | None = None
+                for row in trace:
+                    cp = int(row["checkpoint"])
+                    est = float(row.get("estimate", np.nan))
+                    if not np.isfinite(est):
+                        continue
+                    if cp <= int(checkpoint):
+                        finite_points.append((cp, est))
+                    if cp == int(checkpoint):
+                        estimate_at_checkpoint = est
+
+                if estimate_at_checkpoint is None:
+                    continue
+                n_at_checkpoint += 1
+                if estimate_at_checkpoint <= threshold:
+                    below_at_checkpoint += 1
+
+                event_checkpoints: list[int] = []
+                finite_points = sorted(finite_points, key=lambda item: item[0])
+                for (_, prev_est), (curr_cp, curr_est) in zip(finite_points, finite_points[1:]):
+                    if prev_est > threshold and curr_est <= threshold:
+                        event_checkpoints.append(int(curr_cp))
+                down_into_checkpoint += sum(1 for cp in event_checkpoints if cp == int(checkpoint))
+                cumulative_down_events += len(event_checkpoints)
+                if event_checkpoints:
+                    runs_ever_down += 1
+
+            out.append(
+                {
+                    "method": method,
+                    "checkpoint": int(checkpoint),
+                    "known_significance_threshold": threshold,
+                    "n_runs_at_checkpoint": int(n_at_checkpoint),
+                    "above_threshold_at_checkpoint": int(n_at_checkpoint - below_at_checkpoint),
+                    "below_threshold_at_checkpoint": int(below_at_checkpoint),
+                    "down_crossing_events_into_checkpoint": int(down_into_checkpoint),
+                    "cumulative_down_crossing_events": int(cumulative_down_events),
+                    "runs_ever_down_crossed_by_checkpoint": int(runs_ever_down),
+                }
+            )
+    return out
+
+
+def plot_near_threshold_checkpoint_boxplots(
+    records: list[dict[str, Any]],
+    *,
+    scenario_name: str,
+    exact_p: float,
+    known_significance_threshold: float,
+    checkpoints: list[int] | tuple[int, ...] = (1_000_000, 2_500_000, 5_000_000),
+    method_order: list[str] | tuple[str, ...] | None = None,
+    method_labels: dict[str, str] | None = None,
+    method_colors: dict[str, str] | None = None,
+    scenario_key: str | None = None,
+    n_control: int | None = None,
+    n_treated: int | None = None,
+    save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    target_checkpoints = _sorted_unique_points(checkpoints)
+    methods = _method_order_from_records(records, method_order)
+    if not methods:
+        raise ValueError("records contain no methods to plot.")
+    threshold = float(known_significance_threshold)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("known_significance_threshold must be a positive finite value.")
+    if method_labels is None:
+        method_labels = {}
+    if method_colors is None:
+        method_colors = {}
+
+    count_rows = summarize_threshold_crossings(
+        records,
+        known_significance_threshold=threshold,
+        checkpoints=target_checkpoints,
+        method_order=methods,
+    )
+    for row in count_rows:
+        method = str(row["method"])
+        checkpoint = int(row["checkpoint"])
+        values = np.asarray(
+            [
+                record.get("estimate", np.nan)
+                for record in records
+                if int(record["checkpoint"]) == checkpoint and _record_group_label(record) == method
+            ],
+            dtype=float,
+        )
+        values = values[np.isfinite(values)]
+        rmse = float(np.sqrt(np.mean((values - float(exact_p)) ** 2))) if values.size else float("nan")
+        row["rmse_at_checkpoint"] = rmse
+        row["relative_rmse_at_checkpoint"] = (
+            float(rmse / float(exact_p))
+            if np.isfinite(rmse) and np.isfinite(float(exact_p)) and float(exact_p) > 0.0
+            else float("nan")
+        )
+    count_lookup = {(str(row["method"]), int(row["checkpoint"])): row for row in count_rows}
+
+    fallback_colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(methods), 1)))
+    colors_by_method = {
+        method: str(method_colors.get(method, matplotlib.colors.to_hex(fallback_colors[idx])))
+        for idx, method in enumerate(methods)
+    }
+    labels_by_method = {method: str(method_labels.get(method, method)) for method in methods}
+    for method, label in list(labels_by_method.items()):
+        if label == "Simple-init MCMC-IS":
+            labels_by_method[method] = "MCMC-IS"
+
+    data: list[np.ndarray] = []
+    positions: list[float] = []
+    box_colors: list[str] = []
+    group_centers: list[float] = []
+    n_methods = len(methods)
+    group_width = float(n_methods + 1.0)
+
+    for checkpoint_idx, checkpoint in enumerate(target_checkpoints):
+        base = checkpoint_idx * group_width
+        group_positions = []
+        for method_idx, method in enumerate(methods):
+            x = base + method_idx + 1.0
+            group_positions.append(x)
+            values = np.asarray(
+                [
+                    row.get("estimate", np.nan)
+                    for row in records
+                    if int(row["checkpoint"]) == int(checkpoint) and _record_group_label(row) == method
+                ],
+                dtype=float,
+            )
+            data.append(_finite_for_plot(values))
+            positions.append(x)
+            box_colors.append(colors_by_method[method])
+        group_centers.append(float(np.mean(group_positions)))
+
+    fig, (ax, count_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(13.6, 7.65),
+        gridspec_kw={"height_ratios": [3.55, 0.82]},
+    )
+    artists = ax.boxplot(
+        data,
+        positions=positions,
+        widths=0.58,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": "#222222", "linewidth": 1.45},
+        whiskerprops={"color": "#6d7378", "linewidth": 1.0},
+        capprops={"color": "#6d7378", "linewidth": 1.0},
+        boxprops={"edgecolor": "#6d7378", "linewidth": 1.0},
+    )
+    for patch, color in zip(artists["boxes"], box_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.72)
+    for x, values, color in zip(positions, data, box_colors):
+        finite_values = np.asarray(values, dtype=float)
+        finite_values = np.sort(finite_values[np.isfinite(finite_values)])
+        if finite_values.size == 0:
+            continue
+        if finite_values.size == 1:
+            jitter = np.asarray([0.0], dtype=float)
+        else:
+            jitter = np.linspace(-0.12, 0.12, finite_values.size)
+        ax.scatter(
+            float(x) + jitter,
+            finite_values,
+            s=13,
+            color=color,
+            edgecolors="white",
+            linewidths=0.35,
+            alpha=0.62,
+            zorder=3.5,
+        )
+
+    ax.axhline(threshold, color="#7b2d26", linestyle="-", linewidth=1.35, zorder=2.2)
+    ax.axhline(float(exact_p), color="#000000", linestyle="--", linewidth=1.25, zorder=2.1)
+    for checkpoint_idx in range(1, len(target_checkpoints)):
+        ax.axvline(checkpoint_idx * group_width - 0.5, color="#d7dde0", linewidth=0.9, zorder=1.0)
+    ax.set_xticks(group_centers)
+    ax.set_xticklabels([_format_budget_tick_compact(cp) for cp in target_checkpoints])
+    ax.set_xlabel("Checkpoint budget")
+    ax.set_ylabel(r"$\hat{p}$")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    _set_linear_ylim(ax, data, include_values=[threshold, float(exact_p)], anchor_zero=False)
+    _style_article_axis(ax, grid_axis="y")
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=colors_by_method[method],
+            marker="s",
+            linestyle="",
+            markersize=8,
+            label=labels_by_method[method],
+        )
+        for method in methods
+    ]
+    handles.extend(
+        [
+            Line2D([0], [0], color="#7b2d26", linestyle="-", linewidth=1.35, label="Known threshold"),
+            Line2D([0], [0], color="#000000", linestyle="--", linewidth=1.25, label="True p-value"),
+        ]
+    )
+    ax.legend(handles=handles, frameon=False, fontsize=9.4, ncol=min(len(handles), 5), loc="upper right")
+
+    table_text = []
+    for method in methods:
+        row_text = []
+        for checkpoint in target_checkpoints:
+            count_row = count_lookup[(method, int(checkpoint))]
+            above = int(count_row["above_threshold_at_checkpoint"])
+            n_runs_at_checkpoint = int(count_row["n_runs_at_checkpoint"])
+            rel_rmse = float(count_row["relative_rmse_at_checkpoint"])
+            rel_rmse_label = f"{rel_rmse:.2f}" if np.isfinite(rel_rmse) else "nan"
+            row_text.append(f"{above}/{n_runs_at_checkpoint} | {rel_rmse_label}")
+        table_text.append(row_text)
+    count_ax.set_facecolor("white")
+    count_ax.axis("off")
+    table = count_ax.table(
+        cellText=table_text,
+        rowLabels=[labels_by_method[method] for method in methods],
+        colLabels=[_format_budget_tick_compact(cp) for cp in target_checkpoints],
+        cellLoc="center",
+        rowLoc="right",
+        loc="center",
+        bbox=[0.0, 0.0, 1.0, 0.86],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8.9)
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_facecolor("white")
+        cell.set_edgecolor("#d7dde0")
+        cell.set_linewidth(0.75)
+        cell.PAD = 0.035
+        if row_idx == 0 or col_idx == -1:
+            cell.set_text_props(fontweight="semibold")
+    count_ax.set_title("Above TH count | RRMSE", fontsize=10.6, pad=4)
+
+    n_runs = max((int(row["n_runs_at_checkpoint"]) for row in count_rows), default=0)
+    fig.suptitle(
+        _compact_plot_title(
+            scenario_name,
+            scenario_key=scenario_key,
+            n_control=n_control,
+            n_treated=n_treated,
+            exact_p=float(exact_p),
+            known_significance_threshold=threshold,
+            n_runs=n_runs,
+        ),
+        fontsize=14,
+        fontweight="semibold",
+        y=0.99,
+    )
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+    return count_rows
+
+
 def plot_cross_method_diagnostics(
     summary: list[dict[str, Any]],
     *,
@@ -4535,6 +4847,105 @@ def load_cross_method_saved_output(output_dir: Path) -> dict[str, Any]:
         "metadata": metadata,
         "summary": summary,
         "records": records,
+    }
+
+
+def _known_threshold_from_saved_metadata(metadata: dict[str, Any]) -> float | None:
+    containers = [
+        metadata.get("scenario_portfolio", {}),
+        metadata.get("beta_reference", {}),
+        metadata,
+    ]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ("known_significance_threshold", "canonical_threshold_p0"):
+            value = container.get(key)
+            if value is None:
+                continue
+            threshold = float(value)
+            if np.isfinite(threshold) and threshold > 0.0:
+                return threshold
+    return None
+
+
+def _is_near_threshold_saved_metadata(metadata: dict[str, Any]) -> bool:
+    portfolio = metadata.get("scenario_portfolio", {})
+    if not isinstance(portfolio, dict):
+        return False
+    if str(portfolio.get("threshold_band", "")).lower() == "near":
+        return True
+    groups = {str(group).lower() for group in portfolio.get("groups", [])}
+    return any(group.endswith("_near") or group.endswith("_threshold_suite_near") for group in groups)
+
+
+def regenerate_near_threshold_checkpoint_visualizations_from_saved_run(
+    run_dir: Path,
+    *,
+    save_dir: Path | None = None,
+    checkpoints: list[int] | tuple[int, ...] = (1_000_000, 2_500_000, 5_000_000),
+) -> dict[str, Any]:
+    run_dir = Path(run_dir)
+    save_dir = Path(save_dir) if save_dir is not None else run_dir / "near_threshold_visualizations"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    plots: dict[str, Path] = {}
+    all_counts: list[dict[str, Any]] = []
+    for scenario_dir in sorted(path for path in run_dir.iterdir() if path.is_dir()):
+        metadata_path = scenario_dir / "metadata.json"
+        records_path = scenario_dir / "run_records.jsonl"
+        summary_path = scenario_dir / "summary.json"
+        if not (metadata_path.exists() and records_path.exists() and summary_path.exists()):
+            continue
+        metadata = read_json(metadata_path)
+        if not _is_near_threshold_saved_metadata(metadata):
+            continue
+        threshold = _known_threshold_from_saved_metadata(metadata)
+        if threshold is None:
+            continue
+
+        saved = load_cross_method_saved_output(scenario_dir)
+        scenario_key = str(metadata.get("scenario", scenario_dir.name))
+        plot_path = save_dir / f"{scenario_key}_checkpoint_boxplots.png"
+        count_rows = plot_near_threshold_checkpoint_boxplots(
+            saved["records"],
+            scenario_name=str(metadata["scenario_display"]),
+            scenario_key=scenario_key,
+            exact_p=float(metadata["exact_p"]),
+            known_significance_threshold=float(threshold),
+            checkpoints=checkpoints,
+            method_order=list(metadata.get("method_order", [])) or None,
+            method_labels=dict(metadata.get("method_labels", {})),
+            method_colors=dict(metadata.get("method_colors", {})),
+            n_control=int(metadata["n_control"]) if metadata.get("n_control") is not None else None,
+            n_treated=int(metadata["n_treated"]) if metadata.get("n_treated") is not None else None,
+            save_path=plot_path,
+        )
+        plots[scenario_key] = plot_path
+        for row in count_rows:
+            enriched = dict(row)
+            enriched["scenario"] = scenario_key
+            enriched["scenario_display"] = str(metadata["scenario_display"])
+            enriched["threshold_band"] = str(metadata.get("scenario_portfolio", {}).get("threshold_band", ""))
+            all_counts.append(enriched)
+
+    counts_path = save_dir / "threshold_crossing_counts.json"
+    write_json(counts_path, all_counts)
+    manifest_path = save_dir / "manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "run_dir": run_dir,
+            "checkpoints": [int(v) for v in _sorted_unique_points(checkpoints)],
+            "plots": plots,
+            "counts_path": counts_path,
+        },
+    )
+    return {
+        "plots": plots,
+        "counts": all_counts,
+        "counts_path": counts_path,
+        "manifest_path": manifest_path,
     }
 
 
