@@ -4182,6 +4182,81 @@ def summarize_threshold_crossings(
     return out
 
 
+def _latex_escape(text: str) -> str:
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    return "".join(replacements.get(ch, ch) for ch in str(text))
+
+
+def _latex_label_slug(text: str) -> str:
+    chars = []
+    for ch in str(text).lower():
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in {"_", "-", " ", "."}:
+            chars.append("_")
+    slug = "".join(chars).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug or "checkpoint_summary"
+
+
+def _write_checkpoint_table_latex(
+    path: Path,
+    *,
+    title: str,
+    scenario_key: str | None,
+    count_label: str,
+    method_labels: list[str],
+    checkpoint_labels: list[str],
+    table_text: list[list[str]],
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tabular_cols = "l" + ("c" * len(checkpoint_labels))
+    caption = (
+        f"{title}: {count_label} and relative RMSE by checkpoint. "
+        "Each cell reports count/trials | RRMSE."
+    )
+    label_key = scenario_key if scenario_key is not None else title
+    lines = [
+        r"\begin{table}[t]",
+        r"\centering",
+        rf"\caption{{{_latex_escape(caption)}}}",
+        rf"\label{{tab:{_latex_label_slug(label_key)}_checkpoint_summary}}",
+        rf"\begin{{tabular}}{{{tabular_cols}}}",
+        r"\toprule",
+        "Method & " + " & ".join(_latex_escape(label) for label in checkpoint_labels) + r" \\",
+        r"\midrule",
+    ]
+    for method_label, values in zip(method_labels, table_text):
+        lines.append(
+            _latex_escape(method_label)
+            + " & "
+            + " & ".join(_latex_escape(value) for value in values)
+            + r" \\"
+        )
+    lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\end{table}",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def plot_near_threshold_checkpoint_boxplots(
     records: list[dict[str, Any]],
     *,
@@ -4197,6 +4272,8 @@ def plot_near_threshold_checkpoint_boxplots(
     n_treated: int | None = None,
     threshold_count: str = "above",
     save_path: Path | None = None,
+    table_save_path: Path | None = None,
+    table_tex_save_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     target_checkpoints = _sorted_unique_points(checkpoints)
     methods = _method_order_from_records(records, method_order)
@@ -4276,22 +4353,17 @@ def plot_near_threshold_checkpoint_boxplots(
             box_colors.append(colors_by_method[method])
         group_centers.append(float(np.mean(group_positions)))
 
-    fig, (ax, count_ax) = plt.subplots(
-        2,
-        1,
-        figsize=(13.6, 7.65),
-        gridspec_kw={"height_ratios": [3.55, 0.82]},
-    )
+    fig, ax = plt.subplots(figsize=(11.2, 6.25))
     artists = ax.boxplot(
         data,
         positions=positions,
-        widths=0.58,
+        widths=0.62,
         patch_artist=True,
         showfliers=False,
-        medianprops={"color": "#222222", "linewidth": 1.45},
-        whiskerprops={"color": "#6d7378", "linewidth": 1.0},
-        capprops={"color": "#6d7378", "linewidth": 1.0},
-        boxprops={"edgecolor": "#6d7378", "linewidth": 1.0},
+        medianprops={"color": "#222222", "linewidth": 2.0},
+        whiskerprops={"color": "#6d7378", "linewidth": 1.3},
+        capprops={"color": "#6d7378", "linewidth": 1.3},
+        boxprops={"edgecolor": "#6d7378", "linewidth": 1.2},
     )
     for patch, color in zip(artists["boxes"], box_colors):
         patch.set_facecolor(color)
@@ -4308,25 +4380,27 @@ def plot_near_threshold_checkpoint_boxplots(
         ax.scatter(
             float(x) + jitter,
             finite_values,
-            s=13,
+            s=20,
             color=color,
             edgecolors="white",
-            linewidths=0.35,
+            linewidths=0.45,
             alpha=0.62,
             zorder=3.5,
         )
 
-    ax.axhline(threshold, color="#7b2d26", linestyle="-", linewidth=1.35, zorder=2.2)
-    ax.axhline(float(exact_p), color="#000000", linestyle="--", linewidth=1.25, zorder=2.1)
+    ax.axhline(threshold, color="#7b2d26", linestyle="-", linewidth=1.8, zorder=2.2)
+    ax.axhline(float(exact_p), color="#000000", linestyle="--", linewidth=1.7, zorder=2.1)
     for checkpoint_idx in range(1, len(target_checkpoints)):
-        ax.axvline(checkpoint_idx * group_width - 0.5, color="#d7dde0", linewidth=0.9, zorder=1.0)
+        ax.axvline(checkpoint_idx * group_width - 0.5, color="#d7dde0", linewidth=1.05, zorder=1.0)
     ax.set_xticks(group_centers)
     ax.set_xticklabels([_format_budget_tick_compact(cp) for cp in target_checkpoints])
-    ax.set_xlabel("Checkpoint budget")
-    ax.set_ylabel(r"$\hat{p}$")
+    ax.set_xlabel("Checkpoint budget", fontsize=15)
+    ax.set_ylabel(r"$\hat{p}$", fontsize=15)
     ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
     _set_linear_ylim(ax, data, include_values=[threshold, float(exact_p)], anchor_zero=False)
     _style_article_axis(ax, grid_axis="y")
+    ax.tick_params(axis="both", labelsize=13)
+    ax.yaxis.get_offset_text().set_fontsize(13)
 
     handles = [
         Line2D(
@@ -4335,18 +4409,18 @@ def plot_near_threshold_checkpoint_boxplots(
             color=colors_by_method[method],
             marker="s",
             linestyle="",
-            markersize=8,
+            markersize=9.5,
             label=labels_by_method[method],
         )
         for method in methods
     ]
     handles.extend(
         [
-            Line2D([0], [0], color="#7b2d26", linestyle="-", linewidth=1.35, label="Known threshold"),
-            Line2D([0], [0], color="#000000", linestyle="--", linewidth=1.25, label="True p-value"),
+            Line2D([0], [0], color="#7b2d26", linestyle="-", linewidth=1.8, label="Known threshold"),
+            Line2D([0], [0], color="#000000", linestyle="--", linewidth=1.7, label="True p-value"),
         ]
     )
-    ax.legend(handles=handles, frameon=False, fontsize=9.4, ncol=min(len(handles), 5), loc="upper right")
+    ax.legend(handles=handles, frameon=False, fontsize=12.4, ncol=min(len(handles), 5), loc="upper right")
 
     table_text = []
     count_key = f"{threshold_count}_threshold_at_checkpoint"
@@ -4361,48 +4435,52 @@ def plot_near_threshold_checkpoint_boxplots(
             rel_rmse_label = f"{rel_rmse:.2f}" if np.isfinite(rel_rmse) else "nan"
             row_text.append(f"{threshold_count_value}/{n_runs_at_checkpoint} | {rel_rmse_label}")
         table_text.append(row_text)
-    count_ax.set_facecolor("white")
-    count_ax.axis("off")
-    table = count_ax.table(
-        cellText=table_text,
-        rowLabels=[labels_by_method[method] for method in methods],
-        colLabels=[_format_budget_tick_compact(cp) for cp in target_checkpoints],
-        cellLoc="center",
-        rowLoc="right",
-        loc="center",
-        bbox=[0.0, 0.0, 1.0, 0.86],
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(8.9)
-    for (row_idx, col_idx), cell in table.get_celld().items():
-        cell.set_facecolor("white")
-        cell.set_edgecolor("#d7dde0")
-        cell.set_linewidth(0.75)
-        cell.PAD = 0.035
-        if row_idx == 0 or col_idx == -1:
-            cell.set_text_props(fontweight="semibold")
-    count_ax.set_title(f"{count_label} | RRMSE", fontsize=10.6, pad=4)
 
-    n_runs = max((int(row["n_runs_at_checkpoint"]) for row in count_rows), default=0)
-    fig.suptitle(
-        _compact_plot_title(
-            scenario_name,
-            scenario_key=scenario_key,
-            n_control=n_control,
-            n_treated=n_treated,
-            exact_p=float(exact_p),
-            known_significance_threshold=threshold,
-            n_runs=n_runs,
-        ),
-        fontsize=14,
-        fontweight="semibold",
-        y=0.99,
-    )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    title = _CROSS_METHOD_TITLES.get(str(scenario_key), " ".join(str(scenario_name).split()).rstrip("."))
+    title = str(title).replace("\n", " - ")
+    ax.set_title(title, fontsize=17, fontweight="semibold", pad=12)
+    plt.tight_layout()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=170, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+    if table_save_path is not None:
+        fig_table, table_ax = plt.subplots(figsize=(8.4, 1.95))
+        table_ax.set_facecolor("white")
+        table_ax.axis("off")
+        table_title = f"{title}: {count_label} | RRMSE"
+        table_ax.set_title(table_title, fontsize=14.5, fontweight="semibold", pad=8)
+        table = table_ax.table(
+            cellText=table_text,
+            rowLabels=[labels_by_method[method] for method in methods],
+            colLabels=[_format_budget_tick_compact(cp) for cp in target_checkpoints],
+            cellLoc="center",
+            rowLoc="right",
+            loc="center",
+            bbox=[0.0, 0.0, 1.0, 0.76],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(12.4)
+        for (row_idx, col_idx), cell in table.get_celld().items():
+            cell.set_facecolor("white")
+            cell.set_edgecolor("#d7dde0")
+            cell.set_linewidth(0.9)
+            cell.PAD = 0.045
+            if row_idx == 0 or col_idx == -1:
+                cell.set_text_props(fontweight="semibold")
+        table_save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_table.savefig(table_save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig_table)
+    if table_tex_save_path is not None:
+        _write_checkpoint_table_latex(
+            table_tex_save_path,
+            title=title,
+            scenario_key=scenario_key,
+            count_label=count_label,
+            method_labels=[labels_by_method[method] for method in methods],
+            checkpoint_labels=[_format_budget_tick_compact(cp) for cp in target_checkpoints],
+            table_text=table_text,
+        )
     return count_rows
 
 
@@ -4898,6 +4976,8 @@ def regenerate_near_threshold_checkpoint_visualizations_from_saved_run(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     plots: dict[str, Path] = {}
+    tables: dict[str, Path] = {}
+    table_tex: dict[str, Path] = {}
     all_counts: list[dict[str, Any]] = []
     for scenario_dir in sorted(path for path in run_dir.iterdir() if path.is_dir()):
         metadata_path = scenario_dir / "metadata.json"
@@ -4915,6 +4995,8 @@ def regenerate_near_threshold_checkpoint_visualizations_from_saved_run(
         saved = load_cross_method_saved_output(scenario_dir)
         scenario_key = str(metadata.get("scenario", scenario_dir.name))
         plot_path = save_dir / f"{scenario_key}_checkpoint_boxplots.png"
+        table_path = save_dir / f"{scenario_key}_checkpoint_table.png"
+        table_tex_path = save_dir / f"{scenario_key}_checkpoint_table.tex"
         count_rows = plot_near_threshold_checkpoint_boxplots(
             saved["records"],
             scenario_name=str(metadata["scenario_display"]),
@@ -4928,8 +5010,12 @@ def regenerate_near_threshold_checkpoint_visualizations_from_saved_run(
             n_control=int(metadata["n_control"]) if metadata.get("n_control") is not None else None,
             n_treated=int(metadata["n_treated"]) if metadata.get("n_treated") is not None else None,
             save_path=plot_path,
+            table_save_path=table_path,
+            table_tex_save_path=table_tex_path,
         )
         plots[scenario_key] = plot_path
+        tables[scenario_key] = table_path
+        table_tex[scenario_key] = table_tex_path
         for row in count_rows:
             enriched = dict(row)
             enriched["scenario"] = scenario_key
@@ -4946,11 +5032,15 @@ def regenerate_near_threshold_checkpoint_visualizations_from_saved_run(
             "run_dir": run_dir,
             "checkpoints": [int(v) for v in _sorted_unique_points(checkpoints)],
             "plots": plots,
+            "tables": tables,
+            "table_tex": table_tex,
             "counts_path": counts_path,
         },
     )
     return {
         "plots": plots,
+        "tables": tables,
+        "table_tex": table_tex,
         "counts": all_counts,
         "counts_path": counts_path,
         "manifest_path": manifest_path,

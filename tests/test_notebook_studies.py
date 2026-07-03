@@ -288,6 +288,8 @@ def test_near_threshold_checkpoint_boxplot_writes_png(tmp_path):
         {"label": "b", "replicate": 1, "checkpoint": 2, "estimate": 0.7},
     ]
     plot_path = tmp_path / "near_threshold.png"
+    table_path = tmp_path / "near_threshold_table.png"
+    table_tex_path = tmp_path / "near_threshold_table.tex"
 
     rows = plot_near_threshold_checkpoint_boxplots(
         records,
@@ -301,9 +303,16 @@ def test_near_threshold_checkpoint_boxplot_writes_png(tmp_path):
         method_colors={"a": "#4c8c77", "b": "#b04a5a"},
         threshold_count="below",
         save_path=plot_path,
+        table_save_path=table_path,
+        table_tex_save_path=table_tex_path,
     )
 
     assert plot_path.exists()
+    assert table_path.exists()
+    assert table_tex_path.exists()
+    table_tex = table_tex_path.read_text(encoding="utf-8")
+    assert "\\begin{table}" in table_tex
+    assert "Below TH count" in table_tex
     assert any(row["runs_ever_down_crossed_by_checkpoint"] == 1 for row in rows)
     assert all("relative_rmse_at_checkpoint" in row for row in rows)
     img = mpimg.imread(plot_path)
