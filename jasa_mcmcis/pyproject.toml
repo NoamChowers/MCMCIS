@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jasa-mcmcis"
+version = "0.1.0"
+description = "MCMC importance sampling and SAMC for rare permutation-test p-values"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["jasa_mcmcis*"]
+
+[tool.setuptools.package-data]
+jasa_mcmcis = [
+  "data/scenarios/catalog.json",
+  "data/scenarios/*/metadata.json",
+  "data/scenarios/*/X.npy",
+  "data/scenarios/*/y_obs.npy",
+]

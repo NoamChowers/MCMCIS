@@ -1,0 +1,50 @@
+{
+  "key": "poisson_diffmeans_hep_ultra_n200",
+  "description": "Poisson count benchmark resembling a high-energy-physics counting test: treated~Pois(3), control~Pois(2), n1=n2=100, with p-value far below the 3e-7 discovery threshold.",
+  "statistic_name": "difference_in_means",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 200,
+  "n_treated": 100,
+  "n_control": 100,
+  "t_obs": 1.34,
+  "exact_method": "LinearStatisticDPSolver",
+  "exact_p_value": 3.759362681508888e-09,
+  "tail_hits": 340404706864215331474988902935490120423526713614768,
+  "n_permutations": 90548514656103281165404177077484163874504589675413336841320,
+  "notes": "Deterministic benchmark dataset generated from Poisson draws with fixed seed; right-tail test on mean(group1)-mean(group0).",
+  "extra": {
+    "n_pois2": 100,
+    "n_pois3": 100,
+    "lambda_low": 2.0,
+    "lambda_high": 3.0,
+    "treated_block": "pois3_second_block",
+    "seed": 57,
+    "mean_pois2": 1.91,
+    "mean_pois3": 3.25,
+    "known_significance_threshold": 3e-07,
+    "application_setting_key": "hep_threshold_suite",
+    "application_setting_label": "HEP-like Poisson count test",
+    "threshold_band": "ultra"
+  },
+  "portfolio": {
+    "family": "poisson_count",
+    "statistic_family": "linear_statistic",
+    "data_family": "count",
+    "rarity_band": "ultra_rare",
+    "expected_difficulty": "moderate",
+    "sample_size_band": "large",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact",
+      "threshold_suite",
+      "hep_threshold_suite",
+      "hep_threshold_suite_ultra"
+    ],
+    "known_significance_threshold": 3e-07,
+    "application_setting_key": "hep_threshold_suite",
+    "application_setting_label": "HEP-like Poisson count test",
+    "threshold_band": "ultra"
+  }
+}
