@@ -299,6 +299,7 @@ def test_near_threshold_checkpoint_boxplot_writes_png(tmp_path):
         method_order=("a", "b"),
         method_labels={"a": "Method A", "b": "Method B"},
         method_colors={"a": "#4c8c77", "b": "#b04a5a"},
+        threshold_count="below",
         save_path=plot_path,
     )
 

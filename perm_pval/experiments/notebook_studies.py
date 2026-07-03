@@ -895,11 +895,13 @@ _CROSS_METHOD_TITLES: dict[str, str] = {
     "gwas_additive_score_n40": "GWAS-like additive score",
     "gwas_additive_score_ultra_n100": "GWAS-like additive score\nClearly Significant",
     "gwas_additive_score_sig_n100": "GWAS-like additive score\nNear-Threshold",
+    "gwas_additive_score_slight_above_n100": "GWAS-like additive score\nSlightly Non-Significant",
     "gwas_additive_score_above_n100": "GWAS-like additive score\nClearly Non-Significant",
     "hypergeom_1e7": "Hypergeometric count",
     "linear_stat_dp_n40": "Difference in means",
     "poisson_diffmeans_hep_ultra_n200": "HEP-like Poisson count\nClearly Significant",
     "poisson_diffmeans_hep_sig_n200": "HEP-like Poisson count\nNear-Threshold",
+    "poisson_diffmeans_hep_slight_above_n200": "HEP-like Poisson count\nSlightly Non-Significant",
     "poisson_diffmeans_hep_above_n200": "HEP-like Poisson count\nClearly Non-Significant",
     "rank_sum_dp_n40": "Mann-Whitney U",
 }
@@ -4193,6 +4195,7 @@ def plot_near_threshold_checkpoint_boxplots(
     scenario_key: str | None = None,
     n_control: int | None = None,
     n_treated: int | None = None,
+    threshold_count: str = "above",
     save_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     target_checkpoints = _sorted_unique_points(checkpoints)
@@ -4202,6 +4205,9 @@ def plot_near_threshold_checkpoint_boxplots(
     threshold = float(known_significance_threshold)
     if not np.isfinite(threshold) or threshold <= 0.0:
         raise ValueError("known_significance_threshold must be a positive finite value.")
+    threshold_count = str(threshold_count).lower()
+    if threshold_count not in {"above", "below"}:
+        raise ValueError("threshold_count must be either 'above' or 'below'.")
     if method_labels is None:
         method_labels = {}
     if method_colors is None:
@@ -4343,15 +4349,17 @@ def plot_near_threshold_checkpoint_boxplots(
     ax.legend(handles=handles, frameon=False, fontsize=9.4, ncol=min(len(handles), 5), loc="upper right")
 
     table_text = []
+    count_key = f"{threshold_count}_threshold_at_checkpoint"
+    count_label = "Above TH count" if threshold_count == "above" else "Below TH count"
     for method in methods:
         row_text = []
         for checkpoint in target_checkpoints:
             count_row = count_lookup[(method, int(checkpoint))]
-            above = int(count_row["above_threshold_at_checkpoint"])
+            threshold_count_value = int(count_row[count_key])
             n_runs_at_checkpoint = int(count_row["n_runs_at_checkpoint"])
             rel_rmse = float(count_row["relative_rmse_at_checkpoint"])
             rel_rmse_label = f"{rel_rmse:.2f}" if np.isfinite(rel_rmse) else "nan"
-            row_text.append(f"{above}/{n_runs_at_checkpoint} | {rel_rmse_label}")
+            row_text.append(f"{threshold_count_value}/{n_runs_at_checkpoint} | {rel_rmse_label}")
         table_text.append(row_text)
     count_ax.set_facecolor("white")
     count_ax.axis("off")
@@ -4373,7 +4381,7 @@ def plot_near_threshold_checkpoint_boxplots(
         cell.PAD = 0.035
         if row_idx == 0 or col_idx == -1:
             cell.set_text_props(fontweight="semibold")
-    count_ax.set_title("Above TH count | RRMSE", fontsize=10.6, pad=4)
+    count_ax.set_title(f"{count_label} | RRMSE", fontsize=10.6, pad=4)
 
     n_runs = max((int(row["n_runs_at_checkpoint"]) for row in count_rows), default=0)
     fig.suptitle(
