@@ -6,7 +6,13 @@ from jasa_mcmcis.beta import (
     init_beta_from_iid_pilot,
 )
 from jasa_mcmcis.exact import ExactPValueResult, LinearStatisticDPSolver
-from jasa_mcmcis.mcmcis import MCMCISResult, run_mcmc_is
+from jasa_mcmcis.mcmcis import (
+    MCMCISResult,
+    hard_step_beta_for_target_tail_mass,
+    hard_step_r_for_target_tail_mass,
+    run_hard_step_mcmc_is,
+    run_mcmc_is,
+)
 from jasa_mcmcis.problem import FixedGroupConstraint, PermutationTestProblem
 from jasa_mcmcis.samc import SAMCResult, run_samc
 from jasa_mcmcis.scenarios import (
@@ -44,10 +50,13 @@ __all__ = [
     "available_scenarios",
     "difference_in_means",
     "estimate_scale_T",
+    "hard_step_beta_for_target_tail_mass",
+    "hard_step_r_for_target_tail_mass",
     "iid_pilot_statistics",
     "init_beta_from_iid_pilot",
     "load_scenario",
     "load_scenarios",
+    "run_hard_step_mcmc_is",
     "run_mcmc_is",
     "run_samc",
     "treated_sum",

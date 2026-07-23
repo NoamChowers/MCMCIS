@@ -120,7 +120,7 @@ def _build_cross_method_notebook_legacy() -> dict:
             # Experiment: Cross-Method Tiny-p Study
 
             Objective:
-            - Compare `iid`, `mcmc_is`, and `samc` on fixed exact scenarios.
+            - Compare `iid`, `mcmc_is`, `hard_step`, and `samc` on fixed exact scenarios.
             - Track estimates and diagnostics at intermediate estimation points, not just at the final budget.
             """
         ),
@@ -132,6 +132,7 @@ def _build_cross_method_notebook_legacy() -> dict:
             `ESTIMATION_POINTS` controls the intermediate checkpoints.  
             The largest checkpoint is used for the main boxplots; all checkpoints are used for convergence diagnostics.  
             In the cross-method notebook these are total budgets. For MCMC-IS, a fixed beta-selection budget is deducted first, and the production chain uses the remaining budget.
+            The hard-step method uses the same local proposal kernel with `q = p0 ** d_alpha`, where `p0` is the scenario's known threshold when present.
             """
         ),
         code_cell(
@@ -404,6 +405,8 @@ def _build_cross_method_notebook_legacy() -> dict:
                     "mcmc_local_scan_swap_counts": scenario_mcmc_cfg.local_scan_swap_counts,
                     "mcmc_local_scan_objective": scenario_mcmc_cfg.local_scan_objective,
                     "mcmc_production_estimator_variant": scenario_mcmc_cfg.production_estimator_variant,
+                    "hard_step_enabled": scenario_mcmc_cfg.hard_step_enabled,
+                    "hard_step_target_tail_mass": scenario_mcmc_cfg.hard_step_target_tail_mass,
                     "target_beta_selection_budget": target_scan_budget_from_p0(reference_p0_for_scenario(scenario)),
                     "local_scan_screen_total_steps": scenario_mcmc_cfg.local_scan_screen_total_steps,
                     "local_scan_refine_total_steps": scenario_mcmc_cfg.local_scan_refine_total_steps,
@@ -432,6 +435,7 @@ def _build_cross_method_notebook_legacy() -> dict:
                     "mcmc_beta_selection_budget": study["mcmc_beta_selection_budget"],
                     "mcmc_reported_checkpoints": study.get("mcmc_reported_checkpoints", []),
                     "beta_used": study["beta_workflow"]["beta_used"],
+                    "hard_step_workflow": study.get("hard_step_workflow", {}),
                 }, indent=2))
                 summary_df = pd.DataFrame(study["summary"]).sort_values(["checkpoint", "method"])
                 display(summary_df[[

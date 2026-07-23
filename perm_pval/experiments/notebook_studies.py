@@ -27,6 +27,8 @@ from perm_pval.methods.beta_tuning import (
     init_beta_from_iid_pilot,
 )
 from perm_pval.methods.mcmc_is import (
+    hard_step_beta_for_target_tail_mass,
+    hard_step_r_for_target_tail_mass,
     right_tail_deficit_scaled,
     right_tail_step_shortfall,
     run_mcmc_is,
@@ -70,6 +72,10 @@ class MCMCWorkflowConfig:
     production_estimator_variant: str = "production_only"
     tilt_mode: str = "smooth_hinge"
     proposal_size: float | int = 0.075
+    hard_step_enabled: bool = True
+    hard_step_reference_p0: float | None = None
+    hard_step_target_tail_mass: float | None = None
+    hard_step_proposal_size: float | int | None = None
     local_scan_enabled: bool = True
     local_scan_strategy: str = "fixed_grid"
     local_scan_q_multipliers: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.10, 0.15, 0.25, 0.33)
@@ -197,6 +203,78 @@ def _to_loaded_scenario(s: ExactScenario) -> LoadedScenario:
         extra=dict(s.extra),
         portfolio=dict(getattr(s, "portfolio", {})),
     )
+
+
+def _valid_probability_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isfinite(val) and 0.0 < val < 1.0:
+        return val
+    return None
+
+
+def build_hard_step_workflow(scenario: LoadedScenario, cfg: MCMCWorkflowConfig) -> dict[str, Any]:
+    if not bool(cfg.hard_step_enabled):
+        return {"enabled": False}
+    if scenario.problem.tail != "right":
+        raise NotImplementedError("Hard-step cross-method tilt currently follows the right-tail MCMC-IS kernel.")
+
+    p0_source = "exact_p_fallback" if cfg.use_true_p0_for_q_target else "p0_guess_fallback"
+    p0_ref = float(scenario.exact_p) if cfg.use_true_p0_for_q_target else float(cfg.p0_guess)
+
+    if cfg.hard_step_reference_p0 is not None:
+        override = _valid_probability_or_none(cfg.hard_step_reference_p0)
+        if override is None:
+            raise ValueError("hard_step_reference_p0 must be finite and lie in (0, 1).")
+        p0_ref = float(override)
+        p0_source = "hard_step_reference_p0"
+    else:
+        for source, container in (
+            ("scenario_extra_known_significance_threshold", scenario.extra),
+            ("scenario_portfolio_known_significance_threshold", scenario.portfolio),
+        ):
+            if not isinstance(container, dict):
+                continue
+            threshold = _valid_probability_or_none(container.get("known_significance_threshold"))
+            if threshold is None:
+                threshold = _valid_probability_or_none(container.get("canonical_threshold_p0"))
+            if threshold is not None:
+                p0_ref = float(threshold)
+                p0_source = source
+                break
+
+    q_target = (
+        float(cfg.hard_step_target_tail_mass)
+        if cfg.hard_step_target_tail_mass is not None
+        else float(p0_ref ** float(cfg.d_alpha))
+    )
+    r = hard_step_r_for_target_tail_mass(p0_ref, q_target)
+    beta = hard_step_beta_for_target_tail_mass(p0_ref, q_target)
+    proposal_size = cfg.proposal_size if cfg.hard_step_proposal_size is None else cfg.hard_step_proposal_size
+    n_swap_pairs = resolve_n_swap_pairs(
+        scenario.problem.n_treated,
+        scenario.problem.n_control,
+        proposal_size=proposal_size,
+    )
+    return {
+        "enabled": True,
+        "reference_p0": float(p0_ref),
+        "reference_p0_source": p0_source,
+        "target_tail_mass": float(q_target),
+        "r": float(r),
+        "beta": float(beta),
+        "proposal_size": proposal_size,
+        "n_swap_pairs": int(n_swap_pairs),
+        "tilt_mode": "step",
+        "target_tail_mass_rule": (
+            "hard_step_target_tail_mass" if cfg.hard_step_target_tail_mass is not None else "p0_reference_power_d_alpha"
+        ),
+        "d_alpha": float(cfg.d_alpha),
+    }
 
 
 def load_selected_scenarios(
@@ -881,14 +959,18 @@ def _value_in_ylim(ax, value: float) -> bool:
 _CROSS_METHOD_LABELS: dict[str, str] = {
     "iid": "IID",
     "mcmc_is": "MCMC-IS",
+    "hard_step": "Hard-step IS",
     "samc": "SAMC",
 }
 
 _CROSS_METHOD_COLORS: dict[str, str] = {
     "iid": "#5b6c8f",
     "mcmc_is": "#c48a3a",
+    "hard_step": "#b04a5a",
     "samc": "#4c8c77",
 }
+
+_CROSS_METHOD_ORDER: list[str] = ["iid", "mcmc_is", "hard_step", "samc"]
 
 _CROSS_METHOD_TITLES: dict[str, str] = {
     "bruteforce_welch_nonextreme_n22": "Welch t-statistic",
@@ -1120,7 +1202,16 @@ def _method_order_from_records(
         label = _record_group_label(row)
         if label not in seen:
             seen.append(label)
+    if set(seen).issubset(set(_CROSS_METHOD_ORDER)):
+        return [method for method in _CROSS_METHOD_ORDER if method in seen]
     return seen
+
+
+def _available_cross_method_order(rows: list[dict[str, Any]]) -> list[str]:
+    present = {_record_group_label(row) for row in rows}
+    ordered = [method for method in _CROSS_METHOD_ORDER if method in present]
+    extras = sorted(present.difference(ordered))
+    return [*ordered, *extras]
 
 
 def _stat_label(problem: PermutationTestProblem) -> str:
@@ -3528,6 +3619,51 @@ def _mcmc_cross_replicate_worker(
     return rows
 
 
+def _hard_step_cross_replicate_worker(
+    *,
+    scenario_key: str,
+    scenario_display: str,
+    problem: PermutationTestProblem,
+    exact_p: float,
+    checkpoints: tuple[int, ...],
+    hard_step_workflow: dict[str, Any],
+    mcmc_cfg: MCMCWorkflowConfig,
+    rep: int,
+    rep_seed: int,
+) -> list[dict[str, Any]]:
+    worker_cfg = replace(
+        mcmc_cfg,
+        proposal_size=hard_step_workflow["proposal_size"],
+        tilt_mode="step",
+        local_scan_enabled=False,
+    )
+    rows = _run_mcmc_cumulative_checkpoints(
+        problem,
+        exact_p,
+        checkpoints=checkpoints,
+        beta=float(hard_step_workflow["beta"]),
+        sigma_t=1.0,
+        cfg=worker_cfg,
+        seed=rep_seed + 3,
+    )
+    for row in rows:
+        row["method"] = "hard_step"
+        row["scenario"] = scenario_key
+        row["scenario_display"] = scenario_display
+        row["replicate"] = int(rep)
+        row["beta_selection_budget"] = 0
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+        row["proposal_size"] = worker_cfg.proposal_size
+        row["n_swap_pairs"] = int(hard_step_workflow["n_swap_pairs"])
+        row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
+        row["hard_step_reference_p0"] = float(hard_step_workflow["reference_p0"])
+        row["hard_step_reference_p0_source"] = str(hard_step_workflow["reference_p0_source"])
+        row["hard_step_target_tail_mass"] = float(hard_step_workflow["target_tail_mass"])
+        row["hard_step_r"] = float(hard_step_workflow["r"])
+        row["hard_step_beta"] = float(hard_step_workflow["beta"])
+    return rows
+
+
 def _samc_replicate_worker(
     *,
     scenario_key: str,
@@ -3687,6 +3823,7 @@ def run_cross_method_study(
         seed=cross_cfg.base_seed + 10_000,
     )
     samc_setup = tune_samc_setup(scenario.problem, samc_cfg, seed=cross_cfg.base_seed + 20_000)
+    hard_step_workflow = build_hard_step_workflow(scenario, mcmc_cfg)
     beta_selection_budget = int(beta_workflow["beta_selection_eval_total"])
     mcmc_checkpoint_pairs = [
         (int(cp), int(cp - beta_selection_budget))
@@ -3728,6 +3865,21 @@ def run_cross_method_study(
                         mcmc_chain_checkpoints=mcmc_chain_checkpoints,
                         beta_workflow=beta_workflow,
                         beta_selection_budget=beta_selection_budget,
+                        mcmc_cfg=mcmc_cfg,
+                        rep=rep,
+                        rep_seed=rep_seed,
+                    )
+                )
+        if bool(hard_step_workflow.get("enabled", False)):
+            for rep, rep_seed in repeat_jobs:
+                records.extend(
+                    _hard_step_cross_replicate_worker(
+                        scenario_key=scenario.key,
+                        scenario_display=scenario.description,
+                        problem=scenario.problem,
+                        exact_p=scenario.exact_p,
+                        checkpoints=checkpoints,
+                        hard_step_workflow=hard_step_workflow,
                         mcmc_cfg=mcmc_cfg,
                         rep=rep,
                         rep_seed=rep_seed,
@@ -3787,6 +3939,25 @@ def run_cross_method_study(
                 for future in cf.as_completed(futures):
                     records.extend(future.result())
 
+            if bool(hard_step_workflow.get("enabled", False)):
+                futures = [
+                    executor.submit(
+                        _hard_step_cross_replicate_worker,
+                        scenario_key=scenario.key,
+                        scenario_display=scenario.description,
+                        problem=scenario.problem,
+                        exact_p=scenario.exact_p,
+                        checkpoints=checkpoints,
+                        hard_step_workflow=hard_step_workflow,
+                        mcmc_cfg=mcmc_cfg,
+                        rep=rep,
+                        rep_seed=rep_seed,
+                    )
+                    for rep, rep_seed in repeat_jobs
+                ]
+                for future in cf.as_completed(futures):
+                    records.extend(future.result())
+
             futures = [
                 executor.submit(
                     _samc_replicate_worker,
@@ -3824,6 +3995,7 @@ def run_cross_method_study(
         "beta_workflow": beta_workflow,
         "mcmc_beta_selection_budget": beta_selection_budget,
         "mcmc_reported_checkpoints": list(mcmc_reported_checkpoints),
+        "hard_step_workflow": hard_step_workflow,
         "samc_setup": {
             "lambda_min": float(samc_setup["lambda_min"]),
             "bin_edges": np.asarray(samc_setup["bin_edges"], dtype=float),
@@ -3934,7 +4106,7 @@ def plot_cross_method_max_budget(
         scenario_key=scenario_key,
         exact_p=exact_p,
         max_budget=max_budget,
-        method_order=["iid", "mcmc_is", "samc"],
+        method_order=_available_cross_method_order(records),
         method_labels=_CROSS_METHOD_LABELS,
         method_colors=_CROSS_METHOD_COLORS,
         n_control=n_control,
@@ -4091,7 +4263,7 @@ def plot_cross_method_convergence(
         scenario_name=scenario_name,
         scenario_key=scenario_key,
         exact_p=exact_p,
-        method_order=["iid", "mcmc_is", "samc"],
+        method_order=_available_cross_method_order(summary),
         method_labels=_CROSS_METHOD_LABELS,
         method_colors=_CROSS_METHOD_COLORS,
         n_control=n_control,
@@ -4495,6 +4667,7 @@ def plot_cross_method_diagnostics(
 
     iid = sorted([row for row in summary if row["method"] == "iid"], key=lambda row: row["checkpoint"])
     mcmc = sorted([row for row in summary if row["method"] == "mcmc_is"], key=lambda row: row["checkpoint"])
+    hard_step = sorted([row for row in summary if row["method"] == "hard_step"], key=lambda row: row["checkpoint"])
     samc = sorted([row for row in summary if row["method"] == "samc"], key=lambda row: row["checkpoint"])
 
     axes[0, 0].plot(
@@ -4512,24 +4685,44 @@ def plot_cross_method_diagnostics(
         [row["checkpoint"] for row in mcmc],
         [row["mean_q_tilt_tail_share"] for row in mcmc],
         marker="o",
-        color="#f28e2b",
+        color=_CROSS_METHOD_COLORS["mcmc_is"],
+        label=_CROSS_METHOD_LABELS["mcmc_is"],
     )
+    if hard_step:
+        axes[0, 1].plot(
+            [row["checkpoint"] for row in hard_step],
+            [row["mean_q_tilt_tail_share"] for row in hard_step],
+            marker="s",
+            color=_CROSS_METHOD_COLORS["hard_step"],
+            label=_CROSS_METHOD_LABELS["hard_step"],
+        )
     axes[0, 1].set_xscale("log")
-    axes[0, 1].set_title("MCMC-IS tilted-tail occupancy q")
+    axes[0, 1].set_title("Tilted-chain tail occupancy q")
     axes[0, 1].set_xlabel("iterations")
     axes[0, 1].set_ylabel("q_hat")
+    axes[0, 1].legend(frameon=False, fontsize=8.8)
 
     axes[1, 0].plot(
         [row["checkpoint"] for row in mcmc],
         [row["mean_ess"] for row in mcmc],
         marker="o",
-        color="#f28e2b",
+        color=_CROSS_METHOD_COLORS["mcmc_is"],
+        label=_CROSS_METHOD_LABELS["mcmc_is"],
     )
+    if hard_step:
+        axes[1, 0].plot(
+            [row["checkpoint"] for row in hard_step],
+            [row["mean_ess"] for row in hard_step],
+            marker="s",
+            color=_CROSS_METHOD_COLORS["hard_step"],
+            label=_CROSS_METHOD_LABELS["hard_step"],
+        )
     axes[1, 0].set_xscale("log")
     axes[1, 0].set_yscale("log")
-    axes[1, 0].set_title("MCMC-IS ESS")
+    axes[1, 0].set_title("IS ESS")
     axes[1, 0].set_xlabel("iterations")
     axes[1, 0].set_ylabel("ESS")
+    axes[1, 0].legend(frameon=False, fontsize=8.8)
 
     axes[1, 1].plot(
         [row["checkpoint"] for row in samc],
@@ -4829,10 +5022,14 @@ def save_cross_method_outputs(
             "n_total": int(scenario.problem.n),
             "estimation_points": study["estimation_points"],
             "mcmc_reported_checkpoints": study.get("mcmc_reported_checkpoints", study["estimation_points"]),
+            "method_order": _available_cross_method_order(study["records"]),
+            "method_labels": _CROSS_METHOD_LABELS,
+            "method_colors": _CROSS_METHOD_COLORS,
             "cross_config": cross_cfg,
             "mcmc_config": mcmc_cfg,
             "samc_config": samc_cfg,
             "beta_workflow": beta_workflow_payload,
+            "hard_step_workflow": study.get("hard_step_workflow", {"enabled": False}),
             "samc_setup": study["samc_setup"],
             "iid_density_summary": study["iid_density_summary"],
         },

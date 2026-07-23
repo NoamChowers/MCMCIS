@@ -98,6 +98,29 @@ def make_beta_ladder(
     return np.geomspace(min_beta, max_beta, n_levels, dtype=float)
 
 
+def hard_step_r_for_target_tail_mass(p0: float, q: float) -> float:
+    """
+    Tail multiplier for pi_r(y) ∝ f(y) * {1 + (r - 1) 1_A(y)}.
+
+    If f(A) = p0, then pi_r(A) = q when
+        r = q * (1 - p0) / (p0 * (1 - q)).
+    """
+    p0_f = float(p0)
+    q_f = float(q)
+    if not np.isfinite(p0_f) or not 0.0 < p0_f < 1.0:
+        raise ValueError("p0 must be finite and lie in (0, 1).")
+    if not np.isfinite(q_f) or not 0.0 < q_f < 1.0:
+        raise ValueError("q must be finite and lie in (0, 1).")
+    if q_f <= p0_f:
+        raise ValueError("q must exceed p0 for a tail-upweighting hard-step tilt.")
+    return float((q_f * (1.0 - p0_f)) / (p0_f * (1.0 - q_f)))
+
+
+def hard_step_beta_for_target_tail_mass(p0: float, q: float) -> float:
+    """Equivalent ``tilt_mode='step'`` beta, where beta = log(r)."""
+    return float(np.log(hard_step_r_for_target_tail_mass(p0, q)))
+
+
 def _run_single_chain(
     problem: PermutationTestProblem,
     rng: np.random.Generator,
@@ -374,4 +397,44 @@ def run_mcmc_is(
         log_weights=log_weights,
         tail_indicators=tail_indicators,
         final_states=final_states,
+    )
+
+
+def run_hard_step_mcmc_is(
+    problem: PermutationTestProblem,
+    *,
+    p0: float,
+    q: float,
+    n_steps: int,
+    burn_in: int = 0,
+    thin: int = 1,
+    n_chains: int = 1,
+    seed: Optional[int] = None,
+    init: str | np.ndarray | list[np.ndarray] | tuple[np.ndarray, ...] = "random",
+    proposal_size: float | int = 0.075,
+    estimate_variance: bool = True,
+    obm_batch_size: int | None = None,
+) -> MCMCISResult:
+    """
+    MCMC-IS under a hard-step tail tilt fixed by a reference tail mass ``p0``.
+
+    The target distribution is proportional to
+    ``f(y) * {1 + (r - 1) 1_A(y)}``, where ``A`` is the right-tail event.
+    This is equivalent to ``run_mcmc_is(..., tilt_mode='step', beta=log(r))``.
+    """
+    beta = hard_step_beta_for_target_tail_mass(p0, q)
+    return run_mcmc_is(
+        problem,
+        beta=beta,
+        sigma_t=1.0,
+        n_steps=n_steps,
+        burn_in=burn_in,
+        thin=thin,
+        n_chains=n_chains,
+        seed=seed,
+        init=init,
+        tilt_mode="step",
+        proposal_size=proposal_size,
+        estimate_variance=estimate_variance,
+        obm_batch_size=obm_batch_size,
     )

@@ -5,6 +5,8 @@ p-value estimation. It contains:
 
 - MCMC importance sampling (MCMC-IS) for fixed-size binary-label permutation
   tests, using a tilted distribution and self-normalized importance weights.
+- Hard-step MCMC-IS, using a known reference threshold `p0` to set a fixed
+  tail multiplier.
 - Stochastic Approximation Monte Carlo (SAMC) as a comparison method.
 - The six frozen article scenarios plus 200 threshold-bin scenarios for
   cross-method comparisons.
@@ -99,6 +101,26 @@ result = run_mcmc_is(
 print(result.estimate, result.mcse_obm, result.ess)
 ```
 
+The hard-step variant uses `pi_r(y) ∝ f(y) * {1 + (r - 1) 1_A(y)}`. If
+`f(A)=p0`, then `r = q(1 - p0) / (p0(1 - q))` targets `pi_r(A)=q`:
+
+```python
+from jasa_mcmcis import run_hard_step_mcmc_is
+
+p0 = scenario.extra["known_significance_threshold"]
+q = p0 ** (1 / 3)
+hard_step = run_hard_step_mcmc_is(
+    problem,
+    p0=p0,
+    q=q,
+    n_steps=50_000,
+    burn_in=10_000,
+    n_chains=2,
+    proposal_size=5,
+    seed=123,
+)
+```
+
 For the article's simple threshold-suite rule, use proposal size `2` for GWAS
 scenarios and `5` for Poisson/HEP scenarios. The `proposal_size` argument also
 accepts a fraction of the smaller group size.
@@ -146,6 +168,8 @@ reproducibility aid, not part of the data-generation pipeline.
 - `PermutationTestProblem(x, y_obs, statistic, tail="right")`: fixed-size
   permutation-test problem.
 - `run_mcmc_is(problem, beta, sigma_t, n_steps, ...)`: tilted MCMC-IS estimator.
+- `run_hard_step_mcmc_is(problem, p0, q, n_steps, ...)`: hard-step MCMC-IS
+  estimator with `r` determined by the reference threshold and target tail mass.
 - `run_samc(problem, n_steps, ...)`: SAMC estimator for right-tail tests.
 - `iid_pilot_statistics`, `estimate_scale_T`, `init_beta_from_iid_pilot`:
   lightweight beta initialization helpers.

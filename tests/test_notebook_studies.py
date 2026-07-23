@@ -15,6 +15,7 @@ from perm_pval.experiments.notebook_studies import (
     MCMCWorkflowConfig,
     MCMC_OBJECTIVE_GRID_REALISTIC_OBJECTIVES,
     SAMCWorkflowConfig,
+    build_hard_step_workflow,
     build_beta_workflow,
     build_mcmc_objective_grid_candidates,
     load_beta_sweep_saved_output,
@@ -123,9 +124,9 @@ def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
         _small_samc_cfg(),
     )
 
-    assert len(study["records"]) == 2 * 3
+    assert len(study["records"]) == 2 * 4
     assert sorted({row["checkpoint"] for row in study["records"]}) == [500, 800]
-    assert sorted({row["method"] for row in study["records"]}) == ["iid", "mcmc_is", "samc"]
+    assert sorted({row["method"] for row in study["records"]}) == ["hard_step", "iid", "mcmc_is", "samc"]
     assert int(study["mcmc_beta_selection_budget"]) > 0
     mcmc_rows = [row for row in study["records"] if row["method"] == "mcmc_is"]
     assert all(int(row["mcmc_chain_budget"]) < int(row["checkpoint"]) for row in mcmc_rows)
@@ -137,6 +138,28 @@ def test_run_cross_method_study_emits_rows_for_all_methods_and_checkpoints():
     assert all("samc_estimate_no_empty_bin_correction" in row for row in samc_rows)
     assert all("samc_empty_bin_correction_delta" in row for row in samc_rows)
     assert all("samc_empty_bin_correction_ratio" in row for row in samc_rows)
+    hard_rows = [row for row in study["records"] if row["method"] == "hard_step"]
+    hard_workflow = study["hard_step_workflow"]
+    p0 = float(hard_workflow["reference_p0"])
+    q = float(hard_workflow["target_tail_mass"])
+    r = float(hard_workflow["r"])
+    assert np.isclose(r * p0 / (1.0 - p0 + r * p0), q, rtol=1e-15, atol=0.0)
+    assert hard_workflow["reference_p0_source"] == "exact_p_fallback"
+    assert all(int(row["beta_selection_budget"]) == 0 for row in hard_rows)
+    assert all(np.isclose(row["hard_step_r"], r) for row in hard_rows)
+
+
+def test_build_hard_step_workflow_prefers_known_threshold_metadata():
+    scenario = _small_right_tail_scenario()
+    scenario.extra["known_significance_threshold"] = 1e-4
+    cfg = _small_mcmc_cfg()
+
+    workflow = build_hard_step_workflow(scenario, cfg)
+
+    assert workflow["enabled"]
+    assert workflow["reference_p0"] == 1e-4
+    assert workflow["reference_p0_source"] == "scenario_extra_known_significance_threshold"
+    assert np.isclose(workflow["target_tail_mass"], 1e-4 ** cfg.d_alpha)
 
 
 def test_run_beta_checkpoint_study_emits_rows_for_each_checkpoint():

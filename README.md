@@ -31,7 +31,7 @@ from perm_pval.stats.two_sample import difference_in_means
 from perm_pval.exact.brute_force import BruteForceExactSolver
 from perm_pval.exact.linear_statistic_dp import LinearStatisticDPSolver
 from perm_pval.methods.random_sampling import run_random_sampling
-from perm_pval.methods.mcmc_is import run_mcmc_is
+from perm_pval.methods.mcmc_is import run_hard_step_mcmc_is, run_mcmc_is
 from perm_pval.methods.beta_tuning import (
     estimate_scale_T,
     iid_pilot_statistics,
@@ -74,6 +74,9 @@ print(exact.p_value, exact_dp.p_value, mc.estimate, mcmc.estimate)
   - `g_beta(y) ∝ f(y) * exp(-beta * ((t_obs - T(y))/sigma_t)_+)`
   - Flat in the tail (`T(y) >= t_obs`) and exponentially downweighted below the tail threshold.
   - Importance weights are proportional to `exp(beta * ((t_obs - T(y))/sigma_t)_+)`.
+- Hard-step MCMC-IS uses the same local proposal kernel with
+  `pi_r(y) ∝ f(y) * {1 + (r - 1) 1_A(y)}`. If `f(A)=p0`, then
+  `r = q(1 - p0) / (p0(1 - q))` gives tilted tail mass `pi_r(A)=q`.
 - SAMC follows Yu et al. (2011) p-value evaluation setup:
   - right-tail partition with `bin_edges[-2] = t_obs`, `bin_edges[-1] = +inf`
   - stochastic-approximation updates with `gamma_t = t0 / max(t0, t)`

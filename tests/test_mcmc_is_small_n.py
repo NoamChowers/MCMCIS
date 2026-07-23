@@ -2,7 +2,12 @@ import numpy as np
 
 from perm_pval.core.problem import PermutationTestProblem
 from perm_pval.exact.brute_force import BruteForceExactSolver
-from perm_pval.methods.mcmc_is import run_mcmc_is
+from perm_pval.methods.mcmc_is import (
+    hard_step_beta_for_target_tail_mass,
+    hard_step_r_for_target_tail_mass,
+    run_hard_step_mcmc_is,
+    run_mcmc_is,
+)
 from perm_pval.stats.two_sample import difference_in_means
 
 
@@ -140,3 +145,49 @@ def test_mcmc_is_step_tilt_mode_runs_and_is_reproducible():
     assert 0.0 <= r1.estimate <= 1.0
     assert r1.estimate == r2.estimate
     assert np.array_equal(r1.log_weights, r2.log_weights)
+
+
+def test_hard_step_formula_calibrates_target_tail_mass():
+    p0 = 0.01
+    q = 0.20
+    r = hard_step_r_for_target_tail_mass(p0, q)
+    achieved = r * p0 / (1.0 - p0 + r * p0)
+
+    assert np.isclose(achieved, q, rtol=1e-15, atol=0.0)
+    assert np.isclose(hard_step_beta_for_target_tail_mass(p0, q), np.log(r), rtol=1e-15, atol=0.0)
+
+
+def test_run_hard_step_mcmc_is_wraps_step_tilt():
+    problem = _build_problem()
+    p0 = 0.05
+    q = 0.30
+    beta = hard_step_beta_for_target_tail_mass(p0, q)
+    hard = run_hard_step_mcmc_is(
+        problem,
+        p0=p0,
+        q=q,
+        n_steps=6_000,
+        burn_in=1_000,
+        thin=5,
+        n_chains=2,
+        seed=5151,
+        proposal_size=1,
+    )
+    direct = run_mcmc_is(
+        problem,
+        beta=beta,
+        sigma_t=1.0,
+        n_steps=6_000,
+        burn_in=1_000,
+        thin=5,
+        n_chains=2,
+        seed=5151,
+        init="random",
+        tilt_mode="step",
+        proposal_size=1,
+    )
+
+    assert hard.tilt_mode == "step"
+    assert np.isclose(hard.beta, beta)
+    assert hard.estimate == direct.estimate
+    assert np.array_equal(hard.log_weights, direct.log_weights)

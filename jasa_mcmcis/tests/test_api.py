@@ -15,8 +15,11 @@ from jasa_mcmcis import (
     PermutationTestProblem,
     available_scenarios,
     difference_in_means,
+    hard_step_beta_for_target_tail_mass,
+    hard_step_r_for_target_tail_mass,
     load_scenario,
     load_scenarios,
+    run_hard_step_mcmc_is,
     run_mcmc_is,
     run_samc,
 )
@@ -95,6 +98,30 @@ def test_mcmcis_runs_on_toy_problem() -> None:
     assert result.ess > 0.0
     assert result.mcse_obm is not None
     assert result.n_weighted_samples == 3500
+
+
+def test_hard_step_mcmcis_uses_calibrated_step_tilt() -> None:
+    problem = _toy_problem()
+    p0 = 0.05
+    q = 0.30
+    r = hard_step_r_for_target_tail_mass(p0, q)
+    beta = hard_step_beta_for_target_tail_mass(p0, q)
+    result = run_hard_step_mcmc_is(
+        problem,
+        p0=p0,
+        q=q,
+        n_steps=2_000,
+        burn_in=500,
+        thin=2,
+        n_chains=2,
+        seed=11,
+        proposal_size=1,
+    )
+
+    assert np.isclose(r * p0 / (1.0 - p0 + r * p0), q, rtol=1e-15, atol=0.0)
+    assert np.isclose(result.beta, beta)
+    assert result.tilt_mode == "step"
+    assert 0.0 <= result.estimate <= 1.0
 
 
 def test_samc_runs_on_toy_problem() -> None:
