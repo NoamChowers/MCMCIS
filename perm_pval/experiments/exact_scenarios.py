@@ -163,8 +163,11 @@ def _attach_application_threshold(
     setting_label: str,
     threshold_band: str,
 ) -> ExactScenario:
+    p_over_p0 = float(scenario.exact_p_value) / float(known_significance_threshold)
+
     extra = dict(scenario.extra)
     extra["known_significance_threshold"] = float(known_significance_threshold)
+    extra["p_over_p0"] = float(p_over_p0)
     extra["application_setting_key"] = str(setting_key)
     extra["application_setting_label"] = str(setting_label)
     extra["threshold_band"] = str(threshold_band)
@@ -177,11 +180,485 @@ def _attach_application_threshold(
             groups.append(group)
     portfolio["groups"] = groups
     portfolio["known_significance_threshold"] = float(known_significance_threshold)
+    portfolio["p_over_p0"] = float(p_over_p0)
     portfolio["application_setting_key"] = str(setting_key)
     portfolio["application_setting_label"] = str(setting_label)
     portfolio["threshold_band"] = str(threshold_band)
     scenario.portfolio = portfolio
     return scenario
+
+
+NEAR_THRESHOLD_RATIO_RANGE: tuple[float, float] = (0.75, 0.99)
+ABOVE_THRESHOLD_RATIO_RANGE: tuple[float, float] = (1.01, 1.25)
+GWAS_THRESHOLD_P0 = 5e-8
+HEP_THRESHOLD_P0 = 3e-7
+GWAS_NEAR_THRESHOLD_P0 = GWAS_THRESHOLD_P0
+HEP_NEAR_THRESHOLD_P0 = HEP_THRESHOLD_P0
+
+GWAS_NEAR_THRESHOLD_VARIANT_SPECS: tuple[tuple[int, int], ...] = (
+    (0, 16),
+    (2, 12),
+    (4, 13),
+    (6, 15),
+    (19, 12),
+    (26, 11),
+    (30, 12),
+    (39, 14),
+    (46, 9),
+    (48, 13),
+    (53, 14),
+    (58, 8),
+    (59, 9),
+    (67, 11),
+    (100, 15),
+    (104, 10),
+    (106, 12),
+    (114, 9),
+    (115, 13),
+    (167, 11),
+    (173, 12),
+    (190, 15),
+    (208, 16),
+    (256, 16),
+    (264, 10),
+    (269, 10),
+    (273, 16),
+    (284, 15),
+    (302, 15),
+    (327, 14),
+    (333, 12),
+    (437, 16),
+    (475, 15),
+    (499, 8),
+    (524, 9),
+    (559, 16),
+    (576, 14),
+    (637, 14),
+    (920, 12),
+    (975, 7),
+    (976, 6),
+    (1127, 7),
+    (1151, 13),
+    (1227, 8),
+    (1364, 14),
+    (1404, 16),
+    (1672, 15),
+    (1706, 10),
+    (1865, 15),
+    (2046, 11),
+)
+
+HEP_NEAR_THRESHOLD_VARIANT_SEEDS: tuple[int, ...] = (
+    18,
+    52,
+    149,
+    225,
+    241,
+    248,
+    299,
+    350,
+    363,
+    437,
+    462,
+    489,
+    531,
+    536,
+    692,
+    774,
+    1112,
+    1145,
+    1164,
+    1270,
+    1298,
+    1366,
+    1417,
+    1529,
+    1647,
+    1649,
+    1651,
+    1841,
+    1856,
+    1858,
+    1891,
+    2044,
+    2084,
+    2191,
+    2275,
+    2339,
+    2348,
+    2440,
+    2481,
+    2545,
+    2607,
+    2654,
+    2668,
+    2690,
+    2725,
+    2737,
+    2933,
+    2977,
+    3088,
+    3109,
+)
+
+GWAS_ABOVE_THRESHOLD_VARIANT_SPECS: tuple[tuple[int, int], ...] = (
+    (17, 8),
+    (24, 13),
+    (25, 9),
+    (27, 14),
+    (33, 11),
+    (60, 10),
+    (63, 11),
+    (85, 14),
+    (87, 12),
+    (98, 10),
+    (110, 15),
+    (154, 16),
+    (157, 16),
+    (160, 12),
+    (179, 15),
+    (191, 16),
+    (227, 11),
+    (300, 8),
+    (338, 16),
+    (351, 7),
+    (359, 15),
+    (366, 13),
+    (485, 10),
+    (502, 14),
+    (757, 13),
+    (764, 15),
+    (831, 16),
+    (838, 13),
+    (1154, 7),
+    (1214, 7),
+    (1331, 17),
+    (1618, 16),
+    (1710, 14),
+    (2121, 14),
+    (2219, 15),
+    (2251, 9),
+    (2282, 17),
+    (2782, 12),
+    (2892, 18),
+    (2967, 11),
+    (3126, 6),
+    (3243, 5),
+    (3436, 5),
+    (3662, 8),
+    (4545, 12),
+    (5897, 15),
+    (6661, 14),
+    (6841, 11),
+    (7177, 16),
+    (7248, 13),
+)
+
+HEP_ABOVE_THRESHOLD_VARIANT_SEEDS: tuple[int, ...] = (
+    80,
+    189,
+    233,
+    270,
+    353,
+    368,
+    564,
+    744,
+    924,
+    1028,
+    1258,
+    1319,
+    1636,
+    1646,
+    1670,
+    1712,
+    1736,
+    1882,
+    1887,
+    1895,
+    1924,
+    1933,
+    2008,
+    2150,
+    2242,
+    2387,
+    2389,
+    2565,
+    2691,
+    2707,
+    2764,
+    2845,
+    2867,
+    2927,
+    3073,
+    3187,
+    3203,
+    3435,
+    3459,
+    3496,
+    3575,
+    3733,
+    3808,
+    3840,
+    3844,
+    3860,
+    4019,
+    4027,
+    4224,
+    4225,
+)
+
+
+def _add_portfolio_groups(scenario: ExactScenario, groups: tuple[str, ...]) -> ExactScenario:
+    portfolio = dict(scenario.portfolio)
+    current = [str(v) for v in portfolio.get("groups", [])]
+    for group in groups:
+        if str(group) not in current:
+            current.append(str(group))
+    portfolio["groups"] = current
+    scenario.portfolio = portfolio
+    return scenario
+
+
+def _attach_near_threshold_variant_metadata(
+    scenario: ExactScenario,
+    *,
+    known_significance_threshold: float,
+    setting_key: str,
+    setting_label: str,
+    variant_index: int,
+    ratio_range: tuple[float, float],
+) -> ExactScenario:
+    _attach_application_threshold(
+        scenario,
+        known_significance_threshold=known_significance_threshold,
+        setting_key=setting_key,
+        setting_label=setting_label,
+        threshold_band="near",
+    )
+    ratio = float(scenario.exact_p_value) / float(known_significance_threshold)
+    low, high = ratio_range
+    if not (float(low) <= ratio <= float(high)):
+        raise ValueError(
+            f"Scenario '{scenario.key}' has p/p0={ratio}, outside [{low}, {high}]."
+        )
+
+    extra = dict(scenario.extra)
+    extra["near_threshold_variant_index"] = int(variant_index)
+    extra["near_threshold_ratio_range"] = [float(low), float(high)]
+    scenario.extra = extra
+
+    portfolio = dict(scenario.portfolio)
+    portfolio["near_threshold_variant_index"] = int(variant_index)
+    portfolio["near_threshold_ratio_range"] = [float(low), float(high)]
+    scenario.portfolio = portfolio
+    return _add_portfolio_groups(
+        scenario,
+        (
+            "near_threshold_variety",
+            f"{setting_key}_near_threshold_variety",
+        ),
+    )
+
+
+def build_near_threshold_variant_scenarios(
+    *,
+    n_per_family: int = 50,
+    ratio_range: tuple[float, float] = NEAR_THRESHOLD_RATIO_RANGE,
+) -> list[ExactScenario]:
+    """
+    Build deterministic GWAS-like and HEP-like exact scenarios close to p0.
+
+    The seed/spec lists were selected by exact DP search under the standard
+    application settings and then frozen so catalog regeneration is cheap and
+    reproducible.
+    """
+    if n_per_family < 0:
+        raise ValueError("n_per_family must be non-negative.")
+    if n_per_family > len(GWAS_NEAR_THRESHOLD_VARIANT_SPECS):
+        raise ValueError(
+            f"Only {len(GWAS_NEAR_THRESHOLD_VARIANT_SPECS)} GWAS near-threshold specs "
+            f"are available; requested {n_per_family}."
+        )
+    if n_per_family > len(HEP_NEAR_THRESHOLD_VARIANT_SEEDS):
+        raise ValueError(
+            f"Only {len(HEP_NEAR_THRESHOLD_VARIANT_SEEDS)} HEP near-threshold seeds "
+            f"are available; requested {n_per_family}."
+        )
+
+    scenarios: list[ExactScenario] = []
+    for variant_index, (seed, downgrade_swaps) in enumerate(
+        GWAS_NEAR_THRESHOLD_VARIANT_SPECS[:n_per_family],
+        start=1,
+    ):
+        scenario = _make_gwas_additive_score_scenario(
+            key=f"gwas_additive_score_near_v{variant_index:02d}_n120",
+            description=(
+                "GWAS-like additive score near-threshold variant: "
+                "Binomial(2, maf=0.25) dosages, n=120, right-tail treated dosage sum."
+            ),
+            n=120,
+            n_treated=60,
+            maf=0.25,
+            seed=seed,
+            downgrade_swaps=downgrade_swaps,
+        )
+        scenarios.append(
+            _attach_near_threshold_variant_metadata(
+                scenario,
+                known_significance_threshold=GWAS_NEAR_THRESHOLD_P0,
+                setting_key="gwas_threshold_suite",
+                setting_label="GWAS-like additive score",
+                variant_index=variant_index,
+                ratio_range=ratio_range,
+            )
+        )
+
+    for variant_index, seed in enumerate(
+        HEP_NEAR_THRESHOLD_VARIANT_SEEDS[:n_per_family],
+        start=1,
+    ):
+        scenario = _make_poisson_diffmeans_righttail_scenario(
+            key=f"poisson_diffmeans_hep_near_v{variant_index:02d}_n200",
+            description=(
+                "Poisson count near-threshold variant resembling a high-energy-physics "
+                "counting test: treated~Pois(3), control~Pois(2), n1=n2=100."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=seed,
+        )
+        scenarios.append(
+            _attach_near_threshold_variant_metadata(
+                scenario,
+                known_significance_threshold=HEP_NEAR_THRESHOLD_P0,
+                setting_key="hep_threshold_suite",
+                setting_label="HEP-like Poisson count test",
+                variant_index=variant_index,
+                ratio_range=ratio_range,
+            )
+        )
+    return scenarios
+
+
+def _attach_above_threshold_variant_metadata(
+    scenario: ExactScenario,
+    *,
+    known_significance_threshold: float,
+    setting_key: str,
+    setting_label: str,
+    variant_index: int,
+    ratio_range: tuple[float, float],
+) -> ExactScenario:
+    _attach_application_threshold(
+        scenario,
+        known_significance_threshold=known_significance_threshold,
+        setting_key=setting_key,
+        setting_label=setting_label,
+        threshold_band="above",
+    )
+    ratio = float(scenario.exact_p_value) / float(known_significance_threshold)
+    low, high = ratio_range
+    if not (float(low) <= ratio <= float(high)):
+        raise ValueError(
+            f"Scenario '{scenario.key}' has p/p0={ratio}, outside [{low}, {high}]."
+        )
+
+    extra = dict(scenario.extra)
+    extra["above_threshold_variant_index"] = int(variant_index)
+    extra["above_threshold_ratio_range"] = [float(low), float(high)]
+    scenario.extra = extra
+
+    portfolio = dict(scenario.portfolio)
+    portfolio["above_threshold_variant_index"] = int(variant_index)
+    portfolio["above_threshold_ratio_range"] = [float(low), float(high)]
+    scenario.portfolio = portfolio
+    return _add_portfolio_groups(
+        scenario,
+        (
+            "above_threshold_variety",
+            f"{setting_key}_above_threshold_variety",
+        ),
+    )
+
+
+def build_above_threshold_variant_scenarios(
+    *,
+    n_per_family: int = 50,
+    ratio_range: tuple[float, float] = ABOVE_THRESHOLD_RATIO_RANGE,
+) -> list[ExactScenario]:
+    """
+    Build deterministic GWAS-like and HEP-like exact scenarios just above p0.
+    """
+    if n_per_family < 0:
+        raise ValueError("n_per_family must be non-negative.")
+    if n_per_family > len(GWAS_ABOVE_THRESHOLD_VARIANT_SPECS):
+        raise ValueError(
+            f"Only {len(GWAS_ABOVE_THRESHOLD_VARIANT_SPECS)} GWAS above-threshold specs "
+            f"are available; requested {n_per_family}."
+        )
+    if n_per_family > len(HEP_ABOVE_THRESHOLD_VARIANT_SEEDS):
+        raise ValueError(
+            f"Only {len(HEP_ABOVE_THRESHOLD_VARIANT_SEEDS)} HEP above-threshold seeds "
+            f"are available; requested {n_per_family}."
+        )
+
+    scenarios: list[ExactScenario] = []
+    for variant_index, (seed, downgrade_swaps) in enumerate(
+        GWAS_ABOVE_THRESHOLD_VARIANT_SPECS[:n_per_family],
+        start=1,
+    ):
+        scenario = _make_gwas_additive_score_scenario(
+            key=f"gwas_additive_score_above_v{variant_index:02d}_n120",
+            description=(
+                "GWAS-like additive score above-threshold variant: "
+                "Binomial(2, maf=0.25) dosages, n=120, right-tail treated dosage sum."
+            ),
+            n=120,
+            n_treated=60,
+            maf=0.25,
+            seed=seed,
+            downgrade_swaps=downgrade_swaps,
+        )
+        scenarios.append(
+            _attach_above_threshold_variant_metadata(
+                scenario,
+                known_significance_threshold=GWAS_THRESHOLD_P0,
+                setting_key="gwas_threshold_suite",
+                setting_label="GWAS-like additive score",
+                variant_index=variant_index,
+                ratio_range=ratio_range,
+            )
+        )
+
+    for variant_index, seed in enumerate(
+        HEP_ABOVE_THRESHOLD_VARIANT_SEEDS[:n_per_family],
+        start=1,
+    ):
+        scenario = _make_poisson_diffmeans_righttail_scenario(
+            key=f"poisson_diffmeans_hep_above_v{variant_index:02d}_n200",
+            description=(
+                "Poisson count above-threshold variant resembling a high-energy-physics "
+                "counting test: treated~Pois(3), control~Pois(2), n1=n2=100."
+            ),
+            n_pois2=100,
+            n_pois3=100,
+            lam_low=2.0,
+            lam_high=3.0,
+            seed=seed,
+        )
+        scenarios.append(
+            _attach_above_threshold_variant_metadata(
+                scenario,
+                known_significance_threshold=HEP_THRESHOLD_P0,
+                setting_key="hep_threshold_suite",
+                setting_label="HEP-like Poisson count test",
+                variant_index=variant_index,
+                ratio_range=ratio_range,
+            )
+        )
+    return scenarios
 
 
 def _near_extreme_linear_labels(x: np.ndarray, n_treated: int, *, downgrade_swaps: int = 1) -> np.ndarray:
@@ -1023,6 +1500,8 @@ def build_exact_scenarios() -> list[ExactScenario]:
             swap_from_extreme=3,
         ),
     ]
+    scenarios.extend(build_near_threshold_variant_scenarios())
+    scenarios.extend(build_above_threshold_variant_scenarios())
     threshold_tags = {
         "gwas_additive_score_ultra_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "ultra"),
         "gwas_additive_score_sig_n100": (5e-8, "gwas_threshold_suite", "GWAS-like additive score", "near"),

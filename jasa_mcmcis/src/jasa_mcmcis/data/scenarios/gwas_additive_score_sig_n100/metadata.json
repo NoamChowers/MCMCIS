@@ -25,6 +25,7 @@
     "n_homozygous_alt": 2,
     "total_dosage_sum": 35,
     "known_significance_threshold": 5e-08,
+    "p_over_p0": 0.8740938552869681,
     "application_setting_key": "gwas_threshold_suite",
     "application_setting_label": "GWAS-like additive score",
     "threshold_band": "near"
@@ -46,6 +47,7 @@
       "gwas_threshold_suite_near"
     ],
     "known_significance_threshold": 5e-08,
+    "p_over_p0": 0.8740938552869681,
     "application_setting_key": "gwas_threshold_suite",
     "application_setting_label": "GWAS-like additive score",
     "threshold_band": "near"

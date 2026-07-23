@@ -11,13 +11,35 @@ import numpy as np
 from jasa_mcmcis.problem import PermutationTestProblem
 from jasa_mcmcis.statistics import STATISTIC_REGISTRY
 
-CROSS_METHOD_SCENARIO_KEYS: tuple[str, ...] = (
+ARTICLE_SCENARIO_KEYS: tuple[str, ...] = (
     "gwas_additive_score_ultra_n100",
     "poisson_diffmeans_hep_ultra_n200",
     "gwas_additive_score_sig_n100",
     "poisson_diffmeans_hep_sig_n200",
     "gwas_additive_score_above_n100",
     "poisson_diffmeans_hep_above_n200",
+)
+
+GWAS_NEAR_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = tuple(
+    f"gwas_additive_score_near_v{i:02d}_n120" for i in range(1, 51)
+)
+HEP_NEAR_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = tuple(
+    f"poisson_diffmeans_hep_near_v{i:02d}_n200" for i in range(1, 51)
+)
+GWAS_ABOVE_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = tuple(
+    f"gwas_additive_score_above_v{i:02d}_n120" for i in range(1, 51)
+)
+HEP_ABOVE_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = tuple(
+    f"poisson_diffmeans_hep_above_v{i:02d}_n200" for i in range(1, 51)
+)
+NEAR_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = (
+    GWAS_NEAR_THRESHOLD_SCENARIO_KEYS + HEP_NEAR_THRESHOLD_SCENARIO_KEYS
+)
+ABOVE_THRESHOLD_SCENARIO_KEYS: tuple[str, ...] = (
+    GWAS_ABOVE_THRESHOLD_SCENARIO_KEYS + HEP_ABOVE_THRESHOLD_SCENARIO_KEYS
+)
+CROSS_METHOD_SCENARIO_KEYS: tuple[str, ...] = (
+    ARTICLE_SCENARIO_KEYS + NEAR_THRESHOLD_SCENARIO_KEYS + ABOVE_THRESHOLD_SCENARIO_KEYS
 )
 
 
@@ -118,6 +140,6 @@ def load_scenarios(
     keys: Iterable[str] | None = None,
     data_root: str | Path | None = None,
 ) -> list[Scenario]:
-    """Load several scenarios. By default loads the six cross-method scenarios."""
+    """Load several scenarios. By default loads the cross-method inventory."""
     selected = CROSS_METHOD_SCENARIO_KEYS if keys is None else tuple(str(k) for k in keys)
     return [load_scenario(key, data_root=data_root) for key in selected]

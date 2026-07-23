@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from math import comb
 from typing import DefaultDict, Optional
 
@@ -98,14 +98,22 @@ class LinearStatisticDPSolver(ExactPValueSolver):
     def _distribution_weighted_sum(self, weights: np.ndarray, n_treated: int) -> dict[int, int]:
         states: list[DefaultDict[int, int]] = [defaultdict(int) for _ in range(n_treated + 1)]
         states[0][0] = 1
-        for w in weights.tolist():
-            for k in range(n_treated, 0, -1):
-                prev = states[k - 1]
+        for w, count in sorted(Counter(int(w) for w in weights.tolist()).items()):
+            max_take = min(int(count), n_treated)
+            choose_counts = [comb(int(count), j) for j in range(max_take + 1)]
+            next_states: list[DefaultDict[int, int]] = [
+                defaultdict(int) for _ in range(n_treated + 1)
+            ]
+            for k_prev, prev in enumerate(states):
                 if not prev:
                     continue
-                cur = states[k]
-                for s_prev, count in prev.items():
-                    cur[s_prev + w] += count
+                max_group_take = min(max_take, n_treated - k_prev)
+                for s_prev, state_count in prev.items():
+                    for group_take in range(max_group_take + 1):
+                        next_states[k_prev + group_take][s_prev + group_take * w] += (
+                            state_count * choose_counts[group_take]
+                        )
+            states = next_states
         return dict(states[n_treated])
 
     def _sum_to_stat(self, sum_int: int) -> float:

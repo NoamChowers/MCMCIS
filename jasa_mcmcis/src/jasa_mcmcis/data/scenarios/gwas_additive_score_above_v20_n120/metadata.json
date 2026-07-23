@@ -1,0 +1,66 @@
+{
+  "key": "gwas_additive_score_above_v20_n120",
+  "description": "GWAS-like additive score above-threshold variant: Binomial(2, maf=0.25) dosages, n=120, right-tail treated dosage sum.",
+  "statistic_name": "treated_sum",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 120,
+  "n_treated": 60,
+  "n_control": 60,
+  "t_obs": 39.0,
+  "exact_method": "LinearStatisticDPSolver",
+  "exact_p_value": 5.567292925367971e-08,
+  "tail_hits": 5378834984720261562763701416,
+  "n_permutations": 96614908840363322603893139521372656,
+  "notes": "Additive-dose score statistic T=sum_i G_i y_i with fixed case count. Observed labels are constructed by a one-swap downgrade from the maximal dosage sum.",
+  "extra": {
+    "n": 120,
+    "n_treated": 60,
+    "maf": 0.25,
+    "seed": 351,
+    "downgrade_swaps": 7,
+    "observed_score": 39.0,
+    "extreme_score": 46.0,
+    "n_heterozygous": 36,
+    "n_homozygous_alt": 5,
+    "total_dosage_sum": 46,
+    "known_significance_threshold": 5e-08,
+    "p_over_p0": 1.1134585850735943,
+    "application_setting_key": "gwas_threshold_suite",
+    "application_setting_label": "GWAS-like additive score",
+    "threshold_band": "above",
+    "above_threshold_variant_index": 20,
+    "above_threshold_ratio_range": [
+      1.01,
+      1.25
+    ]
+  },
+  "portfolio": {
+    "family": "gwas_additive_score",
+    "statistic_family": "linear_statistic",
+    "data_family": "discrete_score",
+    "rarity_band": "extreme",
+    "expected_difficulty": "moderate",
+    "sample_size_band": "large",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact",
+      "threshold_suite",
+      "gwas_threshold_suite",
+      "gwas_threshold_suite_above",
+      "above_threshold_variety",
+      "gwas_threshold_suite_above_threshold_variety"
+    ],
+    "known_significance_threshold": 5e-08,
+    "p_over_p0": 1.1134585850735943,
+    "application_setting_key": "gwas_threshold_suite",
+    "application_setting_label": "GWAS-like additive score",
+    "threshold_band": "above",
+    "above_threshold_variant_index": 20,
+    "above_threshold_ratio_range": [
+      1.01,
+      1.25
+    ]
+  }
+}

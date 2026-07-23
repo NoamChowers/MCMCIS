@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from math import comb
 from typing import DefaultDict
@@ -133,14 +133,22 @@ class LinearStatisticDPSolver:
             defaultdict(int) for _ in range(self.problem.n_treated + 1)
         ]
         states[0][0] = 1
-        for weight in self.scores_int.tolist():
-            for k in range(self.problem.n_treated, 0, -1):
-                previous = states[k - 1]
+        for weight, count in sorted(Counter(int(w) for w in self.scores_int.tolist()).items()):
+            max_take = min(int(count), self.problem.n_treated)
+            choose_counts = [comb(int(count), j) for j in range(max_take + 1)]
+            next_states: list[DefaultDict[int, int]] = [
+                defaultdict(int) for _ in range(self.problem.n_treated + 1)
+            ]
+            for k_previous, previous in enumerate(states):
                 if not previous:
                     continue
-                current = states[k]
-                for partial_sum, count in previous.items():
-                    current[partial_sum + int(weight)] += int(count)
+                max_group_take = min(max_take, self.problem.n_treated - k_previous)
+                for partial_sum, state_count in previous.items():
+                    for group_take in range(max_group_take + 1):
+                        next_states[k_previous + group_take][partial_sum + group_take * weight] += (
+                            int(state_count) * choose_counts[group_take]
+                        )
+            states = next_states
         return dict(states[self.problem.n_treated])
 
     def _sum_to_stat(self, sum_int: int) -> float:

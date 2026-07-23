@@ -23,6 +23,7 @@
     "mean_pois2": 1.91,
     "mean_pois3": 3.06,
     "known_significance_threshold": 3e-07,
+    "p_over_p0": 2.556261220653239,
     "application_setting_key": "hep_threshold_suite",
     "application_setting_label": "HEP-like Poisson count test",
     "threshold_band": "above"
@@ -43,6 +44,7 @@
       "hep_threshold_suite_above"
     ],
     "known_significance_threshold": 3e-07,
+    "p_over_p0": 2.556261220653239,
     "application_setting_key": "hep_threshold_suite",
     "application_setting_label": "HEP-like Poisson count test",
     "threshold_band": "above"

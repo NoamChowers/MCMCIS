@@ -1,9 +1,17 @@
 import numpy as np
 
 from perm_pval.experiments.exact_scenarios import (
+    ABOVE_THRESHOLD_RATIO_RANGE,
+    GWAS_THRESHOLD_P0,
+    GWAS_NEAR_THRESHOLD_P0,
+    HEP_THRESHOLD_P0,
+    HEP_NEAR_THRESHOLD_P0,
+    NEAR_THRESHOLD_RATIO_RANGE,
     _make_gwas_additive_score_scenario,
     _make_poisson_diffmeans_righttail_scenario,
     _make_zero_inflated_poisson_diffmeans_scenario,
+    build_above_threshold_variant_scenarios,
+    build_near_threshold_variant_scenarios,
     build_exact_scenarios,
     load_saved_exact_scenarios,
     save_exact_scenarios,
@@ -132,3 +140,75 @@ def test_build_exact_scenarios_emits_portfolio_groups():
     assert "exploratory_exact" in by_key["hypergeom_1e7"].portfolio["groups"]
     assert "core_claim" in by_key["linear_stat_dp_n40"].portfolio["groups"]
     assert by_key["bruteforce_welch_nonextreme_n22"].portfolio["family"] == "welch_bruteforce"
+    assert "gwas_additive_score_near_v01_n120" in by_key
+    assert "poisson_diffmeans_hep_near_v01_n200" in by_key
+    assert "gwas_additive_score_above_v01_n120" in by_key
+    assert "poisson_diffmeans_hep_above_v01_n200" in by_key
+
+
+def test_near_threshold_variant_scenarios_cover_both_families_in_ratio_band():
+    scenarios = build_near_threshold_variant_scenarios()
+    low, high = NEAR_THRESHOLD_RATIO_RANGE
+
+    gwas = [
+        scenario
+        for scenario in scenarios
+        if scenario.portfolio["application_setting_key"] == "gwas_threshold_suite"
+    ]
+    hep = [
+        scenario
+        for scenario in scenarios
+        if scenario.portfolio["application_setting_key"] == "hep_threshold_suite"
+    ]
+
+    assert len(gwas) == 50
+    assert len(hep) == 50
+    assert {scenario.key for scenario in gwas}.isdisjoint({scenario.key for scenario in hep})
+
+    for scenario in gwas:
+        ratio = scenario.exact_p_value / GWAS_NEAR_THRESHOLD_P0
+        assert low <= ratio <= high
+        assert scenario.extra["p_over_p0"] == ratio
+        assert "near_threshold_variety" in scenario.portfolio["groups"]
+        assert "gwas_threshold_suite_near_threshold_variety" in scenario.portfolio["groups"]
+
+    for scenario in hep:
+        ratio = scenario.exact_p_value / HEP_NEAR_THRESHOLD_P0
+        assert low <= ratio <= high
+        assert scenario.extra["p_over_p0"] == ratio
+        assert "near_threshold_variety" in scenario.portfolio["groups"]
+        assert "hep_threshold_suite_near_threshold_variety" in scenario.portfolio["groups"]
+
+
+def test_above_threshold_variant_scenarios_cover_both_families_in_ratio_band():
+    scenarios = build_above_threshold_variant_scenarios()
+    low, high = ABOVE_THRESHOLD_RATIO_RANGE
+
+    gwas = [
+        scenario
+        for scenario in scenarios
+        if scenario.portfolio["application_setting_key"] == "gwas_threshold_suite"
+    ]
+    hep = [
+        scenario
+        for scenario in scenarios
+        if scenario.portfolio["application_setting_key"] == "hep_threshold_suite"
+    ]
+
+    assert len(gwas) == 50
+    assert len(hep) == 50
+    assert {scenario.key for scenario in gwas}.isdisjoint({scenario.key for scenario in hep})
+
+    for scenario in gwas:
+        ratio = scenario.exact_p_value / GWAS_THRESHOLD_P0
+        assert low <= ratio <= high
+        assert scenario.extra["p_over_p0"] == ratio
+        assert "above_threshold_variety" in scenario.portfolio["groups"]
+        assert "gwas_threshold_suite_above_threshold_variety" in scenario.portfolio["groups"]
+
+    for scenario in hep:
+        ratio = scenario.exact_p_value / HEP_THRESHOLD_P0
+        assert low <= ratio <= high
+        assert scenario.extra["p_over_p0"] == ratio
+        assert "above_threshold_variety" in scenario.portfolio["groups"]
+        assert "hep_threshold_suite_above_threshold_variety" in scenario.portfolio["groups"]

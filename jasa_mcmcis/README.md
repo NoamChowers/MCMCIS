@@ -6,7 +6,8 @@ p-value estimation. It contains:
 - MCMC importance sampling (MCMC-IS) for fixed-size binary-label permutation
   tests, using a tilted distribution and self-normalized importance weights.
 - Stochastic Approximation Monte Carlo (SAMC) as a comparison method.
-- The six frozen cross-method simulation scenarios used in the article study.
+- The six frozen article scenarios plus 200 threshold-bin scenarios for
+  cross-method comparisons.
 - A small optional dynamic-programming exact solver for linear statistics,
   included for validation of the bundled scenarios.
 
@@ -41,11 +42,20 @@ print(problem.t_obs)
 print(scenario.exact_p_value)
 ```
 
-The six bundled keys are:
+The bundled cross-method keys include the six article scenarios, 100
+near-threshold variants, and 100 just-above-threshold variants:
 
 ```python
-from jasa_mcmcis import CROSS_METHOD_SCENARIO_KEYS
+from jasa_mcmcis import (
+    ABOVE_THRESHOLD_SCENARIO_KEYS,
+    ARTICLE_SCENARIO_KEYS,
+    CROSS_METHOD_SCENARIO_KEYS,
+    NEAR_THRESHOLD_SCENARIO_KEYS,
+)
 
+print(ARTICLE_SCENARIO_KEYS)
+print(NEAR_THRESHOLD_SCENARIO_KEYS[:3])
+print(ABOVE_THRESHOLD_SCENARIO_KEYS[:3])
 print(CROSS_METHOD_SCENARIO_KEYS)
 ```
 
@@ -115,8 +125,8 @@ print(samc.estimate, samc.acceptance_rate)
 ## Exact DP Validation
 
 The exact p-values are already stored in scenario metadata. The DP solver is
-included because all six bundled scenarios use linear statistics, and exact
-checks are useful in a statistical-methods supplement.
+included because the bundled cross-method scenarios use linear statistics, and
+exact checks are useful in a statistical-methods supplement.
 
 ```python
 from jasa_mcmcis import LinearStatisticDPSolver, load_scenario
