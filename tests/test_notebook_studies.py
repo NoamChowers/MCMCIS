@@ -26,6 +26,7 @@ from perm_pval.experiments.notebook_studies import (
     run_beta_checkpoint_study,
     run_cross_method_study,
     run_mcmc_objective_grid_study,
+    run_threshold_grid_method_block,
     save_beta_sweep_outputs,
     save_cross_method_outputs,
     score_mcmc_objective_grid_repeat_row,
@@ -414,6 +415,81 @@ def test_beta_study_parallel_matches_serial():
 
     assert _strip_runtime_fields(serial["records"]) == _strip_runtime_fields(parallel["records"])
     assert _strip_runtime_summary_fields(serial["summary"]) == _strip_runtime_summary_fields(parallel["summary"])
+
+
+def test_threshold_grid_method_block_saves_requested_method_rows(tmp_path):
+    scenario = _small_right_tail_scenario()
+    scenario.extra["known_significance_threshold"] = 0.25
+    checkpoints = (30, 40)
+    mcmc_cfg = MCMCWorkflowConfig(
+        pilot_samples=5,
+        chains=1,
+        thin=1,
+        estimate_variance=False,
+        proposal_size=1,
+        local_scan_enabled=False,
+    )
+    samc_cfg = SAMCWorkflowConfig(
+        n_bins=5,
+        lambda_min_pilot=5,
+        proposal_size=1,
+    )
+
+    mcmc = run_threshold_grid_method_block(
+        [scenario],
+        method="mcmc_is",
+        family="toy",
+        threshold_band="near",
+        checkpoints=checkpoints,
+        swap_fraction=1,
+        gamma=0.5,
+        mcmc_cfg=mcmc_cfg,
+        base_seed=100,
+        n_jobs=1,
+        output_dir=tmp_path / "mcmc",
+        resume=False,
+    )
+    hard = run_threshold_grid_method_block(
+        [scenario],
+        method="hard_step",
+        family="toy",
+        threshold_band="near",
+        checkpoints=checkpoints,
+        swap_fraction=1,
+        gamma=0.5,
+        mcmc_cfg=mcmc_cfg,
+        base_seed=200,
+        n_jobs=1,
+        output_dir=tmp_path / "hard",
+        resume=False,
+    )
+    samc = run_threshold_grid_method_block(
+        [scenario],
+        method="samc",
+        family="toy",
+        threshold_band="near",
+        checkpoints=checkpoints,
+        swap_fraction=1,
+        samc_cfg=samc_cfg,
+        base_seed=300,
+        n_jobs=1,
+        output_dir=tmp_path / "samc",
+        resume=False,
+    )
+
+    assert {row["method"] for row in mcmc["records"]} == {"mcmc_is_no_oracle"}
+    assert {row["method"] for row in hard["records"]} == {"hard_step"}
+    assert {row["method"] for row in samc["records"]} == {"samc"}
+    assert all(row["p0_reference"] == 0.25 for row in mcmc["records"])
+    assert all(row["beta_selection_budget"] == 5 for row in mcmc["records"])
+    assert all(row["mcmc_chain_budget"] < row["checkpoint"] for row in mcmc["records"])
+    assert all(row["beta_selection_budget"] == 0 for row in hard["records"])
+    assert all("hard_step_r" in row for row in hard["records"])
+    assert all(row["gamma_label"] == "none" for row in samc["records"])
+    assert all(row["samc_setup_eval_total"] == 5 for row in samc["records"])
+    assert (tmp_path / "mcmc" / "block_records.jsonl").exists()
+    assert (tmp_path / "hard" / "block_records.jsonl").exists()
+    assert (tmp_path / "samc" / "block_records.jsonl").exists()
 
 
 def test_build_mcmc_objective_grid_candidates_retains_invalid_q_map_rows():

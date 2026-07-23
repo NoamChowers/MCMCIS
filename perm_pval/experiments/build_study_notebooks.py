@@ -86,11 +86,13 @@ def _common_setup_code() -> str:
         load_beta_sweep_saved_output,
         load_mcmc_objective_grid_saved_output,
         load_selected_scenarios,
+        known_threshold_p0_for_scenario,
         plot_named_method_convergence,
         plot_named_method_max_budget,
         read_json,
         run_named_mcmc_checkpoint_study,
         run_mcmc_objective_grid_study,
+        run_threshold_grid_method_block,
         save_mcmc_objective_grid_outputs,
         regenerate_beta_sweep_plots_from_saved,
         regenerate_cross_method_plots_from_saved,
@@ -3465,6 +3467,419 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
     return nb
 
 
+def build_cross_method_threshold_grid_notebook() -> dict:
+    cells = [
+        markdown_cell(
+            """
+            # Experiment: Threshold-Variety Cross-Method Grid
+
+            Objective:
+            - Compare SAMC, hard-step IS, and MCMC-IS without oracle p-values on the 50 GWAS-like and 50 HEP-like threshold scenarios.
+            - Use a 5M maximum reported budget with 250k checkpoints.
+            - Sweep swap size over 5% and 10% of the smaller group size.
+            - For MCMC-IS and hard-step, sweep `gamma in {0.25, 1/3, 0.4}` with `q = p0 ** gamma`, where `p0` is the known application threshold stored in the scenario metadata.
+
+            Each family/swap/method/gamma block writes its own partial and final JSONL files as soon as it finishes.
+            """
+        ),
+        code_cell(_common_setup_code()),
+        markdown_cell(
+            """
+            ## Configuration
+
+            The default `THRESHOLD_BANDS = ("near",)` runs the 50-per-family near-threshold inventory. Set it to `("above",)` for the `[1.01, 1.25]` above-threshold inventory, or to both bands for the full threshold-variety catalog.
+
+            MCMC-IS uses the known threshold p0, not the exact scenario p-value, when setting `q` and initializing beta. Exact p-values are used only for error summaries.
+            """
+        ),
+        code_cell(
+            """
+            FAST_MODE = False
+            SAVE_OUTPUTS = True
+            RESUME_BLOCKS = True
+            RUN_DIR_OVERRIDE = None  # Set to a previous run_dir string to resume after a kernel restart.
+
+            CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
+            OUTPUT_ROOT = project_root / "results" / "cross_method_threshold_grid"
+
+            THRESHOLD_BANDS = ("near",)
+            FAMILIES = ("gwas", "hep")
+            SCENARIOS_PER_FAMILY = 50
+            MIN_TAIL_STATES = 2
+
+            MAX_BUDGET = 5_000_000 if not FAST_MODE else 20_000
+            CHECKPOINT_STEP = 250_000 if not FAST_MODE else 5_000
+            CHECKPOINTS = tuple(range(CHECKPOINT_STEP, MAX_BUDGET + CHECKPOINT_STEP, CHECKPOINT_STEP))
+            SWAP_FRACTIONS = (0.05, 0.10)
+            GAMMAS = (0.25, 1.0 / 3.0, 0.40)
+
+            BETA_INIT_PILOT_SAMPLES = 100_000 if not FAST_MODE else 1_000
+            N_JOBS = min(6, os.cpu_count() or 1) if not FAST_MODE else 1
+            BASE_SEED = 91_337
+
+            MCMC_CHAINS = 1
+            MCMC_ESTIMATE_VARIANCE = False
+            MCMC_CFG = MCMCWorkflowConfig(
+                use_true_p0_for_q_target=False,
+                p0_guess=1e-8,
+                pilot_samples=BETA_INIT_PILOT_SAMPLES,
+                scale_method="sd",
+                beta_max_init=1e6,
+                chains=MCMC_CHAINS,
+                thin=1,
+                estimate_variance=MCMC_ESTIMATE_VARIANCE,
+                chain_n_jobs=1,
+                production_estimator_variant="production_only",
+                tilt_mode="smooth_hinge",
+                proposal_size=SWAP_FRACTIONS[0],
+                local_scan_enabled=False,
+            )
+            SAMC_CFG = SAMCWorkflowConfig(
+                burn_in_fraction=0.20,
+                n_bins=100 if not FAST_MODE else 10,
+                t0=1_000.0,
+                trace_every=200 if not FAST_MODE else 50,
+                convergence_tolerance=20.0,
+                lambda_min_pilot=10_000 if not FAST_MODE else 1_000,
+                proposal_size=SWAP_FRACTIONS[0],
+            )
+
+            print(json.dumps({
+                "FAST_MODE": FAST_MODE,
+                "THRESHOLD_BANDS": THRESHOLD_BANDS,
+                "FAMILIES": FAMILIES,
+                "SCENARIOS_PER_FAMILY": SCENARIOS_PER_FAMILY,
+                "MAX_BUDGET": MAX_BUDGET,
+                "CHECKPOINT_STEP": CHECKPOINT_STEP,
+                "N_CHECKPOINTS": len(CHECKPOINTS),
+                "SWAP_FRACTIONS": SWAP_FRACTIONS,
+                "GAMMAS": GAMMAS,
+                "BETA_INIT_PILOT_SAMPLES": BETA_INIT_PILOT_SAMPLES,
+                "MCMC_CHAINS": MCMC_CHAINS,
+                "MCMC_ESTIMATE_VARIANCE": MCMC_ESTIMATE_VARIANCE,
+                "SAMC_N_BINS": SAMC_CFG.n_bins,
+                "SAMC_LAMBDA_MIN_PILOT": SAMC_CFG.lambda_min_pilot,
+                "N_JOBS": N_JOBS,
+                "SAVE_OUTPUTS": SAVE_OUTPUTS,
+                "RESUME_BLOCKS": RESUME_BLOCKS,
+            }, indent=2))
+            """
+        ),
+        markdown_cell("## Load Scenario Inventory"),
+        code_cell(
+            """
+            def scenario_keys_for_family(family: str, threshold_band: str, n: int) -> list[str]:
+                if family == "gwas":
+                    return [
+                        f"gwas_additive_score_{threshold_band}_v{idx:02d}_n120"
+                        for idx in range(1, int(n) + 1)
+                    ]
+                if family == "hep":
+                    return [
+                        f"poisson_diffmeans_hep_{threshold_band}_v{idx:02d}_n200"
+                        for idx in range(1, int(n) + 1)
+                    ]
+                raise ValueError(f"Unknown family: {family}")
+
+
+            def family_from_key(key: str) -> str:
+                if key.startswith("gwas_additive_score_"):
+                    return "gwas"
+                if key.startswith("poisson_diffmeans_hep_"):
+                    return "hep"
+                raise ValueError(f"Could not infer family from key: {key}")
+
+
+            def threshold_band_from_key(key: str) -> str:
+                if "_near_" in key:
+                    return "near"
+                if "_above_" in key:
+                    return "above"
+                raise ValueError(f"Could not infer threshold band from key: {key}")
+
+
+            scenario_keys = [
+                key
+                for threshold_band in THRESHOLD_BANDS
+                for family in FAMILIES
+                for key in scenario_keys_for_family(family, threshold_band, SCENARIOS_PER_FAMILY)
+            ]
+            scenarios = load_selected_scenarios(
+                catalog_path=CATALOG_PATH,
+                scenario_keys=scenario_keys,
+                portfolio_group=None,
+                min_tail_states=MIN_TAIL_STATES,
+            )
+            scenarios_by_block = {
+                (threshold_band, family): [
+                    scenario
+                    for scenario in scenarios
+                    if threshold_band_from_key(scenario.key) == threshold_band
+                    and family_from_key(scenario.key) == family
+                ]
+                for threshold_band in THRESHOLD_BANDS
+                for family in FAMILIES
+            }
+
+            inventory_rows = []
+            for scenario in scenarios:
+                p0, p0_source = known_threshold_p0_for_scenario(scenario)
+                inventory_rows.append({
+                    "threshold_band": threshold_band_from_key(scenario.key),
+                    "family": family_from_key(scenario.key),
+                    "scenario": scenario.key,
+                    "n": scenario.problem.n,
+                    "n_treated": scenario.problem.n_treated,
+                    "n_control": scenario.problem.n_control,
+                    "exact_p": scenario.exact_p,
+                    "p0": p0,
+                    "p0_source": p0_source,
+                    "p_over_p0": scenario.exact_p / p0,
+                    "tail_hits": scenario.exact_tail_hits,
+                    "n_perm": scenario.exact_n_perm,
+                })
+            inventory_df = pd.DataFrame(inventory_rows)
+            display(
+                inventory_df
+                .groupby(["threshold_band", "family"])
+                .agg(
+                    n_scenarios=("scenario", "count"),
+                    min_p_over_p0=("p_over_p0", "min"),
+                    median_p_over_p0=("p_over_p0", "median"),
+                    max_p_over_p0=("p_over_p0", "max"),
+                    p0=("p0", "first"),
+                )
+                .reset_index()
+            )
+            inventory_df.head()
+            """
+        ),
+        markdown_cell("## Build Method Blocks"),
+        code_cell(
+            """
+            def gamma_label(gamma: float | None) -> str:
+                return "none" if gamma is None else f"{float(gamma):.12g}".replace(".", "p")
+
+
+            def swap_label(swap_fraction: float | int) -> str:
+                if isinstance(swap_fraction, float):
+                    return f"{int(round(100 * swap_fraction)):02d}pct"
+                return f"{int(swap_fraction)}swap"
+
+
+            def block_slug(block: dict) -> str:
+                parts = [
+                    f"band_{block['threshold_band']}",
+                    f"family_{block['family']}",
+                    f"swap_{swap_label(block['swap_fraction'])}",
+                    f"method_{block['method']}",
+                ]
+                if block.get("gamma") is not None:
+                    parts.append(f"gamma_{gamma_label(block['gamma'])}")
+                return "__".join(parts)
+
+
+            method_blocks = []
+            for threshold_band in THRESHOLD_BANDS:
+                for family in FAMILIES:
+                    block_scenarios = scenarios_by_block[(threshold_band, family)]
+                    if len(block_scenarios) != SCENARIOS_PER_FAMILY:
+                        raise RuntimeError(
+                            f"Expected {SCENARIOS_PER_FAMILY} scenarios for {(threshold_band, family)}, "
+                            f"found {len(block_scenarios)}."
+                        )
+                    for swap_fraction in SWAP_FRACTIONS:
+                        method_blocks.append({
+                            "method": "samc",
+                            "threshold_band": threshold_band,
+                            "family": family,
+                            "swap_fraction": float(swap_fraction),
+                            "gamma": None,
+                            "scenarios": block_scenarios,
+                        })
+                        for gamma in GAMMAS:
+                            method_blocks.append({
+                                "method": "mcmc_is",
+                                "threshold_band": threshold_band,
+                                "family": family,
+                                "swap_fraction": float(swap_fraction),
+                                "gamma": float(gamma),
+                                "scenarios": block_scenarios,
+                            })
+                            method_blocks.append({
+                                "method": "hard_step",
+                                "threshold_band": threshold_band,
+                                "family": family,
+                                "swap_fraction": float(swap_fraction),
+                                "gamma": float(gamma),
+                                "scenarios": block_scenarios,
+                            })
+
+            block_plan = pd.DataFrame([
+                {
+                    "block_index": idx,
+                    "block_slug": block_slug(block),
+                    "threshold_band": block["threshold_band"],
+                    "family": block["family"],
+                    "method": block["method"],
+                    "swap_fraction": block["swap_fraction"],
+                    "gamma": block["gamma"],
+                    "n_scenarios": len(block["scenarios"]),
+                }
+                for idx, block in enumerate(method_blocks)
+            ])
+            display(block_plan)
+            print(f"{len(block_plan)} method blocks; each block saves independently.")
+            """
+        ),
+        markdown_cell("## Run Blocks"),
+        code_cell(
+            """
+            if SAVE_OUTPUTS:
+                if RUN_DIR_OVERRIDE is not None:
+                    run_dir = Path(RUN_DIR_OVERRIDE).expanduser().resolve()
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                else:
+                    run_dir = create_timestamped_run_dir(OUTPUT_ROOT, "threshold_grid_cross_method")
+            else:
+                run_dir = None
+
+            block_results = []
+            for block_index, block in enumerate(method_blocks):
+                slug = block_slug(block)
+                block_dir = (run_dir / slug) if run_dir is not None else None
+                print(json.dumps({
+                    "block": f"{block_index + 1}/{len(method_blocks)}",
+                    "slug": slug,
+                    "method": block["method"],
+                    "threshold_band": block["threshold_band"],
+                    "family": block["family"],
+                    "swap_fraction": block["swap_fraction"],
+                    "gamma": block["gamma"],
+                    "n_scenarios": len(block["scenarios"]),
+                    "output_dir": str(block_dir) if block_dir is not None else None,
+                }, indent=2))
+                result = run_threshold_grid_method_block(
+                    block["scenarios"],
+                    method=block["method"],
+                    family=block["family"],
+                    threshold_band=block["threshold_band"],
+                    checkpoints=CHECKPOINTS,
+                    swap_fraction=block["swap_fraction"],
+                    gamma=block["gamma"],
+                    mcmc_cfg=MCMC_CFG,
+                    samc_cfg=SAMC_CFG,
+                    base_seed=BASE_SEED + 1_000_000 * block_index,
+                    n_jobs=N_JOBS,
+                    output_dir=block_dir,
+                    resume=RESUME_BLOCKS,
+                    block_label=slug,
+                )
+                block_results.append({
+                    "block_index": block_index,
+                    "block_slug": slug,
+                    "threshold_band": block["threshold_band"],
+                    "family": block["family"],
+                    "method": block["method"],
+                    "swap_fraction": block["swap_fraction"],
+                    "gamma": block["gamma"],
+                    "n_records": len(result["records"]),
+                    "n_summary_rows": len(result["summary"]),
+                    "output_dir": str(result["output_dir"]) if result["output_dir"] is not None else None,
+                    "loaded_from": str(result["loaded_from"]) if result.get("loaded_from") is not None else None,
+                    "wall_time_sec": result["metadata"].get("wall_time_sec"),
+                    "status": result["metadata"].get("status"),
+                    "result": result,
+                })
+
+            block_manifest = pd.DataFrame([
+                {key: value for key, value in item.items() if key != "result"}
+                for item in block_results
+            ])
+            display(block_manifest)
+            run_dir
+            """
+        ),
+        markdown_cell("## Aggregate And Save"),
+        code_cell(
+            """
+            all_records = [
+                row
+                for block_result in block_results
+                for row in block_result["result"]["records"]
+            ]
+            all_summary = summarize_records(
+                all_records,
+                group_fields=("threshold_band", "family", "swap_fraction", "method", "gamma_label", "checkpoint"),
+            )
+            records_df = pd.DataFrame(all_records)
+            summary_df = pd.DataFrame(all_summary)
+
+            if SAVE_OUTPUTS and run_dir is not None:
+                records_df.to_json(run_dir / "all_records.jsonl", orient="records", lines=True)
+                summary_df.to_json(run_dir / "summary.json", orient="records", indent=2)
+                block_manifest.to_json(run_dir / "block_manifest.json", orient="records", indent=2)
+                inventory_df.to_json(run_dir / "scenario_inventory.json", orient="records", indent=2)
+                (run_dir / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "CATALOG_PATH": str(CATALOG_PATH),
+                            "THRESHOLD_BANDS": THRESHOLD_BANDS,
+                            "FAMILIES": FAMILIES,
+                            "SCENARIOS_PER_FAMILY": SCENARIOS_PER_FAMILY,
+                            "MAX_BUDGET": MAX_BUDGET,
+                            "CHECKPOINT_STEP": CHECKPOINT_STEP,
+                            "CHECKPOINTS": CHECKPOINTS,
+                            "SWAP_FRACTIONS": SWAP_FRACTIONS,
+                            "GAMMAS": GAMMAS,
+                            "BETA_INIT_PILOT_SAMPLES": BETA_INIT_PILOT_SAMPLES,
+                            "N_JOBS": N_JOBS,
+                            "BASE_SEED": BASE_SEED,
+                            "MCMC_CHAINS": MCMC_CHAINS,
+                            "MCMC_ESTIMATE_VARIANCE": MCMC_ESTIMATE_VARIANCE,
+                            "SAMC_N_BINS": SAMC_CFG.n_bins,
+                            "SAMC_LAMBDA_MIN_PILOT": SAMC_CFG.lambda_min_pilot,
+                            "RESUME_BLOCKS": RESUME_BLOCKS,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"Saved aggregate outputs to {run_dir}")
+
+            display(
+                summary_df
+                .query("checkpoint == @MAX_BUDGET")
+                .sort_values(["threshold_band", "family", "swap_fraction", "method", "gamma_label"])
+                .reset_index(drop=True)
+            )
+            """
+        ),
+        markdown_cell("## Reload A Saved Run"),
+        code_cell(
+            """
+            def load_threshold_grid_run(saved_run_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                saved_run_dir = Path(saved_run_dir)
+                records = pd.read_json(saved_run_dir / "all_records.jsonl", orient="records", lines=True)
+                summary = pd.read_json(saved_run_dir / "summary.json")
+                manifest = pd.read_json(saved_run_dir / "block_manifest.json")
+                return records, summary, manifest
+
+
+            if SAVE_OUTPUTS and run_dir is not None:
+                reloaded_records_df, reloaded_summary_df, reloaded_manifest_df = load_threshold_grid_run(run_dir)
+                display(reloaded_manifest_df[["block_index", "block_slug", "status", "n_records"]].head())
+                print({
+                    "records": len(reloaded_records_df),
+                    "summary_rows": len(reloaded_summary_df),
+                    "run_dir": str(run_dir),
+                })
+            """
+        ),
+    ]
+    return notebook(cells)
+
+
 def build_beta_notebook() -> dict:
     return build_oracle_beta_search_notebook()
 
@@ -3480,6 +3895,7 @@ def main() -> None:
         notebooks_dir / "mcmcis_offline_objective_grid.ipynb": build_mcmc_objective_grid_notebook(),
         notebooks_dir / "mcmcis_scan_budget_policy.ipynb": build_mcmc_scan_budget_policy_notebook(),
         notebooks_dir / "mcmcis_scan_budget_grid.ipynb": build_mcmc_scan_budget_grid_notebook(),
+        notebooks_dir / "cross_method_threshold_grid.ipynb": build_cross_method_threshold_grid_notebook(),
     }
     for path, data in outputs.items():
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")

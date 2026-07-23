@@ -3723,6 +3723,510 @@ def _beta_replicate_worker(
     return beta_rows
 
 
+def known_threshold_p0_for_scenario(
+    scenario: LoadedScenario,
+    *,
+    fallback_to_exact: bool = False,
+) -> tuple[float, str]:
+    for source, container in (
+        ("scenario_extra_known_significance_threshold", scenario.extra),
+        ("scenario_portfolio_known_significance_threshold", scenario.portfolio),
+    ):
+        if not isinstance(container, dict):
+            continue
+        threshold = _valid_probability_or_none(container.get("known_significance_threshold"))
+        if threshold is None:
+            threshold = _valid_probability_or_none(container.get("canonical_threshold_p0"))
+        if threshold is not None:
+            return float(threshold), source
+    if fallback_to_exact:
+        return float(scenario.exact_p), "exact_p_fallback"
+    raise ValueError(
+        f"Scenario '{scenario.key}' has no known significance threshold; "
+        "set fallback_to_exact=True only for oracle/debug runs."
+    )
+
+
+def _threshold_grid_common_annotations(
+    *,
+    scenario: LoadedScenario,
+    family: str,
+    threshold_band: str,
+    swap_fraction: float | int,
+    gamma: float | None,
+    p0_reference: float,
+    p0_reference_source: str,
+    q_target: float | None,
+    seed: int,
+    n_swap_pairs: int,
+) -> dict[str, Any]:
+    gamma_value = float(gamma) if gamma is not None else np.nan
+    gamma_label = f"{float(gamma):.12g}" if gamma is not None else "none"
+    return {
+        "scenario": scenario.key,
+        "scenario_display": scenario.description,
+        "family": str(family),
+        "threshold_band": str(threshold_band),
+        "application_setting_key": scenario.extra.get("application_setting_key"),
+        "known_significance_threshold": float(p0_reference),
+        "p0_reference": float(p0_reference),
+        "p0_reference_source": str(p0_reference_source),
+        "p_over_p0": float(scenario.exact_p / p0_reference),
+        "swap_fraction": float(swap_fraction),
+        "proposal_size": swap_fraction,
+        "n_swap_pairs": int(n_swap_pairs),
+        "gamma": gamma_value,
+        "gamma_label": gamma_label,
+        "q_target": float(q_target) if q_target is not None else np.nan,
+        "target_tail_mass": float(q_target) if q_target is not None else np.nan,
+        "replicate": 0,
+        "seed": int(seed),
+    }
+
+
+def _threshold_grid_mcmcis_scenario_worker(
+    *,
+    scenario: LoadedScenario,
+    family: str,
+    threshold_band: str,
+    checkpoints: tuple[int, ...],
+    gamma: float,
+    swap_fraction: float | int,
+    mcmc_cfg: MCMCWorkflowConfig,
+    seed: int,
+) -> list[dict[str, Any]]:
+    p0_reference, p0_source = known_threshold_p0_for_scenario(scenario, fallback_to_exact=False)
+    worker_cfg = replace(
+        mcmc_cfg,
+        use_true_p0_for_q_target=False,
+        p0_guess=float(p0_reference),
+        d_alpha=float(gamma),
+        proposal_size=swap_fraction,
+        tilt_mode="smooth_hinge",
+        local_scan_enabled=False,
+        hard_step_enabled=False,
+    )
+    init_payload = build_beta_initialization(
+        scenario.problem,
+        float(p0_reference),
+        worker_cfg,
+        seed=int(seed),
+        p0_reference=float(p0_reference),
+    )
+    beta_selection_budget = int(worker_cfg.pilot_samples)
+    checkpoint_pairs = [
+        (int(cp), int(cp) - int(beta_selection_budget))
+        for cp in checkpoints
+        if int(cp) - int(beta_selection_budget) > 0
+    ]
+    if not checkpoint_pairs:
+        return []
+
+    reported_checkpoints = tuple(int(cp) for cp, _ in checkpoint_pairs)
+    chain_checkpoints = tuple(int(chain_cp) for _, chain_cp in checkpoint_pairs)
+    n_swap_pairs = resolve_n_swap_pairs(
+        scenario.problem.n_treated,
+        scenario.problem.n_control,
+        proposal_size=swap_fraction,
+    )
+    rows = _run_mcmc_cumulative_checkpoints(
+        scenario.problem,
+        scenario.exact_p,
+        checkpoints=chain_checkpoints,
+        reported_checkpoints=reported_checkpoints,
+        beta=float(init_payload["beta0_laplace"]),
+        sigma_t=float(init_payload["sigma_t"]),
+        cfg=worker_cfg,
+        seed=int(seed) + 1,
+    )
+    annotations = _threshold_grid_common_annotations(
+        scenario=scenario,
+        family=family,
+        threshold_band=threshold_band,
+        swap_fraction=swap_fraction,
+        gamma=float(gamma),
+        p0_reference=float(p0_reference),
+        p0_reference_source=p0_source,
+        q_target=float(init_payload["q_target"]),
+        seed=int(seed),
+        n_swap_pairs=int(n_swap_pairs),
+    )
+    for row in rows:
+        row.update(annotations)
+        row["method"] = "mcmc_is_no_oracle"
+        row["label"] = f"mcmc_is_no_oracle__swap_{float(swap_fraction):.2f}__gamma_{float(gamma):.12g}"
+        row["beta_selection_budget"] = int(beta_selection_budget)
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"] + beta_selection_budget)
+        row["beta_init_pilot_samples"] = int(init_payload["pilot_eval_total"])
+        row["beta_init_wall_time_sec"] = float(init_payload["pilot_wall_time_sec"])
+        row["beta0_formula"] = float(init_payload["beta0_formula"])
+        row["beta0_laplace"] = float(init_payload["beta0_laplace"])
+        row["beta_used"] = float(init_payload["beta0_laplace"])
+        row["p0_for_qtarget"] = float(init_payload["p0_for_qtarget"])
+        row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
+        row["oracle_mode"] = "known_threshold_p0"
+    return rows
+
+
+def _threshold_grid_hard_step_scenario_worker(
+    *,
+    scenario: LoadedScenario,
+    family: str,
+    threshold_band: str,
+    checkpoints: tuple[int, ...],
+    gamma: float,
+    swap_fraction: float | int,
+    mcmc_cfg: MCMCWorkflowConfig,
+    seed: int,
+) -> list[dict[str, Any]]:
+    p0_reference, p0_source = known_threshold_p0_for_scenario(scenario, fallback_to_exact=False)
+    q_target = float(float(p0_reference) ** float(gamma))
+    r = hard_step_r_for_target_tail_mass(float(p0_reference), q_target)
+    beta = hard_step_beta_for_target_tail_mass(float(p0_reference), q_target)
+    worker_cfg = replace(
+        mcmc_cfg,
+        use_true_p0_for_q_target=False,
+        p0_guess=float(p0_reference),
+        d_alpha=float(gamma),
+        proposal_size=swap_fraction,
+        tilt_mode="step",
+        local_scan_enabled=False,
+        hard_step_enabled=True,
+    )
+    n_swap_pairs = resolve_n_swap_pairs(
+        scenario.problem.n_treated,
+        scenario.problem.n_control,
+        proposal_size=swap_fraction,
+    )
+    rows = _run_mcmc_cumulative_checkpoints(
+        scenario.problem,
+        scenario.exact_p,
+        checkpoints=checkpoints,
+        beta=float(beta),
+        sigma_t=1.0,
+        cfg=worker_cfg,
+        seed=int(seed) + 2,
+    )
+    annotations = _threshold_grid_common_annotations(
+        scenario=scenario,
+        family=family,
+        threshold_band=threshold_band,
+        swap_fraction=swap_fraction,
+        gamma=float(gamma),
+        p0_reference=float(p0_reference),
+        p0_reference_source=p0_source,
+        q_target=float(q_target),
+        seed=int(seed),
+        n_swap_pairs=int(n_swap_pairs),
+    )
+    for row in rows:
+        row.update(annotations)
+        row["method"] = "hard_step"
+        row["label"] = f"hard_step__swap_{float(swap_fraction):.2f}__gamma_{float(gamma):.12g}"
+        row["beta_selection_budget"] = 0
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+        row["hard_step_reference_p0"] = float(p0_reference)
+        row["hard_step_reference_p0_source"] = str(p0_source)
+        row["hard_step_target_tail_mass"] = float(q_target)
+        row["hard_step_r"] = float(r)
+        row["hard_step_beta"] = float(beta)
+        row["q_tilt_tail_share"] = float(row.get("tail_share_raw", np.nan))
+        row["oracle_mode"] = "known_threshold_p0"
+    return rows
+
+
+def _threshold_grid_samc_scenario_worker(
+    *,
+    scenario: LoadedScenario,
+    family: str,
+    threshold_band: str,
+    checkpoints: tuple[int, ...],
+    swap_fraction: float | int,
+    samc_cfg: SAMCWorkflowConfig,
+    seed: int,
+) -> list[dict[str, Any]]:
+    p0_reference, p0_source = known_threshold_p0_for_scenario(scenario, fallback_to_exact=False)
+    worker_cfg = replace(samc_cfg, proposal_size=swap_fraction)
+    n_swap_pairs = resolve_n_swap_pairs(
+        scenario.problem.n_treated,
+        scenario.problem.n_control,
+        proposal_size=swap_fraction,
+    )
+    samc_setup = tune_samc_setup(scenario.problem, worker_cfg, seed=int(seed))
+    rows = _run_samc_cumulative_checkpoints(
+        scenario.problem,
+        scenario.exact_p,
+        checkpoints=checkpoints,
+        samc_setup=samc_setup,
+        cfg=worker_cfg,
+        seed=int(seed) + 3,
+    )
+    annotations = _threshold_grid_common_annotations(
+        scenario=scenario,
+        family=family,
+        threshold_band=threshold_band,
+        swap_fraction=swap_fraction,
+        gamma=None,
+        p0_reference=float(p0_reference),
+        p0_reference_source=p0_source,
+        q_target=None,
+        seed=int(seed),
+        n_swap_pairs=int(n_swap_pairs),
+    )
+    for row in rows:
+        row.update(annotations)
+        row["method"] = "samc"
+        row["label"] = f"samc__swap_{float(swap_fraction):.2f}"
+        row["beta_selection_budget"] = 0
+        row["eval_incl_tuning"] = float(row["eval_excl_tuning"])
+        row["samc_setup_eval_total"] = int(worker_cfg.lambda_min_pilot)
+        row["eval_incl_setup"] = float(row["eval_excl_tuning"] + int(worker_cfg.lambda_min_pilot))
+        row["samc_lambda_min"] = float(samc_setup["lambda_min"])
+        row["samc_n_bins"] = int(worker_cfg.n_bins)
+        row["oracle_mode"] = "not_applicable"
+    return rows
+
+
+def _threshold_grid_scenario_worker(job: dict[str, Any]) -> list[dict[str, Any]]:
+    method = str(job["method"])
+    if method == "samc":
+        return _threshold_grid_samc_scenario_worker(
+            scenario=job["scenario"],
+            family=str(job["family"]),
+            threshold_band=str(job["threshold_band"]),
+            checkpoints=tuple(int(v) for v in job["checkpoints"]),
+            swap_fraction=job["swap_fraction"],
+            samc_cfg=job["samc_cfg"],
+            seed=int(job["seed"]),
+        )
+    if method == "mcmc_is":
+        return _threshold_grid_mcmcis_scenario_worker(
+            scenario=job["scenario"],
+            family=str(job["family"]),
+            threshold_band=str(job["threshold_band"]),
+            checkpoints=tuple(int(v) for v in job["checkpoints"]),
+            gamma=float(job["gamma"]),
+            swap_fraction=job["swap_fraction"],
+            mcmc_cfg=job["mcmc_cfg"],
+            seed=int(job["seed"]),
+        )
+    if method == "hard_step":
+        return _threshold_grid_hard_step_scenario_worker(
+            scenario=job["scenario"],
+            family=str(job["family"]),
+            threshold_band=str(job["threshold_band"]),
+            checkpoints=tuple(int(v) for v in job["checkpoints"]),
+            gamma=float(job["gamma"]),
+            swap_fraction=job["swap_fraction"],
+            mcmc_cfg=job["mcmc_cfg"],
+            seed=int(job["seed"]),
+        )
+    raise ValueError(f"Unknown threshold-grid method: {method}")
+
+
+def _read_jsonl_lenient(path: Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _append_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, default=_json_default))
+            handle.write("\n")
+
+
+def _threshold_grid_record_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("threshold_band", "")),
+        str(row.get("family", "")),
+        float(row.get("swap_fraction", np.nan)),
+        str(row.get("method", "")),
+        str(row.get("gamma_label", "")),
+        str(row.get("scenario", "")),
+        int(row.get("checkpoint", 0)),
+    )
+
+
+def run_threshold_grid_method_block(
+    scenarios: Iterable[LoadedScenario],
+    *,
+    method: str,
+    family: str,
+    threshold_band: str,
+    checkpoints: Iterable[int],
+    swap_fraction: float | int,
+    gamma: float | None = None,
+    mcmc_cfg: MCMCWorkflowConfig | None = None,
+    samc_cfg: SAMCWorkflowConfig | None = None,
+    base_seed: int = 246_810,
+    n_jobs: int = 1,
+    output_dir: Path | None = None,
+    resume: bool = True,
+    block_label: str | None = None,
+) -> dict[str, Any]:
+    method = str(method)
+    if method not in {"samc", "mcmc_is", "hard_step"}:
+        raise ValueError("method must be one of {'samc', 'mcmc_is', 'hard_step'}.")
+    if method in {"mcmc_is", "hard_step"} and gamma is None:
+        raise ValueError("gamma is required for MCMC-IS and hard-step blocks.")
+
+    scenario_list = list(scenarios)
+    checkpoints_tuple = _sorted_unique_points(checkpoints)
+    mcmc_cfg = MCMCWorkflowConfig() if mcmc_cfg is None else mcmc_cfg
+    samc_cfg = SAMCWorkflowConfig() if samc_cfg is None else samc_cfg
+    output_dir = None if output_dir is None else Path(output_dir)
+    final_records_path = output_dir / "block_records.jsonl" if output_dir is not None else None
+    partial_records_path = output_dir / "block_records.partial.jsonl" if output_dir is not None else None
+    summary_path = output_dir / "block_summary.json" if output_dir is not None else None
+    metadata_path = output_dir / "block_metadata.json" if output_dir is not None else None
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if resume and final_records_path is not None and final_records_path.exists():
+            records = sorted(read_jsonl(final_records_path), key=_threshold_grid_record_sort_key)
+            summary = summarize_records(
+                records,
+                group_fields=("threshold_band", "family", "swap_fraction", "method", "gamma_label", "checkpoint"),
+            )
+            metadata = read_json(metadata_path) if metadata_path is not None and metadata_path.exists() else {}
+            metadata.update(
+                {
+                    "status": "loaded_complete",
+                    "n_records": int(len(records)),
+                    "n_scenarios": int(len(scenario_list)),
+                }
+            )
+            return {
+                "records": records,
+                "summary": summary,
+                "metadata": metadata,
+                "output_dir": output_dir,
+                "loaded_from": final_records_path,
+            }
+        if partial_records_path is not None and (not resume or not partial_records_path.exists()):
+            partial_records_path.write_text("", encoding="utf-8")
+
+    expected_rows_per_scenario = len(checkpoints_tuple)
+    if method == "mcmc_is":
+        expected_rows_per_scenario = sum(1 for cp in checkpoints_tuple if int(cp) > int(mcmc_cfg.pilot_samples))
+
+    partial_rows: list[dict[str, Any]] = []
+    completed_scenario_keys: set[str] = set()
+    if resume and partial_records_path is not None and partial_records_path.exists():
+        partial_rows = _read_jsonl_lenient(partial_records_path)
+        counts_by_scenario: dict[str, int] = {}
+        for row in partial_rows:
+            key = str(row.get("scenario", ""))
+            if key:
+                counts_by_scenario[key] = counts_by_scenario.get(key, 0) + 1
+        completed_scenario_keys = {
+            key for key, count in counts_by_scenario.items() if count >= expected_rows_per_scenario
+        }
+
+    pending_scenarios = [s for s in scenario_list if s.key not in completed_scenario_keys]
+    records = [row for row in partial_rows if str(row.get("scenario", "")) in completed_scenario_keys]
+    metadata = {
+        "status": "running",
+        "block_label": block_label,
+        "method": method,
+        "family": family,
+        "threshold_band": threshold_band,
+        "swap_fraction": float(swap_fraction),
+        "gamma": float(gamma) if gamma is not None else None,
+        "checkpoints": list(checkpoints_tuple),
+        "max_budget": int(checkpoints_tuple[-1]),
+        "n_scenarios": int(len(scenario_list)),
+        "n_pending_scenarios": int(len(pending_scenarios)),
+        "n_completed_scenarios_from_partial": int(len(completed_scenario_keys)),
+        "scenario_keys": [s.key for s in scenario_list],
+        "base_seed": int(base_seed),
+        "n_jobs_requested": int(n_jobs),
+        "mcmc_config": mcmc_cfg,
+        "samc_config": samc_cfg,
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if metadata_path is not None:
+        write_json(metadata_path, metadata)
+
+    jobs = [
+        {
+            "scenario": scenario,
+            "method": method,
+            "family": family,
+            "threshold_band": threshold_band,
+            "checkpoints": checkpoints_tuple,
+            "gamma": gamma,
+            "swap_fraction": swap_fraction,
+            "mcmc_cfg": mcmc_cfg,
+            "samc_cfg": samc_cfg,
+            "seed": int(base_seed) + 10_000 * scenario_idx,
+        }
+        for scenario_idx, scenario in enumerate(pending_scenarios)
+    ]
+    effective_jobs = _effective_n_jobs(int(n_jobs), len(jobs))
+    metadata["n_jobs_effective"] = int(effective_jobs)
+
+    executor = _try_make_process_pool(effective_jobs) if effective_jobs > 1 else None
+    t_start = time.perf_counter()
+    if executor is None:
+        for job in jobs:
+            rows = _threshold_grid_scenario_worker(job)
+            records.extend(rows)
+            if partial_records_path is not None:
+                _append_jsonl(partial_records_path, rows)
+    else:
+        with executor:
+            futures = {executor.submit(_threshold_grid_scenario_worker, job): job for job in jobs}
+            for future in cf.as_completed(futures):
+                rows = future.result()
+                records.extend(rows)
+                if partial_records_path is not None:
+                    _append_jsonl(partial_records_path, rows)
+
+    records = sorted(records, key=_threshold_grid_record_sort_key)
+    summary = summarize_records(
+        records,
+        group_fields=("threshold_band", "family", "swap_fraction", "method", "gamma_label", "checkpoint"),
+    )
+    metadata.update(
+        {
+            "status": "complete",
+            "n_records": int(len(records)),
+            "n_summary_rows": int(len(summary)),
+            "wall_time_sec": float(time.perf_counter() - t_start),
+            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    if final_records_path is not None:
+        write_jsonl(final_records_path, records)
+    if summary_path is not None:
+        write_json(summary_path, summary)
+    if metadata_path is not None:
+        write_json(metadata_path, metadata)
+    return {
+        "records": records,
+        "summary": summary,
+        "metadata": metadata,
+        "output_dir": output_dir,
+        "loaded_from": None,
+    }
+
+
 def summarize_records(
     records: list[dict[str, Any]],
     *,
