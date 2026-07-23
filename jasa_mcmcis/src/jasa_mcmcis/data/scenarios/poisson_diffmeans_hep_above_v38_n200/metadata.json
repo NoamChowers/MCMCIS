@@ -1,0 +1,64 @@
+{
+  "key": "poisson_diffmeans_hep_above_v38_n200",
+  "description": "Poisson count above-threshold variant resembling a high-energy-physics counting test: treated~Pois(3), control~Pois(2), n1=n2=100.",
+  "statistic_name": "difference_in_means",
+  "tail": "right",
+  "permutation_p_value_definition": "Right-tail probability from full permutation enumeration over all fixed-size labelings.",
+  "n": 200,
+  "n_treated": 100,
+  "n_control": 100,
+  "t_obs": 1.0899999999999999,
+  "exact_method": "LinearStatisticDPSolver",
+  "exact_p_value": 3.406284202986477e-07,
+  "tail_hits": 30843397507697411928798549753593897556807187800670682,
+  "n_permutations": 90548514656103281165404177077484163874504589675413336841320,
+  "notes": "Deterministic benchmark dataset generated from Poisson draws with fixed seed; right-tail test on mean(group1)-mean(group0).",
+  "extra": {
+    "n_pois2": 100,
+    "n_pois3": 100,
+    "lambda_low": 2.0,
+    "lambda_high": 3.0,
+    "treated_block": "pois3_second_block",
+    "seed": 3435,
+    "mean_pois2": 1.85,
+    "mean_pois3": 2.94,
+    "known_significance_threshold": 3e-07,
+    "p_over_p0": 1.135428067662159,
+    "application_setting_key": "hep_threshold_suite",
+    "application_setting_label": "HEP-like Poisson count test",
+    "threshold_band": "above",
+    "above_threshold_variant_index": 38,
+    "above_threshold_ratio_range": [
+      1.01,
+      1.25
+    ]
+  },
+  "portfolio": {
+    "family": "poisson_count",
+    "statistic_family": "linear_statistic",
+    "data_family": "count",
+    "rarity_band": "extreme",
+    "expected_difficulty": "moderate",
+    "sample_size_band": "large",
+    "has_ties": true,
+    "is_discrete": true,
+    "groups": [
+      "exploratory_exact",
+      "threshold_suite",
+      "hep_threshold_suite",
+      "hep_threshold_suite_above",
+      "above_threshold_variety",
+      "hep_threshold_suite_above_threshold_variety"
+    ],
+    "known_significance_threshold": 3e-07,
+    "p_over_p0": 1.135428067662159,
+    "application_setting_key": "hep_threshold_suite",
+    "application_setting_label": "HEP-like Poisson count test",
+    "threshold_band": "above",
+    "above_threshold_variant_index": 38,
+    "above_threshold_ratio_range": [
+      1.01,
+      1.25
+    ]
+  }
+}
