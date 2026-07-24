@@ -49,6 +49,7 @@ def _common_setup_code() -> str:
     from dataclasses import replace
     import json
     import os
+    import shutil
     import sys
     from pathlib import Path
 
@@ -3484,7 +3485,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             - Compare SAMC, hard-step IS, and MCMC-IS without oracle p-values on the 50 GWAS-like and 50 HEP-like threshold scenarios.
             - Use a 5M maximum reported budget with 250k checkpoints.
             - Sweep swap size over 5% and 10% of the smaller group size.
-            - For MCMC-IS and hard-step, sweep `gamma in {0.25, 1/3, 0.4}` with `q = p0 ** gamma`, where `p0` is the known application threshold stored in the scenario metadata.
+            - For MCMC-IS and hard-step, sweep `gamma in {0.25, 1/3, 0.4, 0.5}` with `q = p0 ** gamma`, where `p0` is the known application threshold stored in the scenario metadata.
 
             Each family/swap/method/gamma block writes its own partial and final JSONL files as soon as it finishes.
             """
@@ -3505,9 +3506,11 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             SAVE_OUTPUTS = True
             RESUME_BLOCKS = True
             RUN_DIR_OVERRIDE = None  # Set to a previous run_dir string to resume after a kernel restart.
+            SKIP_IF_PRESENT = True
 
             CATALOG_PATH = project_root / "results" / "exact_scenarios" / "v1" / "catalog.json"
             OUTPUT_ROOT = project_root / "results" / "cross_method_threshold_grid"
+            LATEST_RESULTS_DIR = OUTPUT_ROOT / "20260723_205321_threshold_grid_cross_method"
 
             THRESHOLD_BANDS = ("near",)
             FAMILIES = ("gwas", "hep")
@@ -3519,7 +3522,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             CHECKPOINTS = tuple(range(CHECKPOINT_STEP, MAX_BUDGET + CHECKPOINT_STEP, CHECKPOINT_STEP))
             APPENDIX_FIGURE_BUDGETS = (1_000_000, 2_500_000) if not FAST_MODE else tuple()
             SWAP_FRACTIONS = (0.05, 0.10)
-            GAMMAS = (0.25, 1.0 / 3.0, 0.40)
+            GAMMAS = (0.25, 1.0 / 3.0, 0.40, 0.50)
 
             BETA_INIT_PILOT_SAMPLES = 100_000 if not FAST_MODE else 1_000
             N_JOBS = min(6, os.cpu_count() or 1) if not FAST_MODE else 1
@@ -3575,6 +3578,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                 "N_JOBS": N_JOBS,
                 "SAVE_OUTPUTS": SAVE_OUTPUTS,
                 "RESUME_BLOCKS": RESUME_BLOCKS,
+                "SKIP_IF_PRESENT": SKIP_IF_PRESENT,
+                "LATEST_RESULTS_DIR": str(LATEST_RESULTS_DIR) if LATEST_RESULTS_DIR is not None else None,
             }, indent=2))
             """
         ),
@@ -3748,6 +3753,77 @@ def build_cross_method_threshold_grid_notebook() -> dict:
         markdown_cell("## Run Blocks"),
         code_cell(
             """
+            def resolve_latest_results_dir() -> Path | None:
+                if not bool(SKIP_IF_PRESENT):
+                    return None
+                if LATEST_RESULTS_DIR is None:
+                    raise ValueError("SKIP_IF_PRESENT=True requires LATEST_RESULTS_DIR to be set.")
+                latest = Path(LATEST_RESULTS_DIR).expanduser()
+                if not latest.is_absolute():
+                    latest = (project_root / latest).resolve()
+                else:
+                    latest = latest.resolve()
+                if not latest.exists():
+                    raise FileNotFoundError(f"LATEST_RESULTS_DIR does not exist: {latest}")
+                return latest
+
+
+            latest_results_dir = resolve_latest_results_dir()
+
+
+            def _same_optional_float(left, right) -> bool:
+                if left is None and right is None:
+                    return True
+                if left is None or right is None:
+                    return False
+                return abs(float(left) - float(right)) <= 1e-12
+
+
+            def prior_block_is_compatible(prior_block_dir: Path, block: dict) -> bool:
+                records_path = prior_block_dir / "block_records.jsonl"
+                if not records_path.exists():
+                    return False
+                metadata_path = prior_block_dir / "block_metadata.json"
+                if metadata_path.exists():
+                    metadata = read_json(metadata_path)
+                    if str(metadata.get("method")) != str(block["method"]):
+                        return False
+                    if str(metadata.get("family")) != str(block["family"]):
+                        return False
+                    if str(metadata.get("threshold_band")) != str(block["threshold_band"]):
+                        return False
+                    if not _same_optional_float(metadata.get("swap_fraction"), block["swap_fraction"]):
+                        return False
+                    if not _same_optional_float(metadata.get("gamma"), block["gamma"]):
+                        return False
+                    if int(metadata.get("max_budget", -1)) != int(MAX_BUDGET):
+                        return False
+                    if tuple(int(x) for x in metadata.get("checkpoints", [])) != tuple(int(x) for x in CHECKPOINTS):
+                        return False
+                records = pd.read_json(records_path, orient="records", lines=True)
+                expected_scenarios = {scenario.key for scenario in block["scenarios"]}
+                if set(records["scenario"].dropna().astype(str)) != expected_scenarios:
+                    return False
+                if int(records["checkpoint"].max()) != int(MAX_BUDGET):
+                    return False
+                return True
+
+
+            def copy_prior_block_if_present(block: dict, slug: str, block_dir: Path | None) -> Path | None:
+                if latest_results_dir is None:
+                    return None
+                prior_block_dir = latest_results_dir / slug
+                if not prior_block_is_compatible(prior_block_dir, block):
+                    return None
+                if block_dir is not None and block_dir.resolve() != prior_block_dir.resolve():
+                    block_dir.mkdir(parents=True, exist_ok=True)
+                    for filename in ("block_records.jsonl", "block_summary.json", "block_metadata.json"):
+                        source = prior_block_dir / filename
+                        if source.exists():
+                            shutil.copy2(source, block_dir / filename)
+                return prior_block_dir
+
+
             if SAVE_OUTPUTS:
                 if RUN_DIR_OVERRIDE is not None:
                     run_dir = Path(RUN_DIR_OVERRIDE).expanduser().resolve()
@@ -3761,6 +3837,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             for block_index, block in enumerate(method_blocks):
                 slug = block_slug(block)
                 block_dir = (run_dir / slug) if run_dir is not None else None
+                reused_from_prior = copy_prior_block_if_present(block, slug, block_dir)
                 print(json.dumps({
                     "block": f"{block_index + 1}/{len(method_blocks)}",
                     "slug": slug,
@@ -3771,6 +3848,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                     "gamma": block["gamma"],
                     "n_scenarios": len(block["scenarios"]),
                     "output_dir": str(block_dir) if block_dir is not None else None,
+                    "reused_from_prior": str(reused_from_prior) if reused_from_prior is not None else None,
                 }, indent=2))
                 result = run_threshold_grid_method_block(
                     block["scenarios"],
@@ -3800,6 +3878,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                     "n_summary_rows": len(result["summary"]),
                     "output_dir": str(result["output_dir"]) if result["output_dir"] is not None else None,
                     "loaded_from": str(result["loaded_from"]) if result.get("loaded_from") is not None else None,
+                    "reused_from_prior": str(reused_from_prior) if reused_from_prior is not None else None,
                     "wall_time_sec": result["metadata"].get("wall_time_sec"),
                     "status": result["metadata"].get("status"),
                     "result": result,
@@ -3853,6 +3932,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                             "SAMC_N_BINS": SAMC_CFG.n_bins,
                             "SAMC_LAMBDA_MIN_PILOT": SAMC_CFG.lambda_min_pilot,
                             "RESUME_BLOCKS": RESUME_BLOCKS,
+                            "SKIP_IF_PRESENT": SKIP_IF_PRESENT,
+                            "LATEST_RESULTS_DIR": str(latest_results_dir) if latest_results_dir is not None else None,
                         },
                         indent=2,
                     ),

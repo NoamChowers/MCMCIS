@@ -1067,6 +1067,15 @@ def _format_budget_title(value: int | float, subject: str) -> str:
     return f"{subject} at {_format_budget_millions(value)} million iterations"
 
 
+def _format_threshold_grid_gamma_axis_label(gamma: float) -> str:
+    gamma_value = float(gamma)
+    if np.isfinite(gamma_value) and np.isclose(gamma_value, 1.0 / 3.0):
+        return "1/3"
+    if np.isfinite(gamma_value):
+        return f"{gamma_value:.3g}"
+    return str(gamma)
+
+
 def _style_article_axis(
     ax,
     *,
@@ -5262,7 +5271,7 @@ def plot_threshold_grid_gamma_swap_rrmse(
         ): float(row["median_scenario_are"])
         for row in summary_rows
     }
-    gamma_labels = ["0.25", "1/3", "0.4"]
+    gamma_labels = [_format_threshold_grid_gamma_axis_label(gamma) for gamma in gamma_values]
     method_specs = [
         ("mcmc_is_no_oracle", "Smooth MCMC-IS", "#2f6fb0"),
         ("hard_step", "Hard-step MCMC", "#b04a5a"),
@@ -5427,7 +5436,7 @@ def plot_threshold_grid_tilt_family_rrmse(
         ): float(row[metric_field])
         for row in summary_rows
     }
-    gamma_labels = ["0.25", "1/3", "0.4"]
+    gamma_labels = [_format_threshold_grid_gamma_axis_label(gamma) for gamma in gamma_values]
     method_specs = [
         ("mcmc_is_no_oracle", "Smooth MCMC-IS", "#2f6fb0"),
         ("hard_step", "Hard-step MCMC", "#b04a5a"),
