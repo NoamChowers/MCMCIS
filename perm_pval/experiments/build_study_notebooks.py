@@ -3872,6 +3872,9 @@ def build_cross_method_threshold_grid_notebook() -> dict:
         code_cell(
             """
             figure_dir = (run_dir / "figures") if (SAVE_OUTPUTS and run_dir is not None) else None
+            figure_support_dir = (figure_dir / "support") if figure_dir is not None else None
+            if figure_support_dir is not None:
+                figure_support_dir.mkdir(parents=True, exist_ok=True)
 
             def figure_budget_suffix(budget: int) -> str:
                 if int(budget) == int(MAX_BUDGET):
@@ -3883,8 +3886,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             figure1_summaries = {}
             for figure_budget in figure_budgets:
                 suffix = figure_budget_suffix(int(figure_budget))
-                fig1_median_path = (figure_dir / f"figure1_tilt_gamma_median_rrmse{suffix}.png") if figure_dir is not None else None
-                fig1_mean_path = (figure_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}.png") if figure_dir is not None else None
+                fig1_median_path = (figure_support_dir / f"figure1_tilt_gamma_median_rrmse{suffix}.png") if figure_support_dir is not None else None
+                fig1_mean_path = (figure_support_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}.png") if figure_support_dir is not None else None
                 figure1_median_summary = plot_threshold_grid_tilt_family_rrmse(
                     all_records,
                     max_budget=int(figure_budget),
@@ -3893,7 +3896,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                     gamma_values=tuple(GAMMAS),
                     swap_fractions=tuple(SWAP_FRACTIONS),
                     save_path=fig1_median_path,
-                    table_save_path=(figure_dir / f"figure1_tilt_gamma_median_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                    table_save_path=(figure_support_dir / f"figure1_tilt_gamma_median_rrmse{suffix}_summary.json") if figure_support_dir is not None else None,
                 )
                 figure1_mean_summary = plot_threshold_grid_tilt_family_rrmse(
                     all_records,
@@ -3903,7 +3906,7 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                     gamma_values=tuple(GAMMAS),
                     swap_fractions=tuple(SWAP_FRACTIONS),
                     save_path=fig1_mean_path,
-                    table_save_path=(figure_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                    table_save_path=(figure_support_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}_summary.json") if figure_support_dir is not None else None,
                 )
                 figure1_summaries[int(figure_budget)] = {
                     "median": figure1_median_summary,
@@ -3957,14 +3960,14 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             figure2_summaries = {}
             for figure_budget in figure_budgets:
                 suffix = figure_budget_suffix(int(figure_budget))
-                fig2_path = (figure_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}.png") if figure_dir is not None else None
+                fig2_path = (figure_support_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}.png") if figure_support_dir is not None else None
                 figure2_summary = plot_threshold_grid_best_practical_rrmse(
                     all_records,
                     max_budget=int(figure_budget),
                     families=tuple(FAMILIES),
                     selection_metric="median",
                     save_path=fig2_path,
-                    table_save_path=(figure_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                    table_save_path=(figure_support_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}_summary.json") if figure_support_dir is not None else None,
                 )
                 figure2_summaries[int(figure_budget)] = {
                     "summary": figure2_summary,
@@ -3995,14 +3998,14 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             figure3_summaries = {}
             for figure_budget in figure_budgets:
                 suffix = figure_budget_suffix(int(figure_budget))
-                fig3_path = (figure_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}.png") if figure_dir is not None else None
+                fig3_path = (figure_support_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}.png") if figure_support_dir is not None else None
                 figure3_summary = plot_threshold_grid_best_practical_scenario_scatter(
                     all_records,
                     max_budget=int(figure_budget),
                     families=tuple(FAMILIES),
                     selection_metric="median",
                     save_path=fig3_path,
-                    table_save_path=(figure_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                    table_save_path=(figure_support_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}_summary.json") if figure_support_dir is not None else None,
                 )
                 figure3_summaries[int(figure_budget)] = {
                     "summary": figure3_summary,
@@ -4030,14 +4033,14 @@ def build_cross_method_threshold_grid_notebook() -> dict:
         markdown_cell("## Figure 4: Threshold-Scale Estimates"),
         code_cell(
             """
-            fig4_path = (figure_dir / "figure4_estimate_vs_threshold_ratio.png") if figure_dir is not None else None
+            fig4_path = (figure_support_dir / "figure4_estimate_vs_threshold_ratio.png") if figure_support_dir is not None else None
             figure4_points = plot_threshold_grid_estimate_vs_threshold_ratio(
                 all_records,
                 max_budget=int(MAX_BUDGET),
                 families=tuple(FAMILIES),
                 selection_metric="median",
                 save_path=fig4_path,
-                table_save_path=(figure_dir / "figure4_estimate_vs_threshold_ratio_points.json") if figure_dir is not None else None,
+                table_save_path=(figure_support_dir / "figure4_estimate_vs_threshold_ratio_points.json") if figure_support_dir is not None else None,
             )
             if figure_dir is not None:
                 plot_threshold_grid_estimate_vs_threshold_ratio(
@@ -4083,8 +4086,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             for figure_budget in bootstrap_budgets:
                 suffix = bootstrap_budget_suffix(int(figure_budget))
                 bootstrap_path = (
-                    figure_dir / f"figure3_bootstrap_diagnostics{suffix}.json"
-                ) if figure_dir is not None else None
+                    figure_support_dir / f"figure3_bootstrap_diagnostics{suffix}.json"
+                ) if figure_support_dir is not None else None
                 bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
                     all_records,
                     max_budget=int(figure_budget),
@@ -4112,8 +4115,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
 
             bootstrap_summary_df = pd.DataFrame(bootstrap_summary_rows).sort_values(["checkpoint", "family"])
             if figure_dir is not None:
-                bootstrap_summary_path = figure_dir / "figure3_bootstrap_diagnostics_summary.json"
-                bootstrap_summary_csv_path = figure_dir / "figure3_bootstrap_diagnostics_summary.csv"
+                bootstrap_summary_path = figure_support_dir / "figure3_bootstrap_diagnostics_summary.json"
+                bootstrap_summary_csv_path = figure_support_dir / "figure3_bootstrap_diagnostics_summary.csv"
                 write_json(bootstrap_summary_path, bootstrap_summary_rows)
                 bootstrap_summary_df.to_csv(bootstrap_summary_csv_path, index=False)
                 print(f"Saved bootstrap diagnostic summary to {bootstrap_summary_path}")
@@ -4130,8 +4133,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             for figure_budget in bootstrap_budgets:
                 suffix = bootstrap_budget_suffix(int(figure_budget))
                 bootstrap_path = (
-                    figure_dir / f"figure3_bootstrap_fixed_5m_config_diagnostics{suffix}.json"
-                ) if figure_dir is not None else None
+                    figure_support_dir / f"figure3_bootstrap_fixed_5m_config_diagnostics{suffix}.json"
+                ) if figure_support_dir is not None else None
                 bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
                     all_records,
                     max_budget=int(figure_budget),
@@ -4163,8 +4166,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                 .sort_values(["checkpoint", "family"])
             )
             if figure_dir is not None:
-                fixed_summary_path = figure_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.json"
-                fixed_summary_csv_path = figure_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.csv"
+                fixed_summary_path = figure_support_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.json"
+                fixed_summary_csv_path = figure_support_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.csv"
                 write_json(fixed_summary_path, fixed_config_bootstrap_summary_rows)
                 fixed_config_bootstrap_summary_df.to_csv(fixed_summary_csv_path, index=False)
                 print(f"Saved fixed-config bootstrap diagnostic summary to {fixed_summary_path}")
@@ -4181,8 +4184,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             for figure_budget in bootstrap_budgets:
                 suffix = bootstrap_budget_suffix(int(figure_budget))
                 bootstrap_path = (
-                    figure_dir / f"figure3_bootstrap_fixed_1m_config_diagnostics{suffix}.json"
-                ) if figure_dir is not None else None
+                    figure_support_dir / f"figure3_bootstrap_fixed_1m_config_diagnostics{suffix}.json"
+                ) if figure_support_dir is not None else None
                 bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
                     all_records,
                     max_budget=int(figure_budget),
@@ -4214,8 +4217,8 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                 .sort_values(["checkpoint", "family"])
             )
             if figure_dir is not None:
-                fixed_1m_summary_path = figure_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.json"
-                fixed_1m_summary_csv_path = figure_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.csv"
+                fixed_1m_summary_path = figure_support_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.json"
+                fixed_1m_summary_csv_path = figure_support_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.csv"
                 write_json(fixed_1m_summary_path, fixed_1m_config_bootstrap_summary_rows)
                 fixed_1m_config_bootstrap_summary_df.to_csv(fixed_1m_summary_csv_path, index=False)
                 print(f"Saved fixed-1M-config bootstrap diagnostic summary to {fixed_1m_summary_path}")
