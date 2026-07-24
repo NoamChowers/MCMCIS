@@ -5552,14 +5552,8 @@ def plot_threshold_grid_tilt_family_rrmse(
         fontsize=9.8,
         bbox_to_anchor=(0.5, -0.02),
     )
-    metric_title = metric_label.replace("ARE", "absolute relative error")
-    metric_title = metric_title[:1].lower() + metric_title[1:]
-    fig.suptitle(
-        _format_budget_title(max_budget, f"Tilt tuning: {metric_title}"),
-        fontsize=12.2,
-        y=0.99,
-    )
-    plt.tight_layout(rect=(0.04, 0.08, 1.0, 0.99))
+    # Figure titles are supplied by the article LaTeX captions.
+    plt.tight_layout(rect=(0.04, 0.08, 1.0, 1.0))
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5978,12 +5972,8 @@ def plot_threshold_grid_best_practical_rrmse(
     for row in selected_rows:
         row.pop("_plot_values", None)
 
-    fig.suptitle(
-        _format_budget_title(max_budget, "Scenario-level absolute relative error distributions"),
-        fontsize=12.2,
-        y=0.99,
-    )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+    # Figure titles are supplied by the article LaTeX captions.
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 1.0))
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6149,12 +6139,8 @@ def plot_threshold_grid_best_practical_scenario_scatter(
             }
         )
 
-    fig.suptitle(
-        _format_budget_title(max_budget, "Scenario-by-scenario absolute relative error comparison"),
-        fontsize=12.2,
-        y=0.99,
-    )
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    # Figure titles are supplied by the article LaTeX captions.
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 1.0))
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6361,27 +6347,11 @@ def plot_threshold_grid_estimate_vs_threshold_ratio(
                 color="#333333",
             )
 
-    plt.tight_layout(rect=(0.15, 0.13, 1.0, 0.925))
+    # Figure titles are supplied by the article LaTeX captions.
+    plt.tight_layout(rect=(0.15, 0.13, 1.0, 1.0))
     fig.canvas.draw()
     panel_boxes = [ax.get_position() for ax in axes.ravel()]
     panel_center_x = 0.5 * (min(box.x0 for box in panel_boxes) + max(box.x1 for box in panel_boxes))
-    fig.text(
-        panel_center_x,
-        0.995,
-        "Estimated versus exact p-values",
-        ha="center",
-        va="top",
-        fontsize=12.2,
-    )
-    fig.text(
-        panel_center_x,
-        0.957,
-        f"Results at {_format_budget_millions(max_budget)} million iterations",
-        ha="center",
-        va="top",
-        fontsize=9.7,
-        color="#333333",
-    )
     fig.legend(
         handles=[
             Line2D([0], [0], color="#545b61", linestyle=(0, (1.3, 2.3)), linewidth=1.05, label=r"$\hat{p}=p$"),
