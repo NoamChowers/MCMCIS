@@ -14,6 +14,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.ticker import FixedLocator, MaxNLocator
 
 from perm_pval.core.proposals import propose_localized_swaps, resolve_n_swap_pairs
 from perm_pval.core.problem import PermutationTestProblem
@@ -1050,6 +1052,19 @@ def _format_budget_tick_compact(value: int | float) -> str:
     else:
         scaled_str = f"{scaled:.1f}".rstrip("0").rstrip(".")
     return f"{scaled_str}{suffix}"
+
+
+def _format_budget_millions(value: int | float) -> str:
+    scaled = float(value) / 1_000_000.0
+    if np.isfinite(scaled) and np.isclose(scaled, round(scaled)):
+        return str(int(round(scaled)))
+    if np.isfinite(scaled):
+        return f"{scaled:.2f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _format_budget_title(value: int | float, subject: str) -> str:
+    return f"{subject} at {_format_budget_millions(value)} million iterations"
 
 
 def _style_article_axis(
@@ -5158,6 +5173,1225 @@ def plot_near_threshold_checkpoint_boxplots(
             table_text=table_text,
         )
     return count_rows
+
+
+def summarize_threshold_grid_gamma_swap_rrmse(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+) -> list[dict[str, Any]]:
+    def float_or_nan(value: Any) -> float:
+        if value is None:
+            return float("nan")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    rows = [row for row in records if int(row.get("checkpoint", -1)) == int(max_budget)]
+    grouped: dict[tuple[str, str, float, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        family = str(row.get("family", ""))
+        method = str(row.get("method", ""))
+        swap_fraction = float(row.get("swap_fraction", np.nan))
+        gamma_label = str(row.get("gamma_label", "none"))
+        grouped.setdefault((family, method, swap_fraction, gamma_label), []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for (family, method, swap_fraction, gamma_label), sub in sorted(grouped.items()):
+        are_values: list[float] = []
+        abs_log_values: list[float] = []
+        zero_estimates = 0
+        for row in sub:
+            exact_p = float_or_nan(row.get("exact_p", np.nan))
+            estimate = float_or_nan(row.get("estimate", np.nan))
+            if np.isfinite(estimate) and estimate <= 0.0:
+                zero_estimates += 1
+            if np.isfinite(exact_p) and exact_p > 0.0 and np.isfinite(estimate):
+                are_values.append(float(abs((estimate - exact_p) / exact_p)))
+            abs_log = float_or_nan(row.get("abs_log10_error", np.nan))
+            if np.isfinite(abs_log):
+                abs_log_values.append(abs_log)
+        vals = np.asarray(are_values, dtype=float)
+        gamma_raw = float_or_nan(sub[0].get("gamma", np.nan)) if sub else np.nan
+        median_are = float(np.median(vals)) if vals.size else np.nan
+        mean_are = float(np.mean(vals)) if vals.size else np.nan
+        p90_are = float(np.quantile(vals, 0.90)) if vals.size else np.nan
+        cross_scenario_rrmse = float(np.sqrt(np.mean(vals * vals))) if vals.size else np.nan
+        out.append(
+            {
+                "family": family,
+                "method": method,
+                "swap_fraction": float(swap_fraction),
+                "gamma_label": gamma_label,
+                "gamma": gamma_raw if gamma_label != "none" and np.isfinite(gamma_raw) else np.nan,
+                "checkpoint": int(max_budget),
+                "n_scenarios": int(vals.size),
+                "median_scenario_are": median_are,
+                "mean_scenario_are": mean_are,
+                "p90_scenario_are": p90_are,
+                "cross_scenario_rrmse": cross_scenario_rrmse,
+                "median_scenario_rrmse": median_are,
+                "relative_rmse": cross_scenario_rrmse,
+                "mean_scenario_rrmse": mean_are,
+                "p90_scenario_rrmse": p90_are,
+                "mean_abs_log10_error": float(np.mean(abs_log_values)) if abs_log_values else np.nan,
+                "zero_estimate_rate": float(zero_estimates / len(sub)) if sub else np.nan,
+            }
+        )
+    return out
+
+
+def plot_threshold_grid_gamma_swap_rrmse(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...] = ("gwas", "hep"),
+    gamma_values: tuple[float, ...] = (0.25, 1.0 / 3.0, 0.4),
+    swap_fractions: tuple[float, ...] = (0.05, 0.10),
+    save_path: Path | None = None,
+    table_save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    summary_rows = summarize_threshold_grid_gamma_swap_rrmse(records, max_budget=max_budget)
+    lookup = {
+        (
+            str(row["family"]),
+            str(row["method"]),
+            round(float(row["swap_fraction"]), 10),
+            str(row["gamma_label"]),
+        ): float(row["median_scenario_are"])
+        for row in summary_rows
+    }
+    gamma_labels = ["0.25", "1/3", "0.4"]
+    method_specs = [
+        ("mcmc_is_no_oracle", "Smooth MCMC-IS", "#2f6fb0"),
+        ("hard_step", "Hard-step MCMC", "#b04a5a"),
+    ]
+    swap_specs = {
+        0.05: {"label": "5% swaps", "marker": "o", "linestyle": "-"},
+        0.10: {"label": "10% swaps", "marker": "s", "linestyle": "--"},
+    }
+    samc_specs = {
+        0.05: {"label": "SAMC, 5% swaps", "linestyle": (0, (1.2, 2.0)), "color": "#4c8c77"},
+        0.10: {"label": "SAMC, 10% swaps", "linestyle": (0, (5.0, 2.0)), "color": "#2e6f5f"},
+    }
+    family_titles = {
+        "gwas": "Panel A: GWAS-like scenarios",
+        "hep": "Panel B: HEP-like scenarios",
+    }
+    x = np.arange(len(gamma_values), dtype=float)
+
+    fig, axes = plt.subplots(1, len(families), figsize=(12.2, 4.8), sharey=True)
+    if len(families) == 1:
+        axes = np.asarray([axes])
+    handles_by_label: dict[str, Any] = {}
+
+    for col_idx, (ax, family) in enumerate(zip(axes, families)):
+        for method, method_label, color in method_specs:
+            for swap_fraction in swap_fractions:
+                spec = swap_specs.get(
+                    round(float(swap_fraction), 10),
+                    {"label": f"{100.0 * float(swap_fraction):.0f}% swaps", "marker": "D", "linestyle": "-"},
+                )
+                y = np.asarray(
+                    [
+                        lookup.get(
+                            (
+                                str(family),
+                                method,
+                                round(float(swap_fraction), 10),
+                                f"{float(gamma):.12g}",
+                            ),
+                            np.nan,
+                        )
+                        for gamma in gamma_values
+                    ],
+                    dtype=float,
+                )
+                (line,) = ax.plot(
+                    x,
+                    y,
+                    color=color,
+                    linestyle=spec["linestyle"],
+                    marker=spec["marker"],
+                    markersize=6.2,
+                    linewidth=2.1,
+                    markeredgecolor="white",
+                    markeredgewidth=0.8,
+                    label=f"{method_label}, {spec['label']}",
+                    zorder=3,
+                )
+                handles_by_label[line.get_label()] = line
+
+        for swap_fraction in swap_fractions:
+            samc_y = lookup.get((str(family), "samc", round(float(swap_fraction), 10), "none"), np.nan)
+            if not np.isfinite(samc_y):
+                continue
+            spec = samc_specs.get(
+                round(float(swap_fraction), 10),
+                {"label": f"SAMC, {100.0 * float(swap_fraction):.0f}% swaps", "linestyle": ":", "color": "#4c8c77"},
+            )
+            ref = ax.hlines(
+                samc_y,
+                xmin=float(x[0]) - 0.08,
+                xmax=float(x[-1]) + 0.08,
+                colors=str(spec["color"]),
+                linestyles=spec["linestyle"],
+                linewidth=1.9,
+                label=str(spec["label"]),
+                zorder=2,
+            )
+            handles_by_label[str(spec["label"])] = ref
+
+        ax.set_title(family_titles.get(str(family), str(family)), fontsize=12.4, fontweight="semibold", pad=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(gamma_labels)
+        ax.set_xlabel(r"Target-tail exponent $\gamma$ in $q=p_0^\gamma$")
+        ax.set_yscale("log")
+        _style_article_axis(ax, grid_axis="y", add_minor_log_grid=True)
+        ax.margins(x=0.10)
+
+    axes[0].set_ylabel("Median scenario ARE")
+    finite_y = np.asarray(
+        [float(row["median_scenario_are"]) for row in summary_rows if np.isfinite(float(row["median_scenario_are"]))],
+        dtype=float,
+    )
+    finite_y = finite_y[finite_y > 0.0]
+    if finite_y.size:
+        y_min = max(float(np.min(finite_y)) / 1.7, 1e-4)
+        y_max = float(np.max(finite_y)) * 1.7
+        for ax in axes:
+            ax.set_ylim(y_min, y_max)
+
+    fig.legend(
+        list(handles_by_label.values()),
+        list(handles_by_label.keys()),
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+        fontsize=9.4,
+        bbox_to_anchor=(0.5, -0.02),
+    )
+    fig.suptitle(
+        f"Threshold-grid median absolute relative error at {_format_budget_tick_compact(max_budget)}",
+        fontsize=14.5,
+        fontweight="semibold",
+        y=1.02,
+    )
+    plt.tight_layout(rect=(0.0, 0.08, 1.0, 0.98))
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if table_save_path is not None:
+        write_json(Path(table_save_path), summary_rows)
+    plt.close(fig)
+    return summary_rows
+
+
+def _threshold_grid_metric_label(metric: str) -> tuple[str, str]:
+    metric_key = str(metric)
+    if metric_key == "median":
+        return "median_scenario_are", "Median scenario ARE"
+    if metric_key == "mean":
+        return "mean_scenario_are", "Mean scenario ARE"
+    if metric_key in {"relative_rmse", "rmse"}:
+        return "cross_scenario_rrmse", "Cross-scenario RRMSE"
+    raise ValueError("metric must be one of {'median', 'mean', 'relative_rmse'}.")
+
+
+def plot_threshold_grid_tilt_family_rrmse(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    metric: str = "median",
+    families: tuple[str, ...] = ("gwas", "hep"),
+    gamma_values: tuple[float, ...] = (0.25, 1.0 / 3.0, 0.4),
+    swap_fractions: tuple[float, ...] = (0.05, 0.10),
+    save_path: Path | None = None,
+    table_save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    metric_field, metric_label = _threshold_grid_metric_label(metric)
+    summary_rows = summarize_threshold_grid_gamma_swap_rrmse(records, max_budget=max_budget)
+    summary_rows = [
+        row
+        for row in summary_rows
+        if str(row["method"]) in {"mcmc_is_no_oracle", "hard_step"}
+    ]
+    lookup = {
+        (
+            str(row["family"]),
+            str(row["method"]),
+            round(float(row["swap_fraction"]), 10),
+            str(row["gamma_label"]),
+        ): float(row[metric_field])
+        for row in summary_rows
+    }
+    gamma_labels = ["0.25", "1/3", "0.4"]
+    method_specs = [
+        ("mcmc_is_no_oracle", "Smooth MCMC-IS", "#2f6fb0"),
+        ("hard_step", "Hard-step MCMC", "#b04a5a"),
+    ]
+    family_labels = {
+        "gwas": "GWAS-like",
+        "hep": "HEP-like",
+    }
+    x = np.arange(len(gamma_values), dtype=float)
+
+    fig, axes = plt.subplots(
+        len(families),
+        len(swap_fractions),
+        figsize=(7.8, 6.65),
+        sharex=True,
+        sharey="row",
+    )
+    axes = np.asarray(axes)
+    if axes.ndim == 0:
+        axes = axes.reshape((1, 1))
+    elif axes.ndim == 1:
+        axes = axes.reshape((len(families), len(swap_fractions)))
+    handles_by_label: dict[str, Any] = {}
+
+    for row_idx, family in enumerate(families):
+        row_values: list[float] = []
+        for swap_fraction in swap_fractions:
+            for method, _, _ in method_specs:
+                for gamma in gamma_values:
+                    value = lookup.get(
+                        (
+                            str(family),
+                            method,
+                            round(float(swap_fraction), 10),
+                            f"{float(gamma):.12g}",
+                        ),
+                        np.nan,
+                    )
+                    if np.isfinite(value) and value > 0.0:
+                        row_values.append(float(value))
+        for col_idx, swap_fraction in enumerate(swap_fractions):
+            ax = axes[row_idx, col_idx]
+            if row_idx == 0:
+                ax.set_title(f"{100.0 * float(swap_fraction):.0f}% swaps", fontsize=11.8, pad=8)
+            if col_idx == 0:
+                ax.text(
+                    -0.33,
+                    0.5,
+                    family_labels.get(str(family), str(family)),
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="center",
+                    fontsize=11.6,
+                    fontweight="semibold",
+                )
+
+            if row_idx == len(families) - 1:
+                ax.set_xlabel(r"$\gamma$")
+            if col_idx == 0:
+                ax.set_ylabel(metric_label)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(gamma_labels)
+            ax.set_yscale("log")
+            _style_article_axis(ax, grid_axis="y", add_minor_log_grid=True)
+            ax.margins(x=0.10)
+
+            if row_values:
+                y_min = max(float(np.min(row_values)) / 1.6, 1e-4)
+                y_max = float(np.max(row_values)) * 1.6
+                ax.set_ylim(y_min, y_max)
+
+        for method, method_label, color in method_specs:
+            for col_idx, swap_fraction in enumerate(swap_fractions):
+                ax = axes[row_idx, col_idx]
+                y = np.asarray(
+                    [
+                        lookup.get(
+                            (
+                                str(family),
+                                method,
+                                round(float(swap_fraction), 10),
+                                f"{float(gamma):.12g}",
+                            ),
+                            np.nan,
+                        )
+                        for gamma in gamma_values
+                    ],
+                    dtype=float,
+                )
+                (line,) = ax.plot(
+                    x,
+                    y,
+                    color=color,
+                    linestyle="-",
+                    marker="o",
+                    markersize=5.8,
+                    linewidth=2.15,
+                    markeredgecolor="white",
+                    markeredgewidth=0.8,
+                    label=method_label,
+                    zorder=3,
+                )
+                handles_by_label[line.get_label()] = line
+
+    fig.legend(
+        list(handles_by_label.values()),
+        list(handles_by_label.keys()),
+        loc="lower center",
+        ncol=2,
+        frameon=False,
+        fontsize=9.8,
+        bbox_to_anchor=(0.5, -0.02),
+    )
+    metric_title = metric_label.replace("ARE", "absolute relative error")
+    metric_title = metric_title[:1].lower() + metric_title[1:]
+    fig.suptitle(
+        _format_budget_title(max_budget, f"Tilt tuning: {metric_title}"),
+        fontsize=12.2,
+        y=0.99,
+    )
+    plt.tight_layout(rect=(0.04, 0.08, 1.0, 0.99))
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if table_save_path is not None:
+        write_json(Path(table_save_path), summary_rows)
+    plt.close(fig)
+    return summary_rows
+
+
+def _threshold_grid_config_label(row: dict[str, Any]) -> str:
+    swap_label = f"{100.0 * float(row['swap_fraction']):.0f}%"
+    if str(row["method"]) == "samc":
+        return swap_label
+    gamma = float(row.get("gamma", np.nan))
+    gamma_label = "1/3" if np.isclose(gamma, 1.0 / 3.0) else f"{gamma:.2g}"
+    return f"{swap_label}, gamma={gamma_label}"
+
+
+def _threshold_grid_figure_config_label(row: dict[str, Any]) -> str:
+    swap_label = f"{100.0 * float(row['swap_fraction']):.0f}% swaps"
+    if str(row["method"]) == "samc":
+        return swap_label
+    gamma = float(row.get("gamma", np.nan))
+    gamma_label = "1/3" if np.isclose(gamma, 1.0 / 3.0) else f"{gamma:.2g}"
+    return rf"$\gamma$={gamma_label}, {swap_label}"
+
+
+def _threshold_grid_gamma_sort_value(row: dict[str, Any]) -> float:
+    gamma = row.get("gamma", np.nan)
+    if gamma is None:
+        return np.inf
+    try:
+        gamma_f = float(gamma)
+    except (TypeError, ValueError):
+        return np.inf
+    return gamma_f if np.isfinite(gamma_f) else np.inf
+
+
+def _select_threshold_grid_best_practical_rows(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...],
+    selection_metric: str,
+) -> list[dict[str, Any]]:
+    selection_field, _ = _threshold_grid_metric_label(selection_metric)
+    summary_rows = summarize_threshold_grid_gamma_swap_rrmse(records, max_budget=max_budget)
+    selected_rows: list[dict[str, Any]] = []
+    for family in families:
+        for method, display_method in (
+            ("mcmc_is_no_oracle", "Smooth MCMC-IS"),
+            ("samc", "SAMC"),
+        ):
+            candidates = [
+                row
+                for row in summary_rows
+                if str(row["family"]) == str(family)
+                and str(row["method"]) == method
+                and np.isfinite(float(row[selection_field]))
+            ]
+            if not candidates:
+                continue
+            best = min(
+                candidates,
+                key=lambda row: (
+                    float(row[selection_field]),
+                    float(row["swap_fraction"]),
+                    _threshold_grid_gamma_sort_value(row),
+                ),
+            )
+            out = dict(best)
+            out["display_method"] = display_method
+            out["config_label"] = _threshold_grid_config_label(best)
+            out["selection_metric"] = str(selection_metric)
+            out["selection_value"] = float(best[selection_field])
+            selected_rows.append(out)
+    return selected_rows
+
+
+def _threshold_grid_record_matches_selection(
+    record: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    max_budget: int,
+) -> bool:
+    if int(record.get("checkpoint", -1)) != int(max_budget):
+        return False
+    if str(record.get("family", "")) != str(row["family"]):
+        return False
+    if str(record.get("method", "")) != str(row["method"]):
+        return False
+    try:
+        record_swap = round(float(record.get("swap_fraction", np.nan)), 10)
+        row_swap = round(float(row["swap_fraction"]), 10)
+    except (TypeError, ValueError):
+        return False
+    if record_swap != row_swap:
+        return False
+    return str(record.get("gamma_label", "none")) == str(row["gamma_label"])
+
+
+def _threshold_grid_record_are(record: dict[str, Any]) -> float | None:
+    exact_p = record.get("exact_p", np.nan)
+    estimate = record.get("estimate", np.nan)
+    try:
+        exact_f = float(exact_p)
+        estimate_f = float(estimate)
+    except (TypeError, ValueError):
+        return None
+    if np.isfinite(exact_f) and exact_f > 0.0 and np.isfinite(estimate_f):
+        return float(abs((estimate_f - exact_f) / exact_f))
+    return None
+
+
+def _threshold_grid_record_rrmse(record: dict[str, Any]) -> float | None:
+    return _threshold_grid_record_are(record)
+
+
+def _threshold_grid_equal_axis_ticks(upper: float) -> tuple[float, np.ndarray]:
+    upper_f = float(upper)
+    if not np.isfinite(upper_f) or upper_f <= 0.0:
+        upper_f = 1.0
+    ticks = np.asarray(MaxNLocator(nbins=5, min_n_ticks=4).tick_values(0.0, upper_f), dtype=float)
+    ticks = np.asarray(
+        [tick for tick in ticks if np.isfinite(tick) and 0.0 <= tick <= upper_f * (1.0 + 1e-9)],
+        dtype=float,
+    )
+    if ticks.size == 0 or not np.isclose(float(ticks[0]), 0.0):
+        ticks = np.concatenate(([0.0], ticks))
+    if ticks.size < 2:
+        ticks = np.asarray([0.0, upper_f], dtype=float)
+    return upper_f, ticks
+
+
+def _threshold_grid_selected_rrmse_values(
+    records: list[dict[str, Any]],
+    row: dict[str, Any],
+    *,
+    max_budget: int,
+) -> np.ndarray:
+    values: list[float] = []
+    for record in records:
+        if not _threshold_grid_record_matches_selection(record, row, max_budget=max_budget):
+            continue
+        are = _threshold_grid_record_are(record)
+        if are is not None:
+            values.append(are)
+    return np.asarray(values, dtype=float)
+
+
+def _threshold_grid_selected_rrmse_by_scenario(
+    records: list[dict[str, Any]],
+    row: dict[str, Any],
+    *,
+    max_budget: int,
+) -> dict[str, float]:
+    grouped: dict[str, list[float]] = {}
+    for record in records:
+        if not _threshold_grid_record_matches_selection(record, row, max_budget=max_budget):
+            continue
+        scenario = record.get("scenario")
+        if scenario is None:
+            continue
+        are = _threshold_grid_record_are(record)
+        if are is not None:
+            grouped.setdefault(str(scenario), []).append(are)
+    return {scenario: float(np.mean(vals)) for scenario, vals in grouped.items() if vals}
+
+
+def bootstrap_threshold_grid_best_practical_diagnostics(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...] = ("gwas", "hep"),
+    selection_metric: str = "median",
+    config_selection_budget: int | None = None,
+    n_bootstrap: int = 10_000,
+    seed: int = 20260724,
+    save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    selection_budget = int(max_budget) if config_selection_budget is None else int(config_selection_budget)
+    selected_rows = _select_threshold_grid_best_practical_rows(
+        records,
+        max_budget=selection_budget,
+        families=families,
+        selection_metric=selection_metric,
+    )
+    rows_by_family_method = {
+        (str(row["family"]), str(row["method"])): row
+        for row in selected_rows
+    }
+    rng = np.random.default_rng(int(seed))
+    out: list[dict[str, Any]] = []
+
+    for family in families:
+        smooth_row = rows_by_family_method.get((str(family), "mcmc_is_no_oracle"))
+        samc_row = rows_by_family_method.get((str(family), "samc"))
+        paired_points: list[dict[str, float | str]] = []
+        if smooth_row is not None and samc_row is not None:
+            smooth_by_scenario = _threshold_grid_selected_rrmse_by_scenario(
+                records,
+                smooth_row,
+                max_budget=max_budget,
+            )
+            samc_by_scenario = _threshold_grid_selected_rrmse_by_scenario(
+                records,
+                samc_row,
+                max_budget=max_budget,
+            )
+            for scenario in sorted(set(smooth_by_scenario).intersection(samc_by_scenario)):
+                smooth_are = float(smooth_by_scenario[scenario])
+                samc_are = float(samc_by_scenario[scenario])
+                if np.isfinite(smooth_are) and np.isfinite(samc_are):
+                    paired_points.append(
+                        {
+                            "scenario": scenario,
+                            "smooth_are": smooth_are,
+                            "samc_are": samc_are,
+                        }
+                    )
+
+        smooth_values = np.asarray([float(point["smooth_are"]) for point in paired_points], dtype=float)
+        samc_values = np.asarray([float(point["samc_are"]) for point in paired_points], dtype=float)
+        n_scenarios = int(smooth_values.size)
+        observed_smooth_rrmse = float(np.sqrt(np.mean(smooth_values * smooth_values))) if n_scenarios else np.nan
+        observed_samc_rrmse = float(np.sqrt(np.mean(samc_values * samc_values))) if n_scenarios else np.nan
+        observed_rrmse_ratio = (
+            float(observed_smooth_rrmse / observed_samc_rrmse)
+            if np.isfinite(observed_smooth_rrmse)
+            and np.isfinite(observed_samc_rrmse)
+            and observed_samc_rrmse > 0.0
+            else np.nan
+        )
+        observed_win_count = int(np.sum(smooth_values < samc_values)) if n_scenarios else 0
+        observed_win_rate = float(observed_win_count / n_scenarios) if n_scenarios else np.nan
+
+        if n_scenarios and int(n_bootstrap) > 0:
+            sample_indices = rng.integers(0, n_scenarios, size=(int(n_bootstrap), n_scenarios))
+            sampled_smooth = smooth_values[sample_indices]
+            sampled_samc = samc_values[sample_indices]
+            bootstrap_win_rates = np.mean(sampled_smooth < sampled_samc, axis=1)
+            bootstrap_smooth_rrmse = np.sqrt(np.mean(sampled_smooth * sampled_smooth, axis=1))
+            bootstrap_samc_rrmse = np.sqrt(np.mean(sampled_samc * sampled_samc, axis=1))
+            bootstrap_rrmse_ratios = np.divide(
+                bootstrap_smooth_rrmse,
+                bootstrap_samc_rrmse,
+                out=np.full_like(bootstrap_smooth_rrmse, np.nan, dtype=float),
+                where=bootstrap_samc_rrmse > 0.0,
+            )
+        else:
+            bootstrap_win_rates = np.asarray([], dtype=float)
+            bootstrap_rrmse_ratios = np.asarray([], dtype=float)
+
+        finite_rrmse_ratios = bootstrap_rrmse_ratios[np.isfinite(bootstrap_rrmse_ratios)]
+        finite_win_rates = bootstrap_win_rates[np.isfinite(bootstrap_win_rates)]
+        out.append(
+            {
+                "family": str(family),
+                "checkpoint": int(max_budget),
+                "config_selection_checkpoint": int(selection_budget),
+                "selection_metric": str(selection_metric),
+                "smooth_config_label": smooth_row.get("config_label") if smooth_row is not None else None,
+                "samc_config_label": samc_row.get("config_label") if samc_row is not None else None,
+                "n_scenarios": n_scenarios,
+                "n_bootstrap": int(n_bootstrap),
+                "bootstrap_seed": int(seed),
+                "observed_rrmse_ratio_smooth_over_samc": observed_rrmse_ratio,
+                "observed_smooth_cross_scenario_rrmse": observed_smooth_rrmse,
+                "observed_samc_cross_scenario_rrmse": observed_samc_rrmse,
+                "observed_win_rate": observed_win_rate,
+                "observed_win_count": observed_win_count,
+                "rrmse_ratio_bootstrap_mean": (
+                    float(np.mean(finite_rrmse_ratios)) if finite_rrmse_ratios.size else np.nan
+                ),
+                "rrmse_ratio_bootstrap_median": (
+                    float(np.median(finite_rrmse_ratios)) if finite_rrmse_ratios.size else np.nan
+                ),
+                "rrmse_ratio_ci95_low": (
+                    float(np.quantile(finite_rrmse_ratios, 0.025)) if finite_rrmse_ratios.size else np.nan
+                ),
+                "rrmse_ratio_ci95_high": (
+                    float(np.quantile(finite_rrmse_ratios, 0.975)) if finite_rrmse_ratios.size else np.nan
+                ),
+                "win_rate_bootstrap_mean": float(np.mean(finite_win_rates)) if finite_win_rates.size else np.nan,
+                "win_rate_bootstrap_median": float(np.median(finite_win_rates)) if finite_win_rates.size else np.nan,
+                "win_rate_ci95_low": (
+                    float(np.quantile(finite_win_rates, 0.025)) if finite_win_rates.size else np.nan
+                ),
+                "win_rate_ci95_high": (
+                    float(np.quantile(finite_win_rates, 0.975)) if finite_win_rates.size else np.nan
+                ),
+                "bootstrap_rrmse_ratios": bootstrap_rrmse_ratios.tolist(),
+                "bootstrap_win_rates": bootstrap_win_rates.tolist(),
+                "paired_points": paired_points,
+            }
+        )
+
+    if save_path is not None:
+        write_json(Path(save_path), out)
+    return out
+
+
+def plot_threshold_grid_best_practical_rrmse(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...] = ("gwas", "hep"),
+    selection_metric: str = "median",
+    save_path: Path | None = None,
+    table_save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    selected_rows = _select_threshold_grid_best_practical_rows(
+        records,
+        max_budget=max_budget,
+        families=families,
+        selection_metric=selection_metric,
+    )
+    family_labels = {"gwas": "GWAS-like", "hep": "HEP-like"}
+    colors = {
+        "Smooth MCMC-IS": "#2f6fb0",
+        "SAMC": "#4c8c77",
+    }
+
+    fig, axes = plt.subplots(1, len(families), figsize=(7.8, 3.95), sharey=False)
+    if len(families) == 1:
+        axes = np.asarray([axes])
+    for row in selected_rows:
+        values = _threshold_grid_selected_rrmse_values(records, row, max_budget=max_budget)
+        values_for_plot = values[np.isfinite(values) & (values >= 0.0)]
+        if values_for_plot.size == 0:
+            values_for_plot = np.asarray([0.0], dtype=float)
+        row["scenario_are_q25"] = float(np.quantile(values, 0.25)) if values.size else np.nan
+        row["scenario_are_q75"] = float(np.quantile(values, 0.75)) if values.size else np.nan
+        row["scenario_are_min"] = float(np.min(values)) if values.size else np.nan
+        row["scenario_are_max"] = float(np.max(values)) if values.size else np.nan
+        row["scenario_rrmse_q25"] = float(np.quantile(values, 0.25)) if values.size else np.nan
+        row["scenario_rrmse_q75"] = float(np.quantile(values, 0.75)) if values.size else np.nan
+        row["scenario_rrmse_min"] = float(np.min(values)) if values.size else np.nan
+        row["scenario_rrmse_max"] = float(np.max(values)) if values.size else np.nan
+        row["n_boxplot_scenarios"] = int(values.size)
+        row["_plot_values"] = values_for_plot
+
+    for col_idx, (ax, family) in enumerate(zip(axes, families)):
+        family_rows = [
+            row
+            for row in selected_rows
+            if str(row["family"]) == str(family)
+        ]
+        family_rows = sorted(
+            family_rows,
+            key=lambda row: 0 if str(row["method"]) == "mcmc_is_no_oracle" else 1,
+        )
+        data = [np.asarray(row["_plot_values"], dtype=float) for row in family_rows]
+        labels = [
+            (
+                f"{'Smooth MCMC-IS' if str(row['method']) == 'mcmc_is_no_oracle' else 'SAMC'}\n"
+                f"{_threshold_grid_figure_config_label(row)}"
+            ).rstrip()
+            for row in family_rows
+        ]
+        box_colors = [colors[str(row["display_method"])] for row in family_rows]
+        artists = ax.boxplot(
+            data,
+            tick_labels=labels,
+            widths=0.54,
+            patch_artist=True,
+            showfliers=False,
+            showmeans=True,
+            medianprops={"color": "#222222", "linewidth": 1.35},
+            meanprops={
+                "marker": "D",
+                "markerfacecolor": "#171717",
+                "markeredgecolor": "white",
+                "markeredgewidth": 0.75,
+                "markersize": 6.0,
+            },
+            whiskerprops={"color": "#6d7378", "linewidth": 0.95},
+            capprops={"color": "#6d7378", "linewidth": 0.95},
+            boxprops={"edgecolor": "#333333", "linewidth": 0.95},
+        )
+        for patch, color in zip(artists["boxes"], box_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.76)
+        ax.set_title(family_labels.get(str(family), str(family)), fontsize=11.8, pad=8)
+        _style_article_axis(ax, grid_axis="y", add_minor_log_grid=False)
+        ax.tick_params(axis="x", labelsize=9.1)
+        ax.margins(x=0.10)
+        displayed_y: list[float] = []
+        for artist_key in ("whiskers", "caps", "medians", "means"):
+            for artist in artists.get(artist_key, []):
+                y_data = np.asarray(artist.get_ydata(), dtype=float)
+                displayed_y.extend(float(v) for v in y_data if np.isfinite(v) and v >= 0.0)
+        if displayed_y:
+            y_max = max(float(np.max(displayed_y)) * 1.08, 1e-3)
+            ax.set_ylim(0.0, y_max)
+    axes[0].set_ylabel("Scenario ARE")
+    axes[0].legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                marker="D",
+                color="none",
+                markerfacecolor="#171717",
+                markeredgecolor="white",
+                markersize=6.5,
+                label="Mean",
+            )
+        ],
+        frameon=False,
+        fontsize=9.2,
+        loc="upper left",
+    )
+
+    for row in selected_rows:
+        row.pop("_plot_values", None)
+
+    fig.suptitle(
+        _format_budget_title(max_budget, "Scenario-level absolute relative error distributions"),
+        fontsize=12.2,
+        y=0.99,
+    )
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if table_save_path is not None:
+        write_json(Path(table_save_path), selected_rows)
+    plt.close(fig)
+    return selected_rows
+
+
+def plot_threshold_grid_best_practical_scenario_scatter(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...] = ("gwas", "hep"),
+    selection_metric: str = "median",
+    save_path: Path | None = None,
+    table_save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    selected_rows = _select_threshold_grid_best_practical_rows(
+        records,
+        max_budget=max_budget,
+        families=families,
+        selection_metric=selection_metric,
+    )
+    rows_by_family_method = {
+        (str(row["family"]), str(row["method"])): row
+        for row in selected_rows
+    }
+    family_labels = {"gwas": "GWAS-like", "hep": "HEP-like"}
+
+    fig, axes = plt.subplots(1, len(families), figsize=(7.8, 4.65), sharex=False, sharey=False)
+    if len(families) == 1:
+        axes = np.asarray([axes])
+    summary_rows: list[dict[str, Any]] = []
+
+    for col_idx, (ax, family) in enumerate(zip(axes, families)):
+        smooth_row = rows_by_family_method.get((str(family), "mcmc_is_no_oracle"))
+        samc_row = rows_by_family_method.get((str(family), "samc"))
+        paired_points: list[dict[str, float | str]] = []
+        if smooth_row is not None and samc_row is not None:
+            smooth_by_scenario = _threshold_grid_selected_rrmse_by_scenario(
+                records,
+                smooth_row,
+                max_budget=max_budget,
+            )
+            samc_by_scenario = _threshold_grid_selected_rrmse_by_scenario(
+                records,
+                samc_row,
+                max_budget=max_budget,
+            )
+            for scenario in sorted(set(smooth_by_scenario).intersection(samc_by_scenario)):
+                smooth_are = float(smooth_by_scenario[scenario])
+                samc_are = float(samc_by_scenario[scenario])
+                if np.isfinite(smooth_are) and np.isfinite(samc_are):
+                    paired_points.append(
+                        {
+                            "scenario": scenario,
+                            "smooth_are": smooth_are,
+                            "samc_are": samc_are,
+                            "smooth_rrmse": smooth_are,
+                            "samc_rrmse": samc_are,
+                        }
+                    )
+
+        smooth_values = np.asarray([float(p["smooth_are"]) for p in paired_points], dtype=float)
+        samc_values = np.asarray([float(p["samc_are"]) for p in paired_points], dtype=float)
+        ratio_values = np.asarray(
+            [
+                float(smooth / samc)
+                for smooth, samc in zip(smooth_values, samc_values)
+                if np.isfinite(smooth) and np.isfinite(samc) and samc > 0.0
+            ],
+            dtype=float,
+        )
+        smooth_cross_scenario_rrmse = (
+            float(np.sqrt(np.mean(smooth_values * smooth_values))) if smooth_values.size else np.nan
+        )
+        samc_cross_scenario_rrmse = (
+            float(np.sqrt(np.mean(samc_values * samc_values))) if samc_values.size else np.nan
+        )
+        cross_scenario_rrmse_ratio = (
+            float(smooth_cross_scenario_rrmse / samc_cross_scenario_rrmse)
+            if np.isfinite(smooth_cross_scenario_rrmse)
+            and np.isfinite(samc_cross_scenario_rrmse)
+            and samc_cross_scenario_rrmse > 0.0
+            else np.nan
+        )
+        smooth_are_lower_count = int(np.sum(smooth_values < samc_values)) if smooth_values.size else 0
+        win_prob = float(np.mean(smooth_values < samc_values)) if smooth_values.size else np.nan
+        median_ratio = float(np.median(ratio_values)) if ratio_values.size else np.nan
+
+        if smooth_values.size:
+            raw_axis_max = max(float(np.max(samc_values)), float(np.max(smooth_values)), 1e-3) * 1.08
+            axis_max, axis_ticks = _threshold_grid_equal_axis_ticks(raw_axis_max)
+            ax.scatter(
+                samc_values,
+                smooth_values,
+                s=36,
+                color="#2f6fb0",
+                alpha=0.58,
+                edgecolors="white",
+                linewidths=0.45,
+                zorder=3,
+            )
+        else:
+            axis_max, axis_ticks = _threshold_grid_equal_axis_ticks(1.0)
+        ax.plot(
+            [0.0, axis_max],
+            [0.0, axis_max],
+            color="#545b61",
+            linestyle=(0, (1.3, 2.3)),
+            linewidth=1.05,
+            zorder=2,
+        )
+        ax.set_xlim(0.0, axis_max)
+        ax.set_ylim(0.0, axis_max)
+        ax.xaxis.set_major_locator(FixedLocator(axis_ticks))
+        ax.yaxis.set_major_locator(FixedLocator(axis_ticks))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_box_aspect(1)
+        smooth_config = _threshold_grid_figure_config_label(smooth_row) if smooth_row is not None else ""
+        samc_config = _threshold_grid_figure_config_label(samc_row) if samc_row is not None else ""
+        ax.set_xlabel(f"SAMC ARE\n{samc_config}".rstrip(), fontsize=9.4)
+        if col_idx == 0:
+            ax.set_ylabel(f"Smooth MCMC-IS ARE\n{smooth_config}".rstrip(), fontsize=9.4)
+        ratio_text = "NA" if not np.isfinite(cross_scenario_rrmse_ratio) else f"{cross_scenario_rrmse_ratio:.2f}"
+        win_text = (
+            "NA"
+            if smooth_values.size == 0
+            else f"{smooth_are_lower_count}/{smooth_values.size}"
+        )
+        ax.set_title(
+            f"{family_labels.get(str(family), str(family))}\n"
+            f"Cross-scenario RRMSE ratio = {ratio_text}\n"
+            f"Smooth ARE lower in {win_text} scenarios",
+            fontsize=9.7,
+            pad=8,
+        )
+        _style_article_axis(ax, grid_axis="both", add_minor_log_grid=False)
+
+        summary_rows.append(
+            {
+                "family": str(family),
+                "checkpoint": int(max_budget),
+                "selection_metric": str(selection_metric),
+                "smooth_config_label": smooth_row.get("config_label") if smooth_row is not None else None,
+                "samc_config_label": samc_row.get("config_label") if samc_row is not None else None,
+                "n_paired_scenarios": int(len(paired_points)),
+                "cross_scenario_rrmse_ratio_smooth_over_samc": cross_scenario_rrmse_ratio,
+                "smooth_cross_scenario_rrmse": smooth_cross_scenario_rrmse,
+                "samc_cross_scenario_rrmse": samc_cross_scenario_rrmse,
+                "n_smooth_are_lt_samc": smooth_are_lower_count,
+                "median_are_ratio_smooth_over_samc": median_ratio,
+                "prob_smooth_are_lt_samc": win_prob,
+                "median_smooth_are": float(np.median(smooth_values)) if smooth_values.size else np.nan,
+                "median_samc_are": float(np.median(samc_values)) if samc_values.size else np.nan,
+                "median_rrmse_ratio_smooth_over_samc": median_ratio,
+                "prob_smooth_rrmse_lt_samc": win_prob,
+                "median_smooth_rrmse": float(np.median(smooth_values)) if smooth_values.size else np.nan,
+                "median_samc_rrmse": float(np.median(samc_values)) if samc_values.size else np.nan,
+                "paired_points": paired_points,
+            }
+        )
+
+    fig.suptitle(
+        _format_budget_title(max_budget, "Scenario-by-scenario absolute relative error comparison"),
+        fontsize=12.2,
+        y=0.99,
+    )
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if table_save_path is not None:
+        write_json(Path(table_save_path), summary_rows)
+    plt.close(fig)
+    return summary_rows
+
+
+def _threshold_grid_ratio_point(record: dict[str, Any]) -> dict[str, float] | None:
+    try:
+        exact_p = float(record.get("exact_p", np.nan))
+        estimate = float(record.get("estimate", np.nan))
+    except (TypeError, ValueError):
+        return None
+    p0_candidates = (
+        record.get("p0_reference", None),
+        record.get("known_significance_threshold", None),
+        record.get("hard_step_reference_p0", None),
+    )
+    p0 = np.nan
+    for candidate in p0_candidates:
+        try:
+            candidate_f = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(candidate_f) and candidate_f > 0.0:
+            p0 = candidate_f
+            break
+    if not (np.isfinite(p0) and p0 > 0.0 and np.isfinite(exact_p) and np.isfinite(estimate)):
+        return None
+    try:
+        p_over_p0 = float(record.get("p_over_p0", np.nan))
+    except (TypeError, ValueError):
+        p_over_p0 = np.nan
+    if not np.isfinite(p_over_p0):
+        p_over_p0 = exact_p / p0
+    estimate_over_p0 = estimate / p0
+    return {
+        "p0_reference": float(p0),
+        "p_over_p0": float(p_over_p0),
+        "estimate_over_p0": float(estimate_over_p0),
+        "ratio_error": float(estimate_over_p0 - p_over_p0),
+        "abs_ratio_error": float(abs(estimate_over_p0 - p_over_p0)),
+        "truth_below_threshold": bool(p_over_p0 < 1.0),
+        "estimate_above_threshold": bool(estimate_over_p0 > 1.0),
+        "false_negative": bool(p_over_p0 < 1.0 and estimate_over_p0 > 1.0),
+    }
+
+
+def plot_threshold_grid_estimate_vs_threshold_ratio(
+    records: list[dict[str, Any]],
+    *,
+    max_budget: int,
+    families: tuple[str, ...] = ("gwas", "hep"),
+    selection_metric: str = "median",
+    save_path: Path | None = None,
+    table_save_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    selected_rows = _select_threshold_grid_best_practical_rows(
+        records,
+        max_budget=max_budget,
+        families=families,
+        selection_metric=selection_metric,
+    )
+    rows_by_family_method = {
+        (str(row["family"]), str(row["method"])): row
+        for row in selected_rows
+    }
+    method_specs = [
+        ("mcmc_is_no_oracle", "Smooth MCMC-IS", "#2f6fb0"),
+        ("samc", "SAMC", "#4c8c77"),
+    ]
+    family_labels = {"gwas": "GWAS-like", "hep": "HEP-like"}
+    point_rows: list[dict[str, Any]] = []
+    points_by_panel: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    for family in families:
+        for method, display_method, _ in method_specs:
+            selected_row = rows_by_family_method.get((str(family), method))
+            panel_points: list[dict[str, Any]] = []
+            if selected_row is not None:
+                for record in records:
+                    if not _threshold_grid_record_matches_selection(record, selected_row, max_budget=max_budget):
+                        continue
+                    point = _threshold_grid_ratio_point(record)
+                    if point is None:
+                        continue
+                    out = {
+                        "family": str(family),
+                        "method": method,
+                        "display_method": display_method,
+                        "checkpoint": int(max_budget),
+                        "selection_metric": str(selection_metric),
+                        "config_label": selected_row.get("config_label"),
+                        "scenario": record.get("scenario"),
+                        "exact_p": float(record.get("exact_p", np.nan)),
+                        "estimate": float(record.get("estimate", np.nan)),
+                        **point,
+                    }
+                    panel_points.append(out)
+                    point_rows.append(out)
+            points_by_panel[(str(family), method)] = panel_points
+
+    fig, axes = plt.subplots(len(families), len(method_specs), figsize=(8.7, 7.35), sharex=False, sharey=False)
+    axes = np.asarray(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape((len(families), len(method_specs)))
+
+    for row_idx, family in enumerate(families):
+        row_x: list[float] = []
+        row_y: list[float] = []
+        for method, _, _ in method_specs:
+            for point in points_by_panel.get((str(family), method), []):
+                row_x.append(float(point["p_over_p0"]))
+                row_y.append(float(point["estimate_over_p0"]))
+        finite_row_values = np.asarray(
+            [value for value in (*row_x, *row_y, 1.0) if np.isfinite(float(value))],
+            dtype=float,
+        )
+        if finite_row_values.size:
+            row_min = max(0.0, float(np.min(finite_row_values)))
+            row_max = float(np.max(finite_row_values))
+            pad = max(0.025, 0.055 * max(row_max - row_min, 1e-6))
+            axis_min = max(0.0, row_min - pad)
+            axis_max = row_max + pad
+        else:
+            axis_min, axis_max = 0.0, 1.0
+        ticks = np.asarray(MaxNLocator(nbins=5, min_n_ticks=4).tick_values(axis_min, axis_max), dtype=float)
+        ticks = np.asarray(
+            [tick for tick in ticks if np.isfinite(tick) and axis_min <= tick <= axis_max * (1.0 + 1e-9)],
+            dtype=float,
+        )
+
+        for col_idx, (method, display_method, color) in enumerate(method_specs):
+            ax = axes[row_idx, col_idx]
+            panel_points = points_by_panel.get((str(family), method), [])
+            x = np.asarray([float(point["p_over_p0"]) for point in panel_points], dtype=float)
+            y = np.asarray([float(point["estimate_over_p0"]) for point in panel_points], dtype=float)
+            if x.size:
+                ax.scatter(
+                    x,
+                    y,
+                    s=36,
+                    color=color,
+                    alpha=0.68,
+                    edgecolors="white",
+                    linewidths=0.45,
+                    zorder=3,
+                )
+            ax.plot(
+                [axis_min, axis_max],
+                [axis_min, axis_max],
+                color="#545b61",
+                linestyle=(0, (1.3, 2.3)),
+                linewidth=1.05,
+                label="Exact",
+                zorder=2,
+            )
+            ax.axhline(
+                1.0,
+                color="#7b2d26",
+                linestyle="-",
+                linewidth=1.15,
+                label=r"$p_0$ threshold",
+                zorder=2.2,
+            )
+            ax.set_xlim(axis_min, axis_max)
+            ax.set_ylim(axis_min, axis_max)
+            if ticks.size:
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.yaxis.set_major_locator(FixedLocator(ticks))
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_box_aspect(1)
+            _style_article_axis(ax, grid_axis="both", add_minor_log_grid=False)
+            if row_idx == 0:
+                ax.set_title(display_method, fontsize=11.8, pad=8)
+            if row_idx == len(families) - 1:
+                ax.set_xlabel(r"$p/p_0$", fontsize=10.0, labelpad=5)
+            if col_idx == 0:
+                ax.set_ylabel(r"$\hat{p}/p_0$", fontsize=10.0, labelpad=7)
+            if col_idx == 0:
+                ax.text(
+                    -0.39,
+                    0.5,
+                    family_labels.get(str(family), str(family)),
+                    transform=ax.transAxes,
+                    rotation=90,
+                    va="center",
+                    ha="center",
+                    fontsize=11.5,
+                    fontweight="semibold",
+                )
+            fn_count = int(sum(bool(point.get("false_negative", False)) for point in panel_points))
+            ax.text(
+                0.03,
+                0.96,
+                f"FN: {fn_count}/{len(panel_points)}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8.8,
+                color="#333333",
+            )
+
+    plt.tight_layout(rect=(0.15, 0.13, 1.0, 0.925))
+    fig.canvas.draw()
+    panel_boxes = [ax.get_position() for ax in axes.ravel()]
+    panel_center_x = 0.5 * (min(box.x0 for box in panel_boxes) + max(box.x1 for box in panel_boxes))
+    fig.text(
+        panel_center_x,
+        0.995,
+        "Estimated versus exact p-values",
+        ha="center",
+        va="top",
+        fontsize=12.2,
+    )
+    fig.text(
+        panel_center_x,
+        0.957,
+        f"Results at {_format_budget_millions(max_budget)} million iterations",
+        ha="center",
+        va="top",
+        fontsize=9.7,
+        color="#333333",
+    )
+    fig.legend(
+        handles=[
+            Line2D([0], [0], color="#545b61", linestyle=(0, (1.3, 2.3)), linewidth=1.05, label=r"$\hat{p}=p$"),
+            Line2D([0], [0], color="#7b2d26", linestyle="-", linewidth=1.15, label=r"$\hat{p}=p_0$"),
+        ],
+        loc="lower center",
+        ncol=2,
+        frameon=False,
+        fontsize=9.6,
+        bbox_to_anchor=(panel_center_x, 0.068),
+    )
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if table_save_path is not None:
+        write_json(Path(table_save_path), point_rows)
+    plt.close(fig)
+    return point_rows
 
 
 def plot_cross_method_diagnostics(

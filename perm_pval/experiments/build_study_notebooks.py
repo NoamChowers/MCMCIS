@@ -89,6 +89,12 @@ def _common_setup_code() -> str:
         known_threshold_p0_for_scenario,
         plot_named_method_convergence,
         plot_named_method_max_budget,
+        bootstrap_threshold_grid_best_practical_diagnostics,
+        plot_threshold_grid_estimate_vs_threshold_ratio,
+        plot_threshold_grid_best_practical_scenario_scatter,
+        plot_threshold_grid_best_practical_rrmse,
+        plot_threshold_grid_gamma_swap_rrmse,
+        plot_threshold_grid_tilt_family_rrmse,
         read_json,
         run_named_mcmc_checkpoint_study,
         run_mcmc_objective_grid_study,
@@ -100,6 +106,7 @@ def _common_setup_code() -> str:
         run_cross_method_study,
         save_beta_sweep_outputs,
         save_cross_method_outputs,
+        summarize_threshold_grid_gamma_swap_rrmse,
         summarize_records,
         tune_samc_setup,
         write_json,
@@ -3510,12 +3517,15 @@ def build_cross_method_threshold_grid_notebook() -> dict:
             MAX_BUDGET = 5_000_000 if not FAST_MODE else 20_000
             CHECKPOINT_STEP = 250_000 if not FAST_MODE else 5_000
             CHECKPOINTS = tuple(range(CHECKPOINT_STEP, MAX_BUDGET + CHECKPOINT_STEP, CHECKPOINT_STEP))
+            APPENDIX_FIGURE_BUDGETS = (1_000_000, 2_500_000) if not FAST_MODE else tuple()
             SWAP_FRACTIONS = (0.05, 0.10)
             GAMMAS = (0.25, 1.0 / 3.0, 0.40)
 
             BETA_INIT_PILOT_SAMPLES = 100_000 if not FAST_MODE else 1_000
             N_JOBS = min(6, os.cpu_count() or 1) if not FAST_MODE else 1
             BASE_SEED = 91_337
+            BOOTSTRAP_RESAMPLES = 10_000 if not FAST_MODE else 1_000
+            BOOTSTRAP_SEED = BASE_SEED + 30_000
 
             MCMC_CHAINS = 1
             MCMC_ESTIMATE_VARIANCE = False
@@ -3552,9 +3562,12 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                 "MAX_BUDGET": MAX_BUDGET,
                 "CHECKPOINT_STEP": CHECKPOINT_STEP,
                 "N_CHECKPOINTS": len(CHECKPOINTS),
+                "APPENDIX_FIGURE_BUDGETS": APPENDIX_FIGURE_BUDGETS,
                 "SWAP_FRACTIONS": SWAP_FRACTIONS,
                 "GAMMAS": GAMMAS,
                 "BETA_INIT_PILOT_SAMPLES": BETA_INIT_PILOT_SAMPLES,
+                "BOOTSTRAP_RESAMPLES": BOOTSTRAP_RESAMPLES,
+                "BOOTSTRAP_SEED": BOOTSTRAP_SEED,
                 "MCMC_CHAINS": MCMC_CHAINS,
                 "MCMC_ESTIMATE_VARIANCE": MCMC_ESTIMATE_VARIANCE,
                 "SAMC_N_BINS": SAMC_CFG.n_bins,
@@ -3853,6 +3866,361 @@ def build_cross_method_threshold_grid_notebook() -> dict:
                 .sort_values(["threshold_band", "family", "swap_fraction", "method", "gamma_label"])
                 .reset_index(drop=True)
             )
+            """
+        ),
+        markdown_cell("## Figure 1: Tuning Behavior"),
+        code_cell(
+            """
+            figure_dir = (run_dir / "figures") if (SAVE_OUTPUTS and run_dir is not None) else None
+
+            def figure_budget_suffix(budget: int) -> str:
+                if int(budget) == int(MAX_BUDGET):
+                    return ""
+                label = f"{float(budget) / 1_000_000.0:g}".replace(".", "p")
+                return f"_budget_{label}m"
+
+            figure_budgets = tuple(dict.fromkeys((*APPENDIX_FIGURE_BUDGETS, MAX_BUDGET)))
+            figure1_summaries = {}
+            for figure_budget in figure_budgets:
+                suffix = figure_budget_suffix(int(figure_budget))
+                fig1_median_path = (figure_dir / f"figure1_tilt_gamma_median_rrmse{suffix}.png") if figure_dir is not None else None
+                fig1_mean_path = (figure_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}.png") if figure_dir is not None else None
+                figure1_median_summary = plot_threshold_grid_tilt_family_rrmse(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    metric="median",
+                    families=tuple(FAMILIES),
+                    gamma_values=tuple(GAMMAS),
+                    swap_fractions=tuple(SWAP_FRACTIONS),
+                    save_path=fig1_median_path,
+                    table_save_path=(figure_dir / f"figure1_tilt_gamma_median_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                )
+                figure1_mean_summary = plot_threshold_grid_tilt_family_rrmse(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    metric="mean",
+                    families=tuple(FAMILIES),
+                    gamma_values=tuple(GAMMAS),
+                    swap_fractions=tuple(SWAP_FRACTIONS),
+                    save_path=fig1_mean_path,
+                    table_save_path=(figure_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                )
+                figure1_summaries[int(figure_budget)] = {
+                    "median": figure1_median_summary,
+                    "mean": figure1_mean_summary,
+                    "median_path": fig1_median_path,
+                    "mean_path": fig1_mean_path,
+                }
+                if figure_dir is not None:
+                    plot_threshold_grid_tilt_family_rrmse(
+                        all_records,
+                        max_budget=int(figure_budget),
+                        metric="median",
+                        families=tuple(FAMILIES),
+                        gamma_values=tuple(GAMMAS),
+                        swap_fractions=tuple(SWAP_FRACTIONS),
+                        save_path=figure_dir / f"figure1_tilt_gamma_median_rrmse{suffix}.pdf",
+                    )
+                    plot_threshold_grid_tilt_family_rrmse(
+                        all_records,
+                        max_budget=int(figure_budget),
+                        metric="mean",
+                        families=tuple(FAMILIES),
+                        gamma_values=tuple(GAMMAS),
+                        swap_fractions=tuple(SWAP_FRACTIONS),
+                        save_path=figure_dir / f"figure1_tilt_gamma_mean_rrmse{suffix}.pdf",
+                    )
+            figure1_median_summary = figure1_summaries[int(MAX_BUDGET)]["median"]
+            figure1_mean_summary = figure1_summaries[int(MAX_BUDGET)]["mean"]
+            fig1_median_path = figure1_summaries[int(MAX_BUDGET)]["median_path"]
+            fig1_mean_path = figure1_summaries[int(MAX_BUDGET)]["mean_path"]
+            if fig1_median_path is not None:
+                display(Image(filename=str(fig1_median_path)))
+                display(Image(filename=str(fig1_mean_path)))
+                print(f"Saved Figure 1 median variant to {fig1_median_path}")
+                print(f"Saved Figure 1 mean variant to {fig1_mean_path}")
+                if APPENDIX_FIGURE_BUDGETS:
+                    for appendix_budget in APPENDIX_FIGURE_BUDGETS:
+                        paths = figure1_summaries[int(appendix_budget)]
+                        print(f"Saved appendix Figure 1 variants to {paths['median_path']} and {paths['mean_path']}")
+            display(
+                pd.DataFrame(figure1_median_summary)
+                .query("method in ['mcmc_is_no_oracle', 'hard_step']")
+                .sort_values(["family", "method", "swap_fraction", "gamma"])
+                .reset_index(drop=True)
+            )
+            """
+        ),
+        markdown_cell("## Figure 2: Practical Takeaway"),
+        code_cell(
+            """
+            figure2_summaries = {}
+            for figure_budget in figure_budgets:
+                suffix = figure_budget_suffix(int(figure_budget))
+                fig2_path = (figure_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}.png") if figure_dir is not None else None
+                figure2_summary = plot_threshold_grid_best_practical_rrmse(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    save_path=fig2_path,
+                    table_save_path=(figure_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                )
+                figure2_summaries[int(figure_budget)] = {
+                    "summary": figure2_summary,
+                    "path": fig2_path,
+                }
+                if figure_dir is not None:
+                    plot_threshold_grid_best_practical_rrmse(
+                        all_records,
+                        max_budget=int(figure_budget),
+                        families=tuple(FAMILIES),
+                        selection_metric="median",
+                        save_path=figure_dir / f"figure2_best_smooth_vs_samc_rrmse{suffix}.pdf",
+                    )
+            figure2_summary = figure2_summaries[int(MAX_BUDGET)]["summary"]
+            fig2_path = figure2_summaries[int(MAX_BUDGET)]["path"]
+            if fig2_path is not None:
+                display(Image(filename=str(fig2_path)))
+                print(f"Saved Figure 2 to {fig2_path}")
+                if APPENDIX_FIGURE_BUDGETS:
+                    for appendix_budget in APPENDIX_FIGURE_BUDGETS:
+                        print(f"Saved appendix Figure 2 to {figure2_summaries[int(appendix_budget)]['path']}")
+            display(pd.DataFrame(figure2_summary))
+            """
+        ),
+        markdown_cell("## Figure 3: Scenario-Level Comparison"),
+        code_cell(
+            """
+            figure3_summaries = {}
+            for figure_budget in figure_budgets:
+                suffix = figure_budget_suffix(int(figure_budget))
+                fig3_path = (figure_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}.png") if figure_dir is not None else None
+                figure3_summary = plot_threshold_grid_best_practical_scenario_scatter(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    save_path=fig3_path,
+                    table_save_path=(figure_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}_summary.json") if figure_dir is not None else None,
+                )
+                figure3_summaries[int(figure_budget)] = {
+                    "summary": figure3_summary,
+                    "path": fig3_path,
+                }
+                if figure_dir is not None:
+                    plot_threshold_grid_best_practical_scenario_scatter(
+                        all_records,
+                        max_budget=int(figure_budget),
+                        families=tuple(FAMILIES),
+                        selection_metric="median",
+                        save_path=figure_dir / f"figure3_best_smooth_vs_samc_scenario_rrmse{suffix}.pdf",
+                    )
+            figure3_summary = figure3_summaries[int(MAX_BUDGET)]["summary"]
+            fig3_path = figure3_summaries[int(MAX_BUDGET)]["path"]
+            if fig3_path is not None:
+                display(Image(filename=str(fig3_path)))
+                print(f"Saved Figure 3 to {fig3_path}")
+                if APPENDIX_FIGURE_BUDGETS:
+                    for appendix_budget in APPENDIX_FIGURE_BUDGETS:
+                        print(f"Saved appendix Figure 3 to {figure3_summaries[int(appendix_budget)]['path']}")
+            display(pd.DataFrame(figure3_summary).drop(columns=["paired_points"], errors="ignore"))
+            """
+        ),
+        markdown_cell("## Figure 4: Threshold-Scale Estimates"),
+        code_cell(
+            """
+            fig4_path = (figure_dir / "figure4_estimate_vs_threshold_ratio.png") if figure_dir is not None else None
+            figure4_points = plot_threshold_grid_estimate_vs_threshold_ratio(
+                all_records,
+                max_budget=int(MAX_BUDGET),
+                families=tuple(FAMILIES),
+                selection_metric="median",
+                save_path=fig4_path,
+                table_save_path=(figure_dir / "figure4_estimate_vs_threshold_ratio_points.json") if figure_dir is not None else None,
+            )
+            if figure_dir is not None:
+                plot_threshold_grid_estimate_vs_threshold_ratio(
+                    all_records,
+                    max_budget=int(MAX_BUDGET),
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    save_path=figure_dir / "figure4_estimate_vs_threshold_ratio.pdf",
+                )
+            if fig4_path is not None:
+                display(Image(filename=str(fig4_path)))
+                print(f"Saved Figure 4 to {fig4_path}")
+            figure4_summary = (
+                pd.DataFrame(figure4_points)
+                .groupby(["family", "display_method", "config_label"], dropna=False)
+                .agg(
+                    n_scenarios=("scenario", "count"),
+                    n_estimate_above_threshold=("estimate_above_threshold", "sum"),
+                    n_false_negative=("false_negative", "sum"),
+                    median_abs_ratio_error=("abs_ratio_error", "median"),
+                )
+                .reset_index()
+            )
+            display(figure4_summary)
+            """
+        ),
+        markdown_cell("## Bootstrap Diagnostics"),
+        code_cell(
+            """
+            bootstrap_summaries = {}
+            bootstrap_summary_rows = []
+            bootstrap_budgets = tuple(CHECKPOINTS)
+
+            def bootstrap_budget_suffix(budget: int) -> str:
+                if int(budget) % 1_000_000 == 0:
+                    label = f"{int(budget) // 1_000_000}m"
+                elif int(budget) % 1_000 == 0:
+                    label = f"{int(budget) // 1_000}k"
+                else:
+                    label = str(int(budget))
+                return f"_budget_{label}"
+
+            for figure_budget in bootstrap_budgets:
+                suffix = bootstrap_budget_suffix(int(figure_budget))
+                bootstrap_path = (
+                    figure_dir / f"figure3_bootstrap_diagnostics{suffix}.json"
+                ) if figure_dir is not None else None
+                bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    n_bootstrap=int(BOOTSTRAP_RESAMPLES),
+                    seed=int(BOOTSTRAP_SEED + int(figure_budget)),
+                    save_path=bootstrap_path,
+                )
+                bootstrap_summaries[int(figure_budget)] = {
+                    "summary": bootstrap_rows,
+                    "path": bootstrap_path,
+                }
+                compact_rows = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"bootstrap_rrmse_ratios", "bootstrap_win_rates", "paired_points"}
+                    }
+                    for row in bootstrap_rows
+                ]
+                bootstrap_summary_rows.extend(compact_rows)
+                if bootstrap_path is not None:
+                    print(f"Saved bootstrap diagnostics to {bootstrap_path}")
+
+            bootstrap_summary_df = pd.DataFrame(bootstrap_summary_rows).sort_values(["checkpoint", "family"])
+            if figure_dir is not None:
+                bootstrap_summary_path = figure_dir / "figure3_bootstrap_diagnostics_summary.json"
+                bootstrap_summary_csv_path = figure_dir / "figure3_bootstrap_diagnostics_summary.csv"
+                write_json(bootstrap_summary_path, bootstrap_summary_rows)
+                bootstrap_summary_df.to_csv(bootstrap_summary_csv_path, index=False)
+                print(f"Saved bootstrap diagnostic summary to {bootstrap_summary_path}")
+                print(f"Saved bootstrap diagnostic summary to {bootstrap_summary_csv_path}")
+            display(bootstrap_summary_df)
+            """
+        ),
+        markdown_cell("## Bootstrap Diagnostics: Fixed 5M Configurations"),
+        code_cell(
+            """
+            fixed_config_bootstrap_summaries = {}
+            fixed_config_bootstrap_summary_rows = []
+            fixed_config_selection_budget = int(MAX_BUDGET)
+            for figure_budget in bootstrap_budgets:
+                suffix = bootstrap_budget_suffix(int(figure_budget))
+                bootstrap_path = (
+                    figure_dir / f"figure3_bootstrap_fixed_5m_config_diagnostics{suffix}.json"
+                ) if figure_dir is not None else None
+                bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    config_selection_budget=fixed_config_selection_budget,
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    n_bootstrap=int(BOOTSTRAP_RESAMPLES),
+                    seed=int(BOOTSTRAP_SEED + 7_000_000 + int(figure_budget)),
+                    save_path=bootstrap_path,
+                )
+                fixed_config_bootstrap_summaries[int(figure_budget)] = {
+                    "summary": bootstrap_rows,
+                    "path": bootstrap_path,
+                }
+                compact_rows = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"bootstrap_rrmse_ratios", "bootstrap_win_rates", "paired_points"}
+                    }
+                    for row in bootstrap_rows
+                ]
+                fixed_config_bootstrap_summary_rows.extend(compact_rows)
+                if bootstrap_path is not None:
+                    print(f"Saved fixed-config bootstrap diagnostics to {bootstrap_path}")
+
+            fixed_config_bootstrap_summary_df = (
+                pd.DataFrame(fixed_config_bootstrap_summary_rows)
+                .sort_values(["checkpoint", "family"])
+            )
+            if figure_dir is not None:
+                fixed_summary_path = figure_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.json"
+                fixed_summary_csv_path = figure_dir / "figure3_bootstrap_fixed_5m_config_diagnostics_summary.csv"
+                write_json(fixed_summary_path, fixed_config_bootstrap_summary_rows)
+                fixed_config_bootstrap_summary_df.to_csv(fixed_summary_csv_path, index=False)
+                print(f"Saved fixed-config bootstrap diagnostic summary to {fixed_summary_path}")
+                print(f"Saved fixed-config bootstrap diagnostic summary to {fixed_summary_csv_path}")
+            display(fixed_config_bootstrap_summary_df)
+            """
+        ),
+        markdown_cell("## Bootstrap Diagnostics: Fixed 1M Configurations"),
+        code_cell(
+            """
+            fixed_1m_config_bootstrap_summaries = {}
+            fixed_1m_config_bootstrap_summary_rows = []
+            fixed_1m_config_selection_budget = 1_000_000
+            for figure_budget in bootstrap_budgets:
+                suffix = bootstrap_budget_suffix(int(figure_budget))
+                bootstrap_path = (
+                    figure_dir / f"figure3_bootstrap_fixed_1m_config_diagnostics{suffix}.json"
+                ) if figure_dir is not None else None
+                bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
+                    all_records,
+                    max_budget=int(figure_budget),
+                    config_selection_budget=fixed_1m_config_selection_budget,
+                    families=tuple(FAMILIES),
+                    selection_metric="median",
+                    n_bootstrap=int(BOOTSTRAP_RESAMPLES),
+                    seed=int(BOOTSTRAP_SEED + 1_000_000 + int(figure_budget)),
+                    save_path=bootstrap_path,
+                )
+                fixed_1m_config_bootstrap_summaries[int(figure_budget)] = {
+                    "summary": bootstrap_rows,
+                    "path": bootstrap_path,
+                }
+                compact_rows = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"bootstrap_rrmse_ratios", "bootstrap_win_rates", "paired_points"}
+                    }
+                    for row in bootstrap_rows
+                ]
+                fixed_1m_config_bootstrap_summary_rows.extend(compact_rows)
+                if bootstrap_path is not None:
+                    print(f"Saved fixed-1M-config bootstrap diagnostics to {bootstrap_path}")
+
+            fixed_1m_config_bootstrap_summary_df = (
+                pd.DataFrame(fixed_1m_config_bootstrap_summary_rows)
+                .sort_values(["checkpoint", "family"])
+            )
+            if figure_dir is not None:
+                fixed_1m_summary_path = figure_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.json"
+                fixed_1m_summary_csv_path = figure_dir / "figure3_bootstrap_fixed_1m_config_diagnostics_summary.csv"
+                write_json(fixed_1m_summary_path, fixed_1m_config_bootstrap_summary_rows)
+                fixed_1m_config_bootstrap_summary_df.to_csv(fixed_1m_summary_csv_path, index=False)
+                print(f"Saved fixed-1M-config bootstrap diagnostic summary to {fixed_1m_summary_path}")
+                print(f"Saved fixed-1M-config bootstrap diagnostic summary to {fixed_1m_summary_csv_path}")
+            display(fixed_1m_config_bootstrap_summary_df)
             """
         ),
         markdown_cell("## Reload A Saved Run"),

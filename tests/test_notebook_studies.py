@@ -18,9 +18,15 @@ from perm_pval.experiments.notebook_studies import (
     build_hard_step_workflow,
     build_beta_workflow,
     build_mcmc_objective_grid_candidates,
+    bootstrap_threshold_grid_best_practical_diagnostics,
     load_beta_sweep_saved_output,
     load_cross_method_saved_output,
     plot_near_threshold_checkpoint_boxplots,
+    plot_threshold_grid_best_practical_scenario_scatter,
+    plot_threshold_grid_best_practical_rrmse,
+    plot_threshold_grid_estimate_vs_threshold_ratio,
+    plot_threshold_grid_gamma_swap_rrmse,
+    plot_threshold_grid_tilt_family_rrmse,
     regenerate_beta_sweep_plots_from_saved,
     regenerate_cross_method_plots_from_saved,
     run_beta_checkpoint_study,
@@ -342,6 +348,184 @@ def test_near_threshold_checkpoint_boxplot_writes_png(tmp_path):
     img = mpimg.imread(plot_path)
     assert img.shape[0] > 0
     assert img.shape[1] > 0
+
+
+def test_threshold_grid_gamma_swap_plot_writes_png_and_summary(tmp_path):
+    records = []
+    checkpoint = 100
+    for family in ("gwas", "hep"):
+        for swap_fraction in (0.05, 0.10):
+            records.append(
+                {
+                    "scenario": f"{family}_scenario",
+                    "family": family,
+                    "method": "samc",
+                    "swap_fraction": swap_fraction,
+                    "gamma_label": "none",
+                    "gamma": np.nan,
+                    "checkpoint": checkpoint,
+                    "estimate": 1.05,
+                    "exact_p": 1.0,
+                    "abs_log10_error": 0.02,
+                }
+            )
+            for method in ("mcmc_is_no_oracle", "hard_step"):
+                for gamma, gamma_label in ((0.25, "0.25"), (1.0 / 3.0, "0.333333333333"), (0.4, "0.4")):
+                    estimate = 0.0 if method == "hard_step" and gamma_label == "0.4" else 1.0 + gamma / 10.0
+                    records.append(
+                        {
+                            "scenario": f"{family}_scenario",
+                            "family": family,
+                            "method": method,
+                            "swap_fraction": swap_fraction,
+                            "gamma_label": gamma_label,
+                            "gamma": gamma,
+                            "checkpoint": checkpoint,
+                            "estimate": estimate,
+                            "exact_p": 1.0,
+                            "abs_log10_error": None if estimate == 0.0 else 0.01,
+                        }
+                    )
+
+    plot_path = tmp_path / "gamma_swap.png"
+    table_path = tmp_path / "gamma_swap_summary.json"
+
+    summary = plot_threshold_grid_gamma_swap_rrmse(
+        records,
+        max_budget=checkpoint,
+        save_path=plot_path,
+        table_save_path=table_path,
+    )
+
+    assert plot_path.exists()
+    assert table_path.exists()
+    assert len(summary) == 28
+    zero_rows = [
+        row
+        for row in summary
+        if row["method"] == "hard_step" and row["gamma_label"] == "0.4"
+    ]
+    assert zero_rows
+    assert all(row["median_scenario_are"] == pytest.approx(1.0) for row in zero_rows)
+    assert all(row["cross_scenario_rrmse"] == pytest.approx(1.0) for row in zero_rows)
+    img = mpimg.imread(plot_path)
+    assert img.shape[0] > 0
+    assert img.shape[1] > 0
+
+
+def test_threshold_grid_split_figures_write_pngs_and_summaries(tmp_path):
+    records = []
+    checkpoint = 100
+    for family in ("gwas", "hep"):
+        for swap_fraction in (0.05, 0.10):
+            records.append(
+                {
+                    "scenario": f"{family}_scenario",
+                    "family": family,
+                    "method": "samc",
+                    "swap_fraction": swap_fraction,
+                    "gamma_label": "none",
+                    "gamma": np.nan,
+                    "checkpoint": checkpoint,
+                    "estimate": 1.04 if swap_fraction == 0.05 else 1.08,
+                    "exact_p": 1.0,
+                    "p0_reference": 1.0,
+                    "p_over_p0": 1.0,
+                    "abs_log10_error": 0.02,
+                }
+            )
+            for method in ("mcmc_is_no_oracle", "hard_step"):
+                for gamma, gamma_label in ((0.25, "0.25"), (1.0 / 3.0, "0.333333333333"), (0.4, "0.4")):
+                    estimate = 1.0 + gamma / (12.0 if method == "mcmc_is_no_oracle" else 1.0)
+                    records.append(
+                        {
+                            "scenario": f"{family}_scenario",
+                            "family": family,
+                            "method": method,
+                            "swap_fraction": swap_fraction,
+                            "gamma_label": gamma_label,
+                            "gamma": gamma,
+                            "checkpoint": checkpoint,
+                            "estimate": estimate,
+                            "exact_p": 1.0,
+                            "p0_reference": 1.0,
+                            "p_over_p0": 1.0,
+                            "abs_log10_error": 0.01,
+                        }
+                    )
+
+    fig1_path = tmp_path / "figure1.png"
+    fig1_table = tmp_path / "figure1_summary.json"
+    fig2_path = tmp_path / "figure2.png"
+    fig2_table = tmp_path / "figure2_summary.json"
+    fig3_path = tmp_path / "figure3.png"
+    fig3_table = tmp_path / "figure3_summary.json"
+    fig4_path = tmp_path / "figure4.png"
+    fig4_table = tmp_path / "figure4_points.json"
+
+    fig1_rows = plot_threshold_grid_tilt_family_rrmse(
+        records,
+        max_budget=checkpoint,
+        metric="mean",
+        save_path=fig1_path,
+        table_save_path=fig1_table,
+    )
+    fig2_rows = plot_threshold_grid_best_practical_rrmse(
+        records,
+        max_budget=checkpoint,
+        save_path=fig2_path,
+        table_save_path=fig2_table,
+    )
+    fig3_rows = plot_threshold_grid_best_practical_scenario_scatter(
+        records,
+        max_budget=checkpoint,
+        save_path=fig3_path,
+        table_save_path=fig3_table,
+    )
+    fig4_rows = plot_threshold_grid_estimate_vs_threshold_ratio(
+        records,
+        max_budget=checkpoint,
+        save_path=fig4_path,
+        table_save_path=fig4_table,
+    )
+    bootstrap_path = tmp_path / "figure3_bootstrap.json"
+    bootstrap_rows = bootstrap_threshold_grid_best_practical_diagnostics(
+        records,
+        max_budget=checkpoint,
+        n_bootstrap=200,
+        seed=123,
+        save_path=bootstrap_path,
+    )
+
+    assert fig1_path.exists()
+    assert fig1_table.exists()
+    assert fig2_path.exists()
+    assert fig2_table.exists()
+    assert fig3_path.exists()
+    assert fig3_table.exists()
+    assert fig4_path.exists()
+    assert fig4_table.exists()
+    assert bootstrap_path.exists()
+    assert len(fig1_rows) == 24
+    assert len(fig2_rows) == 4
+    assert len(fig3_rows) == 2
+    assert len(fig4_rows) == 4
+    assert len(bootstrap_rows) == 2
+    assert {row["display_method"] for row in fig2_rows} == {"Smooth MCMC-IS", "SAMC"}
+    assert all(row["n_paired_scenarios"] == 1 for row in fig3_rows)
+    assert all(np.isfinite(row["cross_scenario_rrmse_ratio_smooth_over_samc"]) for row in fig3_rows)
+    assert all(row["n_smooth_are_lt_samc"] == 1 for row in fig3_rows)
+    assert all(row["n_bootstrap"] == 200 for row in bootstrap_rows)
+    assert all(row["config_selection_checkpoint"] == checkpoint for row in bootstrap_rows)
+    assert all(len(row["bootstrap_win_rates"]) == 200 for row in bootstrap_rows)
+    assert all(len(row["bootstrap_rrmse_ratios"]) == 200 for row in bootstrap_rows)
+    assert all(np.isfinite(row["rrmse_ratio_ci95_low"]) for row in bootstrap_rows)
+    assert all(np.isfinite(row["win_rate_ci95_high"]) for row in bootstrap_rows)
+    assert all("p_over_p0" in row and "estimate_over_p0" in row for row in fig4_rows)
+    for path in (fig1_path, fig2_path, fig3_path, fig4_path):
+        img = mpimg.imread(path)
+        assert img.shape[0] > 0
+        assert img.shape[1] > 0
 
 
 def test_cross_method_parallel_matches_serial():
