@@ -2469,7 +2469,7 @@ def build_mcmc_scan_budget_policy_notebook() -> dict:
             """
             ## Configuration
 
-            `TOTAL_BUDGET` is the total evaluation budget for MCMC-IS: pilot + scan + production.
+            `TOTAL_BUDGET` is the total iteration budget for MCMC-IS: pilot + scan + production.
             The p0-dependent policies below choose the scan budget, and the production budget is the leftover.
 
             The `tail_hit_cap` policies use
@@ -3162,7 +3162,7 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
         # Experiment: Fixed Scan-Budget Grid for MCMC-IS
 
         Objective:
-        - At a fixed total MCMC-IS budget of 10 million evaluations, compare several fixed beta-selection budgets.
+        - At a fixed total MCMC-IS budget of 10 million iterations, compare several fixed beta-selection budgets.
         - For each scan budget, choose beta by the same local scan objective and then spend the remaining budget on production.
         - Avoid duplicate production work by grouping identical selected beta/proposal pairs and evaluating all required production cutoffs from one cumulative run.
 
@@ -3173,7 +3173,7 @@ def build_mcmc_scan_budget_grid_notebook() -> dict:
         """
         ## Configuration
 
-        `TOTAL_BUDGET` is the full MCMC-IS evaluation budget: IID pilot + beta scan + production. `SCAN_BUDGETS` below are target beta-selection budgets, including the IID pilot. The actual charged budget can differ by a few evaluations because MCMC chains are split across chains and candidates.
+        `TOTAL_BUDGET` is the full MCMC-IS iteration budget: IID pilot + beta scan + production. `SCAN_BUDGETS` below are target beta-selection budgets, including the IID pilot. The actual charged budget can differ by a few iterations because MCMC chains are split across chains and candidates.
 
         The scan-budget grid is deliberately simple: it asks whether spending roughly `50k`, `100k`, `500k`, `1m`, or `2m` on beta selection is worthwhile when the full budget is `10m`.
         """
